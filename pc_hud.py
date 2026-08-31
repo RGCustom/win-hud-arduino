@@ -736,6 +736,12 @@ def run_web():
 def metrics_main_loop(stop_event):
     print(f"[win-hud-arduino] metrics loop starting, version {SCRIPT_VERSION}", flush=True)
 
+    # COM (comtypes/pycaw) должен быть инициализирован В ЭТОМ ПОТОКЕ до
+    # первого обращения к audio_controller - иначе pycaw падает с
+    # "Не был произведен вызов CoInitialize" (COM per-thread, а этот цикл
+    # живёт в отдельном от главного потоке). См. metrics_windows.init_com_for_thread().
+    metrics_windows.init_com_for_thread()
+
     with state_lock:
         state["cfg"] = load_settings()
 

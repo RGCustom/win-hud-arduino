@@ -9,13 +9,13 @@ metrics_windows.py  (win-hud-arduino)
     Громкость/mute/устройство вывода -> pycaw (обёртка над Core Audio API)
     Раскладка клавиатуры -> ctypes (user32.dll)
 
-ВАЖНО про звук: реализация ниже писалась и проверялась логически (не
-исполнялась - у меня нет доступа к настоящей Windows-машине с живым Core
-Audio API), т.к. pycaw/comtypes используют Windows-only COM-интерфейсы.
-Структура функций и именование - стандартный для pycaw паттерн, но при
-первом запуске на реальном железе (Konstantin) стоит внимательно проверить
-блок AudioController, особенно чтение FriendlyName устройства - там больше
-всего шансов, что понадобится мелкая правка под конкретную версию pycaw.
+ВАЖНО про звук: изначальная реализация писалась без доступа к настоящей
+Windows-машине и была скорректирована по фидбеку с реального запуска -
+в частности, AudioUtilities.GetSpeakers() в pycaw 2024+ возвращает готовую
+обёртку с .EndpointVolume/.FriendlyName напрямую (без ручного Activate()) -
+см. комментарий в AudioController._get_volume_interface() ниже. Основная
+механика (получение и кэширование интерфейса громкости) сейчас проверена
+и работает; switch_output_device() всё ещё не реализован (см. TODO там же).
 
 Зависимости (requirements.txt):
     psutil, pynvml, pycaw, comtypes, pywin32
@@ -227,6 +227,34 @@ def read_iface_speed_mbps(iface):
 # устройства и т.п.) читается из settings.json главным циклом - здесь только
 # сами примитивы, которыми это действие пользуется.
 
+def init_com_for_thread():
+    """
+    Инициализирует COM (CoInitialize) для ТЕКУЩЕГО потока - обязательный
+    вызов перед первым использованием AudioController из любого потока,
+    кроме того, где сам процесс стартовал (см. предупреждение в докстринге
+    AudioController ниже). В pc_hud.py вызывается один раз в самом начале
+    metrics_main_loop().
+
+    Без этого pycaw падает с "OSError: [WinError -2147221008] Не был
+    произведен вызов CoInitialize" при первом обращении к звуку из фонового
+    потока - именно так и происходит, если main-поток (там, где Python сам
+    неявно инициализирует COM STA при старте) не совпадает с потоком,
+    реально дёргающим AudioUtilities/IAudioEndpointVolume.
+
+    Безопасно вызывать повторно (comtypes сам игнорирует повторный
+    CoInitialize в том же потоке) и безопасно вызывать, даже если pycaw не
+    установлен - тогда просто no-op.
+    """
+    if not _PYCAW_AVAILABLE:
+        return
+    try:
+        comtypes.CoInitialize()
+    except OSError:
+        # уже инициализирован в этом потоке (RPC_E_CHANGED_MODE и т.п. -
+        # для наших целей это не ошибка, COM всё равно доступен)
+        pass
+
+
 class AudioController:
     """
     Обёртка над pycaw для чтения/управления громкостью ПО УМОЛЧАНИЮ
@@ -235,30 +263,45 @@ class AudioController:
     каждое событие энкодера) избыточно дорого.
 
     ВАЖНО: comtypes требует, чтобы COM был инициализирован (CoInitialize) в
-    ТОМ ЖЕ потоке, из которого вызываются его методы. Если AudioController
-    используется из отдельного потока (например из обработчика serial-
-    событий энкодера, который может жить в своём потоке в pc_hud.py) -
-    нужно явно вызвать comtypes.CoInitialize() в начале этого потока один
-    раз, иначе будет падать с COMError при первом обращении.
+    ТОМ ЖЕ потоке, из которого вызываются его методы - см. init_com_for_thread()
+    выше. pc_hud.py зовёт её один раз в начале metrics_main_loop(), поэтому
+    сам AudioController об этом можно больше не думать при обычном
+    использовании - но если будешь дёргать его из ЕЩЁ ОДНОГО потока (кроме
+    metrics_main_loop), для того потока тоже нужен свой init_com_for_thread().
     """
 
     def __init__(self):
         self.available = _PYCAW_AVAILABLE
         self._volume_iface = None
+        self._device_name = None
         if not self.available:
             print("[audio] pycaw не установлен - управление громкостью недоступно", flush=True)
 
     def _get_volume_interface(self):
         """Ленивая инициализация + автопересоздание, если устройство вывода
         сменилось (девайс мог быть переключён вручную в Windows между
-        тиками - тогда старый COM-указатель может быть уже невалиден)."""
+        тиками - тогда старый COM-указатель может быть уже невалиден).
+
+        pycaw 2024+ (у нас в проекте) возвращает из GetSpeakers() готовую
+        обёртку AudioDevice с атрибутами .EndpointVolume и .FriendlyName
+        напрямую - никакого ручного Activate()/cast() уже не нужно, и заодно
+        отпадает нужда в хрупком переборе AudioUtilities.GetAllDevices() для
+        имени устройства (см. _read_device_name() ниже - теперь просто читает
+        закэшированное имя). Более старые версии pycaw (до этого изменения
+        API) такого атрибута не имеют - для них оставлен путь через
+        Activate()+cast(), определяется по hasattr() ниже."""
         try:
             device = AudioUtilities.GetSpeakers()
-            iface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            self._volume_iface = cast(iface, POINTER(IAudioEndpointVolume))
+            if hasattr(device, "EndpointVolume"):
+                self._volume_iface = device.EndpointVolume
+                self._device_name = getattr(device, "FriendlyName", "N/A")
+            else:
+                iface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                self._volume_iface = cast(iface, POINTER(IAudioEndpointVolume))
+                self._device_name = None  # неизвестно - см. _read_device_name() fallback
             return self._volume_iface
         except COMError as e:
-            print(f"[audio] GetSpeakers/Activate failed: {e}", flush=True)
+            print(f"[audio] GetSpeakers failed: {e}", flush=True)
             return None
 
     def read_state(self):
@@ -286,11 +329,12 @@ class AudioController:
             return empty
 
     def _read_device_name(self):
-        """FriendlyName текущего устройства вывода по умолчанию. pycaw не
-        даёт это напрямую через IAudioEndpointVolume - идём через
-        AudioUtilities.GetAllDevices() и ищем активное устройство вывода по
-        умолчанию. Это самое хрупкое место модуля - см. предупреждение в
-        шапке файла."""
+        """FriendlyName текущего устройства вывода по умолчанию. На новом
+        pycaw уже закэширован в _get_volume_interface() (см. выше) - тут
+        просто отдаём его. На старом pycaw (без .EndpointVolume) кэш будет
+        None - тогда как fallback идём через AudioUtilities.GetAllDevices()."""
+        if self._device_name is not None:
+            return self._device_name
         try:
             for d in AudioUtilities.GetAllDevices():
                 if getattr(d, "id", None) and d.state == 1:  # DEVICE_STATE.ACTIVE
