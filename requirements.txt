@@ -1,8 +1,29 @@
-psutil
-pynvml
-pycaw
-comtypes
-pywin32
-pyserial
-flask
-requests
+# win-hud-arduino - зависимости (Windows)
+#
+# pip install -r requirements.txt --break-system-packages
+# (флаг --break-system-packages нужен только если ставишь не в venv;
+#  в собственном venv он не требуется)
+
+pyserial>=3.5
+flask>=3.0
+
+# метрики хоста
+psutil>=5.9
+
+# GPU (NVIDIA) - см. metrics_windows.GpuMonitor
+pynvml>=11.5
+
+# звук - управление громкостью/mute, чтение устройства вывода (см.
+# metrics_windows.AudioController). pycaw тянет comtypes сам, но фиксируем
+# версию явно, т.к. от неё зависит и pynvml, и это самое хрупкое место проекта
+# (см. предупреждение в шапке metrics_windows.py)
+pycaw>=20230407
+comtypes>=1.2
+
+# доступ к Win32 API (используется опосредованно pycaw/pystray; держим явно
+# в списке, чтобы pip сразу подтянул нужную версию под Windows)
+pywin32>=306
+
+# трей-иконка + генерация assets/icon.png, если их нет в дистрибутиве
+pystray>=0.19
+pillow>=10.0
