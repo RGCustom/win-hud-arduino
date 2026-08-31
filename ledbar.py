@@ -183,18 +183,54 @@ def compute_bar_pixels_center(
     return bottom_half + top_half
 
 
-def compute_volume_osd_pixels(volume_pct, c1_hex, c2_hex, c3_hex, leds_per_bar=LEDS_PER_BAR):
+def compute_volume_osd_pixels(
+    volume_pct, c1_hex, c2_hex, c3_hex,
+    muted=False,
+    mute_color="FF0000", warning_color="FFA500", warning_threshold_pct=95,
+    leds_per_bar=LEDS_PER_BAR,
+):
     """
     Пиксели для OSD-попапа громкости: одно значение (volume_pct), рисуется
     СИММЕТРИЧНО от центра ленты в обе стороны - частный случай
-    compute_bar_pixels_center() с одинаковым pct и одинаковыми цветами на
-    обе половины (см. пояснение "Зеркальность" в докстринге модуля выше).
+    compute_bar_pixels_center() с одинаковым pct на обе половины (см.
+    пояснение "Зеркальность" в докстринге модуля выше).
 
-    Без peak hold и без solid-режима - для OSD это лишнее: попап и так живёт
-    считанные секунды (см. таймер в pc_hud.py), пик держать незачем.
+    Цвет переопределяется на "тревожный" в двух случаях, ИГНОРИРУЯ обычный
+    c1/c2/c3 градиент бара - чтобы состояние было видно однозначно, вне
+    зависимости от того, какие цвета настроены на самом баре:
+        - muted=True                        -> сплошной mute_color (обычно
+                                                красный) по всей заполненной
+                                                части, независимо от pct
+        - volume_pct >= warning_threshold_pct -> сплошной warning_color
+                                                (обычно оранжевый) - "на
+                                                грани максимума"
+        - иначе - обычный 3-стопный градиент c1->c2->c3, как всегда
+
+    Технически "сплошной цвет" получается тем же _gradient_pixels() с
+    ОДИНАКОВЫМ hex на всех трёх стопах (c1=c2=c3=color) - блендинг между
+    одинаковыми цветами даёт этот же цвет, так что solid-флаг тут не важен,
+    отдельная ветка кода не нужна.
+
+    Без peak hold - для OSD это лишнее: попап и так живёт считанные секунды
+    (см. таймер в pc_hud.py), пик держать незачем.
 
     Возвращает список из leds_per_bar строк 'RRGGBB'.
     """
+    if muted:
+        color = mute_color
+    elif volume_pct >= warning_threshold_pct:
+        color = warning_color
+    else:
+        color = None
+
+    if color is not None:
+        return compute_bar_pixels_center(
+            volume_pct, volume_pct,
+            color, color, color, False,
+            color, color, color, False,
+            leds_per_bar=leds_per_bar,
+        )
+
     return compute_bar_pixels_center(
         volume_pct, volume_pct,
         c1_hex, c2_hex, c3_hex, False,

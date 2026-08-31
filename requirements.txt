@@ -1,0 +1,8 @@
+psutil
+pynvml
+pycaw
+comtypes
+pywin32
+pyserial
+flask
+requests
