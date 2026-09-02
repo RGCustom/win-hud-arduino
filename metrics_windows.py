@@ -25,6 +25,7 @@ Windows-машине и была скорректирована по фидбе�
 audio-функций).
 """
 
+import asyncio
 import ctypes
 import time
 
@@ -44,6 +45,14 @@ try:
     _PYCAW_AVAILABLE = True
 except ImportError:
     _PYCAW_AVAILABLE = False
+
+try:
+    from winsdk.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as _MediaManager,
+    )
+    _WINSDK_AVAILABLE = True
+except ImportError:
+    _WINSDK_AVAILABLE = False
 
 
 # ---------------- CPU / RAM ----------------
@@ -384,6 +393,75 @@ class AudioController:
         print("[audio] switch_output_device: пока не реализовано (см. TODO в коде)", flush=True)
 
 
+# ---------------- Now Playing (SMTC - System Media Transport Controls) ----------------
+
+class MediaMonitor:
+    """
+    Текущий трек через Windows SMTC - тот же источник данных, что у системного
+    медиа-виджета (Win+K/уведомления). Показывает сессию, которую Windows
+    считает "текущей" (обычно последний плеер, с которым было взаимодействие -
+    Spotify/браузер/VLC/...), а не какое-то конкретное приложение.
+
+    winsdk - WinRT-биндинг, весь API асинхронный. Остальной pc_hud.py
+    синхронный, а опрашивается это редко (раз в POLL_INTERVAL, как GPU/диски) -
+    поэтому просто оборачиваем в asyncio.run() на каждый вызов read(), не
+    заводя постоянный event loop. Если winsdk не установлен - тихо возвращает
+    "пустые" значения, как GpuMonitor/AudioController без своих библиотек.
+    """
+
+    def __init__(self):
+        self.available = _WINSDK_AVAILABLE
+        if not self.available:
+            print("[media] winsdk не установлен - Now Playing недоступен", flush=True)
+
+    def read(self):
+        """dict: media_title, media_artist (None, если сейчас ничего не играет
+        - в частности на паузе/стопе тоже None, см. _read_async() ниже -
+        чтобы OLED-экран Now Playing автоматически пропускался ротацией
+        через общий механизм screens.build_active_screens(), как экраны
+        net2/disk2 без настройки - см. докстринг screens.py), media_playing
+        ('да'/'нет', всегда строка, не None)."""
+        empty = {"media_title": None, "media_artist": None, "media_playing": "нет"}
+        if not self.available:
+            return empty
+        try:
+            return asyncio.run(self._read_async())
+        except Exception as e:
+            print(f"[media] read failed: {e}", flush=True)
+            return empty
+
+    async def _read_async(self):
+        manager = await _MediaManager.request_async()
+        session = manager.get_current_session()
+        if session is None:
+            return {"media_title": None, "media_artist": None, "media_playing": "нет"}
+
+        playback_info = session.get_playback_info()
+        # PlaybackStatus: Closed=0, Opened=1, Changing=2, Stopped=3, Playing=4, Paused=5
+        status = playback_info.playback_status if playback_info else None
+        playing = "да" if status == 4 else "нет"
+
+        if status != 4:
+            # Сессия есть, но сейчас не Playing (пауза/стоп/нет данных) - SMTC
+            # почти всегда держит метаданные ПОСЛЕДНЕГО трека даже после
+            # паузы/остановки, поэтому НЕ отдаём title/artist в этом случае -
+            # иначе экран Now Playing показывал бы устаревший трек, который
+            # уже не играет (см. правило в докстринге screens.py -
+            # build_active_screens). Заодно экономим лишний async-вызов
+            # try_get_media_properties_async(), который тут всё равно не нужен.
+            return {"media_title": None, "media_artist": None, "media_playing": playing}
+
+        props = await session.try_get_media_properties_async()
+        title = (props.title or "").strip() if props else ""
+        artist = (props.artist or "").strip() if props else ""
+
+        return {
+            "media_title": title or None,
+            "media_artist": artist or None,
+            "media_playing": playing,
+        }
+
+
 # ---------------- Раскладка клавиатуры ----------------
 
 # Primary language ID (младшие 10 бит LANGID) -> короткое имя для OLED.
@@ -441,3 +519,6 @@ if __name__ == "__main__":
 
     audio = AudioController()
     print("Audio:", audio.read_state())
+
+    media = MediaMonitor()
+    print("Media:", media.read())

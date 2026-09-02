@@ -24,6 +24,13 @@ comtypes>=1.2
 # в списке, чтобы pip сразу подтянул нужную версию под Windows)
 pywin32>=306
 
+# Now Playing - чтение текущего медиа-сеанса (трек/исполнитель/статус
+# воспроизведения) через Windows SMTC (System Media Transport Controls -
+# тот же API, что и медиа-виджет в Win+K/уведомлениях). См.
+# metrics_windows.MediaMonitor. Асинхронный WinRT-биндинг, версия >=1.0.0b10
+# уже стабильна для нужного нам подмножества API (GlobalSystemMedia...).
+winsdk>=1.0.0b10
+
 # трей-иконка + генерация assets/icon.png, если их нет в дистрибутиве
 pystray>=0.19
 pillow>=10.0

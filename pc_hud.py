@@ -183,6 +183,7 @@ flashing_event = threading.Event()
 
 gpu_monitor = metrics_windows.GpuMonitor()
 audio_controller = metrics_windows.AudioController()
+media_monitor = metrics_windows.MediaMonitor()
 
 
 def get_context():
@@ -759,6 +760,7 @@ def metrics_main_loop(stop_event):
 
     common_metrics = {"cpu": 0.0, "ram": 0.0, "gpu": 0.0, "gpu_vram": 0.0, "disk1": 0.0, "disk2": 0.0, "net": 0.0}
     audio_state = {"volume_pct": 0, "volume_muted": "нет", "audio_device_name": "N/A"}
+    media_state = {"media_title": None, "media_artist": None, "media_playing": "нет"}
     lines = ["", "", ""]
 
     osd_active = False
@@ -880,6 +882,7 @@ def metrics_main_loop(stop_event):
                 }
 
             audio_state = audio_controller.read_state()
+            media_state = media_monitor.read()
             keyboard_layout = metrics_windows.get_keyboard_layout()
 
             common_metrics = {
@@ -907,6 +910,9 @@ def metrics_main_loop(stop_event):
                 "volume_pct": audio_state["volume_pct"], "volume_muted": audio_state["volume_muted"],
                 "audio_device_name": audio_state["audio_device_name"],
                 "keyboard_layout": keyboard_layout,
+                "media_title": media_state["media_title"],
+                "media_artist": media_state["media_artist"],
+                "media_playing": media_state["media_playing"],
             }
             with _context_lock:
                 _last_context.clear()

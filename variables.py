@@ -48,6 +48,11 @@ shkaf-hud код) просто никогда не пойдёт по repeating-�
 #     "audio_device_name": str,
 #
 #     "keyboard_layout": str,   # глобальная системная раскладка, напр. "RU"/"EN"
+#
+#     "media_title": str|None, "media_artist": str|None,   # None, если сейчас
+#                                # ничего не играет (в т.ч. на паузе) - см.
+#                                # metrics_windows.MediaMonitor
+#     "media_playing": str,     # "да"/"нет" - уже отформатировано
 # }
 
 
@@ -156,6 +161,13 @@ VARIABLES = {
     # --- Клавиатура ---
     "keyboard_layout":  {"label": "Раскладка клавиатуры (RU/EN и т.п.)", "group": "scalar", "category": "Система", "resolver": _scalar("keyboard_layout")},
 
+    # --- Now Playing (SMTC) - media_title/media_artist резолвятся в None,
+    # если сейчас ничего не играет (включая паузу) - см. metrics_windows.MediaMonitor
+    # и правило про условные экраны в докстринге screens.py ---
+    "media_title":    {"label": "Трек: название",        "group": "scalar", "category": "Медиа", "resolver": _scalar("media_title")},
+    "media_artist":   {"label": "Трек: исполнитель",      "group": "scalar", "category": "Медиа", "resolver": _scalar("media_artist")},
+    "media_playing":  {"label": "Сейчас играет (да/нет)", "group": "scalar", "category": "Медиа", "resolver": _scalar("media_playing")},
+
     # --- Сеть, слот 2 ---
     "net2_name":       {"label": "Net2: имя интерфейса",     "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "name")},
     "net2_speed":      {"label": "Net2: скорость линка",     "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "speed")},
@@ -167,7 +179,7 @@ VARIABLES = {
 
 # Порядок категорий в легенде на /screens (buildLegend() в screens_webui.py -
 # общий с shkaf-hud код, сортирует по этому списку, а не по алфавиту).
-CATEGORY_ORDER = ["Система", "GPU", "Диски", "Сеть", "Аудио"]
+CATEGORY_ORDER = ["Система", "GPU", "Диски", "Сеть", "Аудио", "Медиа"]
 
 # Повторяющихся групп в win-hud-arduino нет (Plex-стримы/qBittorrent-торренты
 # сюда не переехали) - оставлено пустым для совместимости с общим

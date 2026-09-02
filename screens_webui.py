@@ -17,7 +17,7 @@ shkaf-hud практически без изменений логики: дви�
     из папки assets/ рядом со скриптом - те же PNG, что использует и
     трей-иконка pystray)
   - порядок категорий легенды - под variables.CATEGORY_ORDER этого проекта
-    (Система/GPU/Диски/Сеть/Аудио, вместо Система/Диски.../Media/qBittorrent)
+    (Система/GPU/Диски/Сеть/Аудио/Медиа, вместо Система/Диски.../Media/qBittorrent)
 
 get_context - функция без аргументов, возвращающая текущий context (тот же
 словарь, что build_active_screens ожидает) - нужна для живого превью при
@@ -254,8 +254,8 @@ function buildLegend() {
     vars.forEach(v => { (categories[v.category] = categories[v.category] || []).push(v); });
 
     // Порядок категорий - как в variables.CATEGORY_ORDER этого проекта
-    // (Система/GPU/Диски/Сеть/Аудио); всё, чего там почему-то нет - в конец.
-    const order = ['Система', 'GPU', 'Диски', 'Сеть', 'Аудио'];
+    // (Система/GPU/Диски/Сеть/Аудио/Медиа); всё, чего там почему-то нет - в конец.
+    const order = ['Система', 'GPU', 'Диски', 'Сеть', 'Аудио', 'Медиа'];
     const orderedCats = [...order.filter(c => categories[c]), ...Object.keys(categories).filter(c => !order.includes(c))];
 
     const legend = document.getElementById('legend');
