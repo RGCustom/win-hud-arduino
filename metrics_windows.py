@@ -46,6 +46,51 @@ try:
 except ImportError:
     _PYCAW_AVAILABLE = False
 
+if _PYCAW_AVAILABLE:
+    from comtypes import GUID, IUnknown, COMMETHOD, HRESULT as _HRESULT
+    from ctypes import c_float, c_uint32
+
+    class _IAudioMeterInformationFull(IUnknown):
+        """
+        Полное объявление COM-интерфейса IAudioMeterInformation - см. падение
+        "AttributeError: ... object has no attribute 'GetMeteringChannelCount'"
+        на реальном запуске: pycaw.api.endpointvolume.IAudioMeterInformation в
+        установленной версии pycaw объявляет ТОЛЬКО GetPeakValue (известная
+        проблема самого pycaw - см. github.com/AndreMiras/pycaw issue #62).
+
+        COM - это контракт бинарной vtable (таблицы указателей на функции по
+        фиксированным смещениям). Реальный объект в памяти Windows поддерживает
+        ВСЕ 4 метода независимо от того, что объявлено в Python-обёртке - тут
+        просто дополняем недостающие, СТРОГО в порядке их реального положения
+        в интерфейсе (endpointvolume.h), иначе вызов уйдёт по чужому смещению
+        vtable и либо упадёт, либо (хуже) молча вызовет не тот метод:
+            1. GetPeakValue
+            2. GetMeteringChannelCount
+            3. GetChannelsPeakValues
+            4. QueryHardwareSupport   (не используется нами - можно не
+                                        объявлять: он последний, поэтому
+                                        отсутствие не сдвигает смещения
+                                        трёх предыдущих методов)
+
+        GetChannelsPeakValues.afPeakValues объявлен как "in", а НЕ "out" -
+        это буфер, который в реальном Win32 API выделяет и передаёт ВЫЗЫВАЮЩИЙ
+        (caller-allocated array), а не COM-объект. Если пометить его "out",
+        comtypes попытается сам сгенерировать буфер под ОДИН float (как для
+        GetPeakValue), и Core Audio запишет за границы этого буфера при
+        стерео/многоканальном звуке - именно поэтому buf передаётся вручную
+        в read_vu() ниже, а не создаётся автоматически.
+        """
+        _iid_ = GUID("{C02216F6-8C67-4B5B-9D00-D008E73E0064}")
+        _methods_ = (
+            COMMETHOD([], _HRESULT, "GetPeakValue",
+                      (["out"], ctypes.POINTER(c_float), "pfPeak")),
+            COMMETHOD([], _HRESULT, "GetMeteringChannelCount",
+                      (["out"], ctypes.POINTER(c_uint32), "pnChannelCount")),
+            COMMETHOD([], _HRESULT, "GetChannelsPeakValues",
+                      (["in"], c_uint32, "u32ChannelCount"),
+                      (["in"], ctypes.POINTER(c_float), "afPeakValues")),
+        )
+
 try:
     from winsdk.windows.media.control import (
         GlobalSystemMediaTransportControlsSessionManager as _MediaManager,
@@ -283,6 +328,13 @@ class AudioController:
         self.available = _PYCAW_AVAILABLE
         self._volume_iface = None
         self._device_name = None
+        self._meter_iface = None
+        # "Отображаемые" (уже сглаженные затуханием) VU-уровни - состояние
+        # между тиками, см. read_vu() ниже. Сразу в процентах (0-100) - так
+        # удобнее отдавать напрямую в common_metrics ленты (pc_hud.py).
+        self._vu_peak = 0.0
+        self._vu_left = 0.0
+        self._vu_right = 0.0
         if not self.available:
             print("[audio] pycaw не установлен - управление громкостью недоступно", flush=True)
 
@@ -351,6 +403,120 @@ class AudioController:
         except Exception as e:
             print(f"[audio] device name lookup failed: {e}", flush=True)
         return "N/A"
+
+    def _get_meter_interface(self):
+        """
+        Лениво создаёт/пересоздаёт IAudioMeterInformation для текущего
+        устройства вывода по умолчанию - источник данных для VU-метра ленты
+        (см. read_vu() ниже и vu_peak/vu_left/vu_right в pc_hud.py). Это
+        ОТДЕЛЬНЫЙ COM-интерфейс от EndpointVolume (громкость и метринг у
+        Core Audio - разные интерфейсы ОДНОГО И ТОГО ЖЕ endpoint-объекта),
+        поэтому кэшируется в своём поле, но пересоздаётся по тем же
+        правилам, что и volume-интерфейс (устройство вывода могло смениться
+        вручную между тиками - см. GetSpeakers() ниже, он всегда возвращает
+        АКТУАЛЬНОЕ дефолтное устройство на момент вызова).
+
+        ВАЖНО (проверено чтением исходников pycaw.utils.AudioDevice): у
+        обёртки AudioDevice, в отличие от volume, НЕТ готового свойства
+        .MeterInformation - только .EndpointVolume. Но Activate() нельзя
+        звать на самой обёртке AudioDevice (у неё такого метода нет - это
+        и была причина падения "'AudioDevice' object has no attribute
+        'Activate'"), только на её приватном атрибуте ._dev (сырой
+        IMMDevice COM-объект) - именно так устроено внутри самого pycaw
+        свойство .EndpointVolume (см. pycaw/utils.py). Дублируем тот же
+        паттерн вручную: device._dev.Activate(...).QueryInterface(...).
+        """
+        try:
+            device = AudioUtilities.GetSpeakers()
+            iface = device._dev.Activate(_IAudioMeterInformationFull._iid_, CLSCTX_ALL, None)
+            self._meter_iface = iface.QueryInterface(_IAudioMeterInformationFull)
+            return self._meter_iface
+        except (COMError, OSError, AttributeError) as e:
+            print(f"[audio] GetMeterInformation failed: {e}", flush=True)
+            return None
+
+    VU_RELEASE_SECONDS = 0.3  # время плавного спада показанного пика -
+                               # визуальная характеристика ленты, поэтому
+                               # константа тут, а не настройка в /settings
+                               # (аналогично OLED_SCROLL_STEP_PX в .ino)
+
+    def read_vu(self, dt=0.1):
+        """
+        Реальный уровень ИГРАЮЩЕГО звука (пики сигнала) - НЕ системная
+        громкость volume_pct, независимо от того, на что она выкручена -
+        для VU-метра ленты (см. докстринг read_vu в пояснении к проекту).
+        Источник - Core Audio IAudioMeterInformation, тот же механизм,
+        которым Windows рисует пиковые индикаторы в системном микшере
+        громкости - НЕ требует захвата аудиопотока (loopback), просто
+        спрашивает у драйвера текущий пик с прошлого опроса.
+
+        dt - секунд с прошлого вызова (для затухания показанного пика, см.
+        VU_RELEASE_SECONDS) - вызывающий код (pc_hud.py) передаёт фактически
+        прошедшее время между тиками главного цикла, не TICK_INTERVAL
+        "в теории".
+
+        Возвращает dict: vu_peak_pct (пик по всем каналам сразу, 0-100),
+        vu_left_pct, vu_right_pct (раздельно для стерео; при ином числе
+        каналов, включая моно, оба получают общий пик - честного разделения
+        тогда всё равно нет).
+
+        Нули (НЕ None) при недоступности - в отличие от read_state(), эти
+        значения идут напрямую в common_metrics ленты (pc_hud.py), где
+        всегда ожидается float (см. там же паттерн disk1/disk2 -> 0.0).
+        """
+        empty = {"vu_peak_pct": 0.0, "vu_left_pct": 0.0, "vu_right_pct": 0.0}
+        if not self.available:
+            return empty
+
+        meter = self._meter_iface or self._get_meter_interface()
+        if meter is None:
+            return empty
+
+        try:
+            peak = meter.GetPeakValue()  # 0.0-1.0, по всем каналам сразу
+            channel_count = meter.GetMeteringChannelCount()
+            if channel_count >= 2:
+                buf = (ctypes.c_float * channel_count)()
+                # afPeakValues у _IAudioMeterInformationFull объявлен как
+                # POINTER(c_float) с направлением "in" (буфер выделяем МЫ,
+                # см. докстринг класса выше) - ctypes-массив передаётся как
+                # есть, comtypes сам приводит его к указателю на первый
+                # элемент при вызове.
+                meter.GetChannelsPeakValues(channel_count, buf)
+                left_raw, right_raw = buf[0], buf[1]
+            else:
+                left_raw = right_raw = peak
+        except (COMError, AttributeError, OSError, ValueError) as e:
+            # Расширенный except - НАМЕРЕННО шире, чем просто COMError:
+            # на реальном первом запуске сюда прилетел AttributeError из-за
+            # неполного объявления интерфейса в pycaw (см. докстринг
+            # _IAudioMeterInformationFull) - он не ловился и убивал ВЕСЬ
+            # поток metrics_main_loop целиком (не только VU), из-за чего
+            # зависали вообще все метрики и лента/OLED переставали
+            # обновляться. Раз это метод "не должен бросать исключений"
+            # (см. докстринг read_vu про "нули, не None"), ловим тут любую
+            # реалистичную причину сбоя чтения COM-интерфейса, а не только
+            # ожидаемую COMError.
+            print(f"[audio] read_vu failed, will reinit meter: {e}", flush=True)
+            self._meter_iface = None
+            return empty
+
+        def _decay(prev_pct, new_raw):
+            new_pct = max(0.0, min(100.0, new_raw * 100.0))
+            if new_pct >= prev_pct or self.VU_RELEASE_SECONDS <= 0:
+                return new_pct  # атака - мгновенно (или спад выключен)
+            frac = min(1.0, dt / self.VU_RELEASE_SECONDS)
+            return prev_pct + (new_pct - prev_pct) * frac
+
+        self._vu_peak = _decay(self._vu_peak, peak)
+        self._vu_left = _decay(self._vu_left, left_raw)
+        self._vu_right = _decay(self._vu_right, right_raw)
+
+        return {
+            "vu_peak_pct": round(self._vu_peak, 1),
+            "vu_left_pct": round(self._vu_left, 1),
+            "vu_right_pct": round(self._vu_right, 1),
+        }
 
     def set_volume_relative(self, steps):
         """Изменить громкость на steps процентных пунктов (положительное =
@@ -519,6 +685,7 @@ if __name__ == "__main__":
 
     audio = AudioController()
     print("Audio:", audio.read_state())
+    print("VU:", audio.read_vu())
 
     media = MediaMonitor()
     print("Media:", media.read())

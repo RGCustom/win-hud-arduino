@@ -107,6 +107,13 @@ BAR_METRICS = {
     "disk1": "Диск 1, %",
     "disk2": "Диск 2, %",
     "net": "NET (Network 1, для LED)",
+    # VU-метр - реальный уровень играющего звука (пики сигнала), НЕ системная
+    # громкость (volume_pct) - см. metrics_windows.AudioController.read_vu().
+    # peak - общий пик по всем каналам сразу (удобно для classic-режима);
+    # left/right - для честного стерео в center-режиме (низ=left, верх=right).
+    "vu_peak": "VU: пик громкости (звук)",
+    "vu_left": "VU: левый канал",
+    "vu_right": "VU: правый канал",
 }
 
 CLICK_ACTIONS = ("mute_toggle", "switch_device")
@@ -758,7 +765,10 @@ def metrics_main_loop(stop_event):
     rotation = screens.RotationState()
     proto = protocol.ProtocolState(full_resync_seconds=FULL_RESYNC_SECONDS)
 
-    common_metrics = {"cpu": 0.0, "ram": 0.0, "gpu": 0.0, "gpu_vram": 0.0, "disk1": 0.0, "disk2": 0.0, "net": 0.0}
+    common_metrics = {
+        "cpu": 0.0, "ram": 0.0, "gpu": 0.0, "gpu_vram": 0.0, "disk1": 0.0, "disk2": 0.0, "net": 0.0,
+        "vu_peak": 0.0, "vu_left": 0.0, "vu_right": 0.0,
+    }
     audio_state = {"volume_pct": 0, "volume_muted": "нет", "audio_device_name": "N/A"}
     media_state = {"media_title": None, "media_artist": None, "media_playing": "нет"}
     lines = ["", "", ""]
@@ -767,6 +777,12 @@ def metrics_main_loop(stop_event):
     osd_until = 0.0
 
     last_metrics_tick = 0.0
+    # last_vu_time - ОТДЕЛЬНЫЙ от last_metrics_tick таймер: VU обновляется
+    # каждый тик (TICK_INTERVAL, ~100мс), а не раз в POLL_INTERVAL (1с) как
+    # остальные метрики - иначе индикатор реального звука будет заметно
+    # дёрганым/с лагом. dt между тиками нужен AudioController.read_vu() для
+    # плавного затухания пика (см. VU_RELEASE_SECONDS в metrics_windows.py).
+    last_vu_time = time.time()
     read_buffer = ""
 
     while not stop_event.is_set():
@@ -909,6 +925,14 @@ def metrics_main_loop(stop_event):
                 "time_now": time.strftime("%H:%M"),
                 "volume_pct": audio_state["volume_pct"], "volume_muted": audio_state["volume_muted"],
                 "audio_device_name": audio_state["audio_device_name"],
+                # VU (реальный уровень звука) для OLED-шаблонов - берём уже
+                # посчитанное значение из common_metrics (обновляется каждый
+                # тик ниже по циклу, см. блок "VU" после медленных метрик) -
+                # отдельный COM-вызов тут не нужен, лаг не больше одного тика
+                # (~TICK_INTERVAL), для текстового экрана это незаметно.
+                "vu_peak_pct": round(common_metrics.get("vu_peak", 0.0)),
+                "vu_left_pct": round(common_metrics.get("vu_left", 0.0)),
+                "vu_right_pct": round(common_metrics.get("vu_right", 0.0)),
                 "keyboard_layout": keyboard_layout,
                 "media_title": media_state["media_title"],
                 "media_artist": media_state["media_artist"],
@@ -922,6 +946,33 @@ def metrics_main_loop(stop_event):
             lines = rotation.current_lines(current_screens, context, now=now)
             with state_lock:
                 state["oled_lines"] = lines
+
+        # ---- VU (реальный уровень звука): каждый тик, НЕ раз в POLL_INTERVAL -
+        # иначе индикатор ощутимо дёргается/лагает при интервале в секунду.
+        # dt считаем по факту прошедшего времени между итерациями (а не
+        # "теоретический" TICK_INTERVAL) - на случай, если предыдущая
+        # итерация подвисла на serial write/read. Пишем в common_metrics
+        # ПОСЛЕ блока медленных метрик выше - там common_metrics иногда
+        # переприсваивается целиком, и vu-ключи иначе терялись бы до
+        # следующего POLL_INTERVAL.
+        vu_dt = now - last_vu_time
+        last_vu_time = now
+        try:
+            vu_state = audio_controller.read_vu(dt=vu_dt if vu_dt > 0 else TICK_INTERVAL)
+        except Exception as e:
+            # Страховка: на реальном запуске необработанное исключение
+            # именно отсюда (AttributeError из-за неполного объявления
+            # IAudioMeterInformation в pycaw - см. metrics_windows.py) убило
+            # ВЕСЬ поток metrics_main_loop целиком, а не только VU - экран
+            # переставал обновляться вообще (CPU/RAM/лента/OLED - всё
+            # замирало). read_vu() теперь сама не должна бросать исключения,
+            # но эта обвязка - защита именно от того, чтобы ЛЮБАЯ будущая
+            # ошибка в чтении звука не могла повторить тот же сценарий.
+            print(f"[audio] read_vu() unexpected error, VU отключён на этот тик: {e}", flush=True)
+            vu_state = {"vu_peak_pct": 0.0, "vu_left_pct": 0.0, "vu_right_pct": 0.0}
+        common_metrics["vu_peak"] = vu_state["vu_peak_pct"]
+        common_metrics["vu_left"] = vu_state["vu_left_pct"]
+        common_metrics["vu_right"] = vu_state["vu_right_pct"]
 
         # ---- лента: OSD громкости ИЛИ обычная метрика (каждый тик) ----
         leds_count = cfg["leds_count"]

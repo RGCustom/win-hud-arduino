@@ -47,6 +47,15 @@ shkaf-hud код) просто никогда не пойдёт по repeating-�
 #     "volume_pct": int, "volume_muted": str,   # "да"/"нет" - уже отформатировано
 #     "audio_device_name": str,
 #
+#     # VU-метр - реальный уровень ИГРАЮЩЕГО звука (пики сигнала, через
+#     # Core Audio IAudioMeterInformation) - НЕ то же самое, что volume_pct
+#     # (системная громкость может быть 100%, а играть тихая запись, и
+#     # наоборот). peak - по обоим каналам сразу; left/right - раздельно для
+#     # стерео (для моно-источника оба равны peak). Обновляется каждый тик
+#     # (не раз в POLL_INTERVAL) с плавным затуханием - см.
+#     # metrics_windows.AudioController.read_vu().
+#     "vu_peak_pct": int, "vu_left_pct": int, "vu_right_pct": int,
+#
 #     "keyboard_layout": str,   # глобальная системная раскладка, напр. "RU"/"EN"
 #
 #     "media_title": str|None, "media_artist": str|None,   # None, если сейчас
@@ -157,6 +166,9 @@ VARIABLES = {
     "volume_pct":       {"label": "Громкость, %",                  "group": "scalar", "category": "Аудио", "resolver": _scalar("volume_pct")},
     "volume_muted":     {"label": "Звук выключен (да/нет)",        "group": "scalar", "category": "Аудио", "resolver": _scalar("volume_muted")},
     "audio_device_name": {"label": "Устройство вывода звука",      "group": "scalar", "category": "Аудио", "resolver": _scalar("audio_device_name")},
+    "vu_peak_pct":       {"label": "VU: пик громкости (звук), %",  "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_peak_pct")},
+    "vu_left_pct":       {"label": "VU: левый канал, %",           "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_left_pct")},
+    "vu_right_pct":      {"label": "VU: правый канал, %",          "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_right_pct")},
 
     # --- Клавиатура ---
     "keyboard_layout":  {"label": "Раскладка клавиатуры (RU/EN и т.п.)", "group": "scalar", "category": "Система", "resolver": _scalar("keyboard_layout")},
