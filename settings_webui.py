@@ -81,6 +81,16 @@ SETTINGS_PAGE_HTML = """<!doctype html>
       <label>Диодов на ленте</label>
       <input type="number" id="leds-count" min="1" max="300" value="30">
     </div>
+
+    <div class="slider-row">
+      <label>Частота опроса (VU/лента)</label>
+      <input type="range" id="tick-interval-ms" min="20" max="500" step="5" value="40">
+      <span class="val" id="tick-interval-ms-val">40мс (~25Гц)</span>
+    </div>
+    <div class="note">Как часто опрашивается звук (VU-метр) и отправляется обновление на ленту по serial.
+      Ниже - отзывчивее (лучше для VU-эквалайзера), но больше нагрузка на serial-порт, особенно
+      при большом числе диодов выше. Если при малых значениях лента начнёт подтормаживать/дёргаться -
+      увеличьте это число.</div>
   </div>
 
   <!-- ---- Энкодер громкости ---- -->
@@ -166,6 +176,26 @@ const ledsCountEl = document.getElementById("leds-count");
 debounceSave(ledsCountEl, v => editingLedsCount = v, () => {
   fetch("/api/leds_count", { method: "POST", headers: {"Content-Type":"application/json"},
     body: JSON.stringify({ value: parseInt(ledsCountEl.value) }) });
+});
+
+const tickIntervalEl = document.getElementById("tick-interval-ms");
+const tickIntervalValEl = document.getElementById("tick-interval-ms-val");
+let editingTickInterval = false;
+function formatTickInterval(ms) {
+  return ms + "мс (~" + Math.round(1000 / ms) + "Гц)";
+}
+// Подпись обновляем на КАЖДОЕ движение ползунка (input), а не только на
+// отпускание (change) - иначе число мс/Гц не успевает за пальцем/мышью, в
+// отличие от peak-hold/peak-fade слайдеров ниже (там это не так критично,
+// а тут пользователь настраивает "на глаз" по отзывчивости).
+tickIntervalEl.addEventListener("input", () => {
+  editingTickInterval = true;
+  tickIntervalValEl.textContent = formatTickInterval(parseInt(tickIntervalEl.value));
+});
+tickIntervalEl.addEventListener("change", () => {
+  fetch("/api/tick_interval", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ value: parseInt(tickIntervalEl.value) / 1000 }) });
+  editingTickInterval = false;
 });
 
 const volumeStepEl = document.getElementById("volume-step");
@@ -400,6 +430,15 @@ function render(state) {
   metricsMap = state.metrics;
 
   if (!editingLedsCount) ledsCountEl.value = state.cfg.leds_count;
+
+  if (!editingTickInterval) {
+    // state.cfg.tick_interval хранится в СЕКУНДАХ на сервере (см.
+    // DEFAULT_SETTINGS/TICK_INTERVAL в pc_hud.py) - на слайдере показываем
+    // мс, конвертация туда-обратно только тут и в обработчике change выше.
+    const ms = Math.round(state.cfg.tick_interval * 1000);
+    tickIntervalEl.value = ms;
+    tickIntervalValEl.textContent = formatTickInterval(ms);
+  }
 
   if (!editingVolumeStep) volumeStepEl.value = state.cfg.encoder.volume_step_pct;
   encoderClickEl.value = state.cfg.encoder.click_action;

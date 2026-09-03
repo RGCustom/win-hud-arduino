@@ -60,7 +60,15 @@ BAUD = int(os.environ.get("BAUD", "115200"))
 NET_MAX_MBPS = float(os.environ.get("NET_MAX_MBPS", "300"))
 
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))       # медленные метрики (CPU/RAM/GPU/диски/сеть/экраны)
-TICK_INTERVAL = float(os.environ.get("TICK_INTERVAL", "0.1"))        # частота главного цикла (BAR/serial-чтение)
+TICK_INTERVAL = float(os.environ.get("TICK_INTERVAL", "0.04"))        # частота главного цикла (BAR/serial-чтение) -
+                                                                        # 25 Гц; понижено с прежних 0.1с (10 Гц) - для
+                                                                        # VU-эквалайзера (см. read_vu() в
+                                                                        # metrics_windows.py) 10 Гц ощущались
+                                                                        # ступенчато. Если при большом числе
+                                                                        # светодиодов упрётесь в пропускную
+                                                                        # способность serial (115200 бод) - можно
+                                                                        # поднять обратно через переменную окружения
+                                                                        # TICK_INTERVAL=0.06 и т.п., без правки кода.
 FULL_RESYNC_SECONDS = float(os.environ.get("FULL_RESYNC_SECONDS", "30"))
 
 WEB_PORT = int(os.environ.get("WEB_PORT", "8189"))
@@ -132,6 +140,18 @@ DEFAULT_SETTINGS = {
     "peak_fade_seconds": DEFAULT_PEAK_FADE_SECONDS,
     "contrast": 255,
     "leds_count": 30,
+    # Частота главного цикла (VU/BAR-обновления, чтение serial), в секундах -
+    # см. также TICK_INTERVAL (env var) в шапке файла. Дефолт тут = значению
+    # TICK_INTERVAL на момент старта - т.е. пока настройку никто не трогал
+    # через /settings, поведение то же, что было раньше (управлялось только
+    # переменной окружения). Как только пользователь один раз сохранит
+    # значение через /api/tick_interval, оно осядет в settings.json и с
+    # этого момента будет ПЕРЕВЕШИВАТЬ переменную окружения при каждом
+    # следующем запуске (см. load_settings() - saved-значение всегда в
+    # приоритете над DEFAULT_SETTINGS). Это осознанный компромисс: раз
+    # настройка живёт в /settings как обычный слайдер, она должна вести
+    # себя как остальные - переживать перезапуски независимо от env.
+    "tick_interval": TICK_INTERVAL,
     "serial_port": "",
     "net1_iface": "",
     "net2_iface": "",
@@ -672,6 +692,23 @@ def api_leds_count():
     return jsonify({"ok": True})
 
 
+@app.route("/api/tick_interval", methods=["POST"])
+def api_tick_interval():
+    """Частота главного цикла (VU/лента/serial) - см. tick_interval в
+    DEFAULT_SETTINGS выше и использование в главном цикле ниже. Границы
+    0.02с (50 Гц) - 0.5с (2 Гц): нижняя - чтобы не заспамить serial-порт
+    при большом leds_count (см. предупреждение в README про пропускную
+    способность 115200 бод), верхняя - чтобы настройка не превращала ленту
+    в полностью неотзывчивую по ошибке."""
+    body = request.get_json(force=True)
+    with state_lock:
+        state["cfg"]["tick_interval"] = round(
+            max(0.02, min(0.5, float(body.get("value", state["cfg"]["tick_interval"])))), 3
+        )
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
 @app.route("/api/serial_port", methods=["POST"])
 def api_serial_port():
     body = request.get_json(force=True)
@@ -958,7 +995,7 @@ def metrics_main_loop(stop_event):
         vu_dt = now - last_vu_time
         last_vu_time = now
         try:
-            vu_state = audio_controller.read_vu(dt=vu_dt if vu_dt > 0 else TICK_INTERVAL)
+            vu_state = audio_controller.read_vu(dt=vu_dt if vu_dt > 0 else cfg.get("tick_interval", TICK_INTERVAL))
         except Exception as e:
             # Страховка: на реальном запуске необработанное исключение
             # именно отсюда (AttributeError из-за неполного объявления
@@ -1053,7 +1090,17 @@ def metrics_main_loop(stop_event):
                 last_reconnect_attempt = now
 
         elapsed = time.time() - loop_t0
-        stop_event.wait(timeout=max(0.0, TICK_INTERVAL - elapsed))
+        # cfg["tick_interval"] - живая настройка из /settings (см.
+        # /api/tick_interval и DEFAULT_SETTINGS выше), а не статическая
+        # TICK_INTERVAL - cfg уже перечитывается из state в начале КАЖДОЙ
+        # итерации цикла (см. "cfg = copy.deepcopy(state[\"cfg\"])" в самом
+        # начале while), поэтому смена значения в /settings подхватывается
+        # на следующем же тике, без перезапуска pc_hud.py. TICK_INTERVAL
+        # (env var) используется только как дефолт при самом первом запуске
+        # (см. DEFAULT_SETTINGS) - .get() тут на случай уже сохранённого
+        # settings.json от версии ДО этой настройки (там ключа ещё нет).
+        tick_interval = cfg.get("tick_interval", TICK_INTERVAL)
+        stop_event.wait(timeout=max(0.0, tick_interval - elapsed))
 
     if ser is not None:
         try:

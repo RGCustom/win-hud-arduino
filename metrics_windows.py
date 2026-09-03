@@ -435,10 +435,20 @@ class AudioController:
             print(f"[audio] GetMeterInformation failed: {e}", flush=True)
             return None
 
-    VU_RELEASE_SECONDS = 0.3  # время плавного спада показанного пика -
-                               # визуальная характеристика ленты, поэтому
-                               # константа тут, а не настройка в /settings
-                               # (аналогично OLED_SCROLL_STEP_PX в .ino)
+    VU_RELEASE_SECONDS = 0.15  # время плавного спада показанного пика -
+                                # визуальная характеристика ленты, поэтому
+                                # константа тут, а не настройка в /settings
+                                # (аналогично OLED_SCROLL_STEP_PX в .ino).
+                                # Понижено с прежних 0.3с - для
+                                # VU-эквалайзера это ощущалось вязко;
+                                # 0.15с ближе к тому, как затухают полосы
+                                # в типичных спектр-барах плееров (Winamp/
+                                # foobar2000 и т.п.). Не путать с
+                                # TICK_INTERVAL в pc_hud.py - это два
+                                # РАЗНЫХ рычага "отзывчивости": TICK_INTERVAL
+                                # - как часто вообще опрашиваем звук,
+                                # VU_RELEASE_SECONDS - как быстро гаснет
+                                # уже показанный пик между опросами.
 
     def read_vu(self, dt=0.1):
         """
@@ -564,9 +574,23 @@ class AudioController:
 class MediaMonitor:
     """
     Текущий трек через Windows SMTC - тот же источник данных, что у системного
-    медиа-виджета (Win+K/уведомления). Показывает сессию, которую Windows
-    считает "текущей" (обычно последний плеер, с которым было взаимодействие -
-    Spotify/браузер/VLC/...), а не какое-то конкретное приложение.
+    медиа-виджета (Win+K/уведомления). НЕ полагается на "текущую" сессию по
+    версии Windows (это ненадёжная эвристика, часто даёт None при реально
+    играющей музыке) - вместо этого перебирает ВСЕ зарегистрированные SMTC-
+    сессии и берёт первую, где статус реально Playing (см. _read_async()).
+
+    ВАЖНО: SMTC - это API, который каждое приложение регистрирует САМО.
+    UWP-приложения на MediaPlayer (в т.ч. встроенный проигрыватель Windows -
+    "Фильмы и ТВ"/Media Player, Groove) интегрируются автоматически. Обычные
+    Win32-программы (в т.ч. многие сторонние плееры) должны реализовать это
+    явно - если приложение НЕ добавляет свою сессию в SMTC, оно тут просто
+    не появится, вне зависимости от того, насколько правильно написан этот
+    класс. Известно, что так ведут себя некоторые версии AIMP (нужна
+    отдельная настройка/плагин интеграции с системными медиаклавишами - см.
+    настройки AIMP) и большинство десктоп-клиентов Plex (Electron-based, SMTC
+    не реализуют вовсе). Если не уверены, работает ли конкретный плеер -
+    проверьте системный медиа-виджет Win+K во время его воспроизведения:
+    если плеер не появляется там - он не появится и тут, дело не в этом коде.
 
     winsdk - WinRT-биндинг, весь API асинхронный. Остальной pc_hud.py
     синхронный, а опрашивается это редко (раз в POLL_INTERVAL, как GPU/диски) -
@@ -596,35 +620,68 @@ class MediaMonitor:
             print(f"[media] read failed: {e}", flush=True)
             return empty
 
+    def debug_list_sessions(self):
+        """
+        Диагностика для ручной проверки (см. самотест в конце файла:
+        `python metrics_windows.py`) - НЕ используется в обычной работе
+        pc_hud.py. Печатает КАЖДУЮ SMTC-сессию, которую видит Windows, с её
+        источником (app_user_model_id) и статусом - позволяет отличить два
+        разных случая:
+          - сессий вообще нет / нужного плеера нет в списке -> само
+            приложение не регистрируется в SMTC, это не чинится в этом коде
+            (см. докстринг класса выше про AIMP/Plex)
+          - сессия есть, но playback_status не Playing -> отладка тут, в
+            _read_async()/read()
+        """
+        if not self.available:
+            print("[media] winsdk недоступен")
+            return
+        asyncio.run(self._debug_list_sessions_async())
+
+    async def _debug_list_sessions_async(self):
+        manager = await _MediaManager.request_async()
+        sessions = manager.get_sessions()
+        if not sessions:
+            print("[media] Windows не видит НИ ОДНОЙ SMTC-сессии сейчас")
+            return
+        for session in sessions:
+            info = session.get_playback_info()
+            status = info.playback_status if info else None
+            source = session.source_app_user_model_id
+            print(f"[media] сессия: source={source!r} playback_status={status}")
+
     async def _read_async(self):
         manager = await _MediaManager.request_async()
-        session = manager.get_current_session()
-        if session is None:
+
+        # НЕ используем manager.get_current_session() - это эвристика Windows
+        # "какую сессию считать текущей", и она нередко возвращает None даже
+        # при реально играющей музыке (особенно если открыто несколько
+        # источников звука одновременно, или фокус недавно переключался
+        # между приложениями) - см. обсуждение в README. Вместо этого сами
+        # перебираем ВСЕ зарегистрированные SMTC-сессии и берём первую, где
+        # реально Playing - так надёжнее и не зависит от того, что Windows
+        # сочла "текущим".
+        sessions = manager.get_sessions()
+
+        playing_session = None
+        for session in sessions:
+            info = session.get_playback_info()
+            # PlaybackStatus: Closed=0, Opened=1, Changing=2, Stopped=3, Playing=4, Paused=5
+            if info and info.playback_status == 4:
+                playing_session = session
+                break
+
+        if playing_session is None:
             return {"media_title": None, "media_artist": None, "media_playing": "нет"}
 
-        playback_info = session.get_playback_info()
-        # PlaybackStatus: Closed=0, Opened=1, Changing=2, Stopped=3, Playing=4, Paused=5
-        status = playback_info.playback_status if playback_info else None
-        playing = "да" if status == 4 else "нет"
-
-        if status != 4:
-            # Сессия есть, но сейчас не Playing (пауза/стоп/нет данных) - SMTC
-            # почти всегда держит метаданные ПОСЛЕДНЕГО трека даже после
-            # паузы/остановки, поэтому НЕ отдаём title/artist в этом случае -
-            # иначе экран Now Playing показывал бы устаревший трек, который
-            # уже не играет (см. правило в докстринге screens.py -
-            # build_active_screens). Заодно экономим лишний async-вызов
-            # try_get_media_properties_async(), который тут всё равно не нужен.
-            return {"media_title": None, "media_artist": None, "media_playing": playing}
-
-        props = await session.try_get_media_properties_async()
+        props = await playing_session.try_get_media_properties_async()
         title = (props.title or "").strip() if props else ""
         artist = (props.artist or "").strip() if props else ""
 
         return {
             "media_title": title or None,
             "media_artist": artist or None,
-            "media_playing": playing,
+            "media_playing": "да",
         }
 
 
@@ -689,3 +746,5 @@ if __name__ == "__main__":
 
     media = MediaMonitor()
     print("Media:", media.read())
+    print("Media sessions raw dump:")
+    media.debug_list_sessions()
