@@ -82,6 +82,14 @@ SETTINGS_PAGE_HTML = """<!doctype html>
       <input type="number" id="leds-count" min="1" max="300" value="30">
     </div>
 
+    <div class="checkbox-row">
+      <input type="checkbox" id="leds-reverse">
+      <label for="leds-reverse">Реверс ленты (если подключена/повёрнута задом наперёд)</label>
+    </div>
+    <div class="note">Переворачивает порядок диодов на лету, без пересборки прошивки -
+      альтернатива калибровке LED_MAP, если выяснилось, что вся лента целиком светится
+      "не в ту сторону" (начало и конец градиента поменялись местами).</div>
+
     <div class="slider-row">
       <label>Частота опроса (VU/лента)</label>
       <input type="range" id="tick-interval-ms" min="20" max="500" step="5" value="40">
@@ -176,6 +184,12 @@ const ledsCountEl = document.getElementById("leds-count");
 debounceSave(ledsCountEl, v => editingLedsCount = v, () => {
   fetch("/api/leds_count", { method: "POST", headers: {"Content-Type":"application/json"},
     body: JSON.stringify({ value: parseInt(ledsCountEl.value) }) });
+});
+
+const ledsReverseEl = document.getElementById("leds-reverse");
+ledsReverseEl.addEventListener("change", () => {
+  fetch("/api/leds_reverse", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ value: ledsReverseEl.checked }) });
 });
 
 const tickIntervalEl = document.getElementById("tick-interval-ms");
@@ -343,7 +357,12 @@ function renderBar(cfg) {
   modeLabel.textContent = "Режим";
   modeRow.appendChild(modeLabel);
   const modeSel = document.createElement("select");
-  [["classic", "Classic (слева направо)"], ["center", "Center (от центра в обе стороны)"]].forEach(([val, text]) => {
+  [
+    ["classic", "Classic (слева направо)"],
+    ["center", "Center (от центра в обе стороны)"],
+    ["edges", "Edges (от краёв к центру)"],
+    ["flat", "Flat (вся лента одним цветом)"],
+  ].forEach(([val, text]) => {
     const opt = document.createElement("option");
     opt.value = val; opt.textContent = text;
     if (val === cfg.mode[BAR_ID]) opt.selected = true;
@@ -373,10 +392,19 @@ function renderBar(cfg) {
   card.appendChild(bottomBlock);
 
   function applyModeVisibility(mode) {
-    bottomTitle.textContent = mode === "center" ? "Левая половина" : "";
-    topBlock.style.display = mode === "center" ? "block" : "none";
+    // center и edges - оба двухполосные режимы (см. ledbar.py) - у обоих
+    // показываем блок "правая половина" и подписываем нижний блок как
+    // "левая половина"; classic/flat - однометричные, там второй половины
+    // нет вообще, а нижний блок - единственная метрика без подписи.
+    const twoHalves = mode === "center" || mode === "edges";
+    bottomTitle.textContent = twoHalves ? "Левая половина" : "";
+    topBlock.style.display = twoHalves ? "block" : "none";
+    // Peak hold (точка недавнего максимума) не имеет смысла в flat-режиме -
+    // там нет позиции вдоль ленты, куда её ставить (см. докстринг
+    // ledbar.compute_bar_pixels_flat() и ветку "flat" в главном цикле
+    // pc_hud.py, где peak_enabled для этого режима не используется).
+    peakRow.style.display = mode === "flat" ? "none" : "block";
   }
-  applyModeVisibility(cfg.mode[BAR_ID]);
 
   modeSel.addEventListener("change", () => {
     applyModeVisibility(modeSel.value);
@@ -415,6 +443,7 @@ function renderBar(cfg) {
   styleRow.appendChild(styleSel);
   peakRow.appendChild(styleRow);
   card.appendChild(peakRow);
+  applyModeVisibility(cfg.mode[BAR_ID]);
 
   function sendPeak(partial) {
     const body = {}; body[BAR_ID] = partial;
@@ -430,6 +459,7 @@ function render(state) {
   metricsMap = state.metrics;
 
   if (!editingLedsCount) ledsCountEl.value = state.cfg.leds_count;
+  ledsReverseEl.checked = !!state.cfg.leds_reverse;
 
   if (!editingTickInterval) {
     // state.cfg.tick_interval хранится в СЕКУНДАХ на сервере (см.

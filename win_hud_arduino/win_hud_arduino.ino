@@ -48,11 +48,19 @@
 #define NUM_LEDS        30      // должно совпадать с cfg["leds_count"] в settings.json хоста
 #define LED_PIN         6
 
-#define ENCODER_CLK_PIN 8       // энкодер: CLK (A)
-#define ENCODER_DT_PIN  9       // энкодер: DT (B)
+// ВАЖНО: CLK обязан сидеть на пине, поддерживающем attachInterrupt() - на
+// Pro Micro/Leonardo (ATmega32u4) это ТОЛЬКО пины 0, 1, 2, 3, 7. Пины 0/1
+// заняты Serial (связь с хостом), 2/3 - I2C (OLED) - единственный свободный
+// вариант это пин 7. Если поставить CLK на любой другой пин (например 8) -
+// attachInterrupt() тихо получит NOT_AN_INTERRUPT, encoderISR() не будет
+// вызываться НИКОГДА и вращение энкодера не будет регистрироваться вообще,
+// независимо от того, как физически подключены DT/CLK - это не ошибка
+// проводки, это ограничение конкретных пинов на этой плате.
+#define ENCODER_CLK_PIN 7       // энкодер: CLK (A) - ДОЛЖЕН быть interrupt-пином
+#define ENCODER_DT_PIN  9       // энкодер: DT (B) - обычный digitalRead, прерывание не нужно
 #define ENCODER_BTN_PIN 10      // кнопка энкодера - INPUT_PULLUP, замыкание на GND
 
-#define OLED_FONT_SIZE  2       // 1-4, см. oledFont() ниже - подбирается под физический размер экрана/вкус
+#define OLED_FONT_SIZE  1       // 0-4, см. oledFont() ниже - подбирается под физический размер экрана/вкус (0 - самый мелкий)
 
 // Worst-case строка: "BAR:" + NUM_LEDS*6 + "|BRI:100|CON:255" + 3 строки OLED.
 // При NUM_LEDS=30 это ~290 байт - берём с запасом. Если увеличишь NUM_LEDS
@@ -92,16 +100,29 @@ U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 const uint8_t *oledFont() {
   switch (OLED_FONT_SIZE) {
-    case 1: return u8g2_font_5x8_t_cyrillic;
-    case 3: return u8g2_font_7x14_t_cyrillic;
+    case 0: return u8g2_font_6x12_t_cyrillic;    // экстра-мелкий
+    case 1: return u8g2_font_6x13_t_cyrillic;
+    case 3: return u8g2_font_8x13_t_cyrillic;
     case 4: return u8g2_font_9x15_t_cyrillic;
-    default: return u8g2_font_6x12_t_cyrillic;  // case 2 / фолбэк
+    default: return u8g2_font_10x20_t_cyrillic;  // case 2 / фолбэк
   }
 }
 
 String oledLines[3] = {"", "", ""};
 int16_t scrollOffset[3] = {0, 0, 0};
 unsigned long lastScrollMs = 0;
+
+// oledDirty - НОВОЕ: раньше drawOled() (несколько проходов по I2C на
+// однобуферном "_1_" конструкторе U8g2) вызывался БЕЗУСЛОВНО на каждой
+// итерации loop(), даже если экран не менялся ни на пиксель. Это ощутимо
+// тормозило частоту loop() и, как следствие, частоту pollButton() ниже -
+// если целый клик (нажал-отпустил) укладывался в один "медленный" проход
+// отрисовки, pollButton() мог просто не увидеть переход состояния между
+// двумя своими опросами (быстрые клики "терялись", хотя сам debounce
+// был в порядке). Теперь перерисовываем OLED, только когда есть что
+// перерисовывать - см. флаг выставляется в applyOledLine() (новый текст)
+// и в updateScroll() (реальный шаг скролла), сбрасывается после drawOled().
+bool oledDirty = true;
 
 // ---------------- serial: входящий буфер ----------------
 
@@ -168,6 +189,7 @@ void applyContrast(const char *value) {
 void applyOledLine(uint8_t idx, const char *value) {
   oledLines[idx] = String(value);
   scrollOffset[idx] = 0;  // новая строка - скролл начинается заново
+  oledDirty = true;
 }
 
 void runCalibration();  // объявление вперёд - используется в processCommandLine ниже
@@ -321,6 +343,7 @@ void updateScroll() {
     if (scrollOffset[i] >= textWidth + OLED_SCROLL_GAP_PX) {
       scrollOffset[i] = 0;
     }
+    oledDirty = true;
   }
 }
 
@@ -372,5 +395,8 @@ void loop() {
   flushEncoder();
 
   updateScroll();
-  drawOled();
+  if (oledDirty) {
+    drawOled();
+    oledDirty = false;
+  }
 }

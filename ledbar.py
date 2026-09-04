@@ -30,6 +30,18 @@ leds_per_bar явно, беря его из cfg["leds_count"].
     свой % заполнения/градиент/solid:
     compute_bar_pixels_center(pct_bottom, pct_top, ...)
 
+  - "edges" - зеркальная противоположность "center": лента растёт от ОБОИХ
+    краёв к центру (у каждой половины свой % заполнения/градиент/solid, как
+    и в center - геометрия половин та же, различается только направление
+    роста внутри каждой половины):
+    compute_bar_pixels_edges(pct_bottom, pct_top, ...)
+
+  - "flat" - НЕ позиционный режим вообще: вся лента целиком горит ОДНИМ
+    сплошным цветом, который сам плывёт по 3-стопному градиенту c1->c2->c3
+    в зависимости от pct (0% -> чистый c1, 50% -> c2, 100% -> чистый c3).
+    Заполнения/роста длины тут нет - вся информация только в цвете:
+    compute_bar_pixels_flat(pct, c1, c2, c3, ...)
+
   - "volume_osd" - НЕ отдельный режим здесь, а частный случай center с
     ОДИНАКОВЫМ pct и ОДИНАКОВЫМИ цветами на обе половины (см. комментарий
     "Зеркальность" в shkaf-hud - там та же идея). Это ровно то, что нужно
@@ -181,6 +193,93 @@ def compute_bar_pixels_center(
         top_half = _apply_peak(top_half, peak_pct_top, t_c3, top_count)
 
     return bottom_half + top_half
+
+
+def compute_bar_pixels_edges(
+    pct_bottom, pct_top,
+    b_c1, b_c2, b_c3, b_solid,
+    t_c1, t_c2, t_c3, t_solid,
+    leds_per_bar=LEDS_PER_BAR,
+    peak_pct_bottom=None, peak_pct_top=None,
+):
+    """
+    Edges-режим: зеркальная противоположность center - лента растёт от
+    ОБОИХ краёв к центру (вместо от центра к краям). Деление на половины
+    (bottom_count/top_count) и сигнатура - один в один как у
+    compute_bar_pixels_center() выше, различается только то, какую из
+    половин реверсируем.
+
+    В _gradient_pixels() level 0 полосы - это "старт" (там, где при pct=0%
+    ничего не горит, а первым загорается именно level 0 по мере роста pct) -
+    см. докстринг _gradient_pixels выше. В center() bottom_half реверсируют,
+    чтобы level 0 (загорается первым) оказался РЯДОМ С ЦЕНТРОМ - тогда рост
+    идёт от центра наружу. Здесь нужно ровно наоборот - level 0 должен
+    оказаться на ДАЛЬНЕМ КРАЮ ленты, чтобы рост шёл от края к центру:
+
+        - bottom_half (левая половина, физически идёт первой в
+          итоговом массиве) - НЕ реверсируем: index 0 в
+          _gradient_pixels() и так соответствует крайней левой физической
+          позиции (см. итоговую сборку bottom_half + top_half) - level 0
+          загорается первым, и он уже на краю ленты, ничего двигать не надо.
+        - top_half (правая половина) - реверсируем: без этого level 0
+          оказался бы у самой границы с bottom_half (то есть у центра) и
+          загорался бы первым, что дало бы рост от центра, как в center().
+          Реверс переносит level 0 на дальний правый край - именно туда,
+          где должен начинаться рост в edges-режиме.
+
+    Peak hold (если задан) применяется К НЕРЕВЕРСИРОВАННОМУ массиву - как и
+    в center() - индексы _apply_peak() считаются в терминах "level = pct"
+    независимо от последующего физического реверса, поэтому порядок
+    "посчитать пик -> затем реверсировать" сохранён без изменений.
+
+    Возвращает ПОЛНЫЙ список из leds_per_bar строк 'RRGGBB'.
+    """
+    bottom_count = leds_per_bar // 2
+    top_count = leds_per_bar - bottom_count
+
+    bottom_half = _gradient_pixels(pct_bottom, b_c1, b_c2, b_c3, b_solid, bottom_count)
+    if peak_pct_bottom is not None:
+        bottom_half = _apply_peak(bottom_half, peak_pct_bottom, b_c3, bottom_count)
+    # реверс НЕ нужен - level 0 уже на краю ленты, см. докстринг выше
+
+    top_half = _gradient_pixels(pct_top, t_c1, t_c2, t_c3, t_solid, top_count)
+    if peak_pct_top is not None:
+        top_half = _apply_peak(top_half, peak_pct_top, t_c3, top_count)
+    top_half = list(reversed(top_half))  # переносим level 0 на дальний край
+
+    return bottom_half + top_half
+
+
+def compute_bar_pixels_flat(pct, c1_hex, c2_hex, c3_hex, leds_per_bar=LEDS_PER_BAR):
+    """
+    Flat-режим: вся лента - ОДИН сплошной цвет, который сам плывёт по
+    3-стопному градиенту c1->c2->c3 в зависимости от pct (0-100), в отличие
+    от classic/center/edges тут нет понятия "заполненности" длины ленты -
+    ВСЕ leds_per_bar диодов светятся ОДИНАКОВЫМ цветом одновременно.
+
+    Математика цвета идентична серединной части _gradient_pixels() (тот же
+    c1->c2->c3 сплит на 0-50%/50-100%), просто вместо fraction = позиция
+    диода вдоль полосы берём fraction = сам pct/100 - то есть "виртуальный
+    диод" тут один на всю ленту, а не leds_per_bar штук.
+
+    Peak hold сюда не подходит по смыслу (нет позиции, куда его ставить) -
+    поэтому параметра peak_pct тут нет, в отличие от classic/center/edges.
+    solid-чекбокс ("цвет на 100%") тоже неприменим - при pct=100% и так
+    получается чистый c3 естественным путём, отдельная ветка не нужна.
+
+    Возвращает список из leds_per_bar ОДИНАКОВЫХ строк 'RRGGBB'.
+    """
+    pct = max(0.0, min(100.0, pct))
+    c1, c2, c3 = _hex_to_rgb(c1_hex), _hex_to_rgb(c2_hex), _hex_to_rgb(c3_hex)
+    frac = pct / 100.0
+
+    if frac <= 0.5:
+        rgb = _blend(c1, c2, frac / 0.5)
+    else:
+        rgb = _blend(c2, c3, (frac - 0.5) / 0.5)
+
+    color_hex = _rgb_to_hex(rgb)
+    return [color_hex] * leds_per_bar
 
 
 def compute_volume_osd_pixels(

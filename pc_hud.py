@@ -126,6 +126,19 @@ BAR_METRICS = {
 
 CLICK_ACTIONS = ("mute_toggle", "switch_device")
 
+# Режимы ленты - см. ledbar.py (докстринг модуля) за подробным описанием
+# геометрии каждого режима:
+#   classic - обычный градиент по всей длине ленты (одна метрика)
+#   center  - растёт от центра к обоим краям (две половины/метрики)
+#   edges   - растёт от обоих краёв к центру (две половины/метрики,
+#             зеркально center)
+#   flat    - вся лента одним сплошным "плывущим" цветом (одна метрика,
+#             без позиционного заполнения)
+# center/edges используют одну и ту же пару настроек (assignment_top,
+# colors_top, solid_top - "правая половина") - при переключении между ними
+# эти настройки не сбрасываются и не дублируются.
+BAR_MODES = ("classic", "center", "edges", "flat")
+
 DEFAULT_SETTINGS = {
     "colors": DEFAULT_COLORS,
     "colors_top": DEFAULT_COLORS_TOP,
@@ -140,6 +153,15 @@ DEFAULT_SETTINGS = {
     "peak_fade_seconds": DEFAULT_PEAK_FADE_SECONDS,
     "contrast": 255,
     "leds_count": 30,
+    # Реверс ленты - на случай, если она физически подключена/повёрнута
+    # "задом наперёд" относительно того, что ожидает ledbar.py (level 0 =
+    # "начало" полосы). Проще калибровки LED_MAP в прошивке - переключается
+    # на лету из /settings, без пересборки/перезаливки. Разворачивает УЖЕ
+    # ГОТОВЫЙ список пикселей ОДИН РАЗ в главном цикле (см.
+    # metrics_main_loop ниже) - работает одинаково для ЛЮБОГО режима ленты
+    # (classic/center/edges/flat/volume_osd), т.к. применяется уже ПОСЛЕ
+    # того, как конкретный режим посчитал свои пиксели.
+    "leds_reverse": False,
     # Частота главного цикла (VU/BAR-обновления, чтение serial), в секундах -
     # см. также TICK_INTERVAL (env var) в шапке файла. Дефолт тут = значению
     # TICK_INTERVAL на момент старта - т.е. пока настройку никто не трогал
@@ -558,6 +580,7 @@ def api_state():
         out = dict(state)
         out["metrics"] = BAR_METRICS
         out["click_actions"] = CLICK_ACTIONS
+        out["bar_modes"] = BAR_MODES
         out["available_interfaces"] = metrics_windows.list_network_interfaces()
         out["available_disks"] = metrics_windows.list_disk_letters()
         out["available_ports"] = sorted(flash.list_com_ports())
@@ -613,7 +636,7 @@ def api_assignment_top():
 def api_mode():
     body = request.get_json(force=True)
     with state_lock:
-        if "bar0" in body and body["bar0"] in ("classic", "center"):
+        if "bar0" in body and body["bar0"] in BAR_MODES:
             state["cfg"]["mode"]["bar0"] = body["bar0"]
         save_settings(state["cfg"])
     return jsonify({"ok": True})
@@ -688,6 +711,15 @@ def api_leds_count():
     body = request.get_json(force=True)
     with state_lock:
         state["cfg"]["leds_count"] = max(1, min(300, int(body.get("value", state["cfg"]["leds_count"]))))
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/leds_reverse", methods=["POST"])
+def api_leds_reverse():
+    body = request.get_json(force=True)
+    with state_lock:
+        state["cfg"]["leds_reverse"] = bool(body.get("value", state["cfg"]["leds_reverse"]))
         save_settings(state["cfg"])
     return jsonify({"ok": True})
 
@@ -1039,14 +1071,20 @@ def metrics_main_loop(stop_event):
             pct_bottom = round(common_metrics.get(cfg["assignment"]["bar0"], 0))
             bottom_peak = peak_trackers["bottom"].update(pct_bottom, now)
 
-            if bar_mode == "center":
+            if bar_mode in ("center", "edges"):
+                # center и edges - геометрически одна и та же пара половин
+                # (те же assignment_top/colors_top/solid_top, тот же
+                # top-трекер peak hold) - отличается только сама функция
+                # расчёта пикселей в ledbar.py (направление роста внутри
+                # половины). См. докстринг ledbar.compute_bar_pixels_edges().
                 peak_trackers["top"].set_style(peak_info["style"])
                 peak_trackers["top"].set_timings(cfg["peak_hold_seconds"], cfg["peak_fade_seconds"])
 
                 pct_top = round(common_metrics.get(cfg["assignment_top"]["bar0"], 0))
                 top_peak = peak_trackers["top"].update(pct_top, now)
 
-                pixels = ledbar.compute_bar_pixels_center(
+                compute_fn = ledbar.compute_bar_pixels_center if bar_mode == "center" else ledbar.compute_bar_pixels_edges
+                pixels = compute_fn(
                     pct_bottom, pct_top,
                     cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"], cfg["solid"]["bar0"],
                     cfg["colors_top"]["bar0"]["c1"], cfg["colors_top"]["bar0"]["c2"], cfg["colors_top"]["bar0"]["c3"], cfg["solid_top"]["bar0"],
@@ -1054,7 +1092,20 @@ def metrics_main_loop(stop_event):
                     peak_pct_bottom=bottom_peak if peak_enabled else None,
                     peak_pct_top=top_peak if peak_enabled else None,
                 )
-                bar_state = {"mode": "center", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": pct_top, "osd_active": False}
+                bar_state = {"mode": bar_mode, "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": pct_top, "osd_active": False}
+            elif bar_mode == "flat":
+                # flat - однометричный режим (как classic - только нижняя/
+                # единственная метрика assignment, без top-половины), но без
+                # peak hold: у "заливки всей ленты одним цветом" нет позиции,
+                # куда ставить точку недавнего максимума (см. докстринг
+                # ledbar.compute_bar_pixels_flat()) - top-трекер и
+                # peak_enabled тут осознанно не используются.
+                pixels = ledbar.compute_bar_pixels_flat(
+                    pct_bottom,
+                    cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"],
+                    leds_per_bar=leds_count,
+                )
+                bar_state = {"mode": "flat", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None, "osd_active": False}
             else:
                 pixels = ledbar.compute_bar_pixels(
                     pct_bottom, cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"], cfg["solid"]["bar0"],
@@ -1062,6 +1113,18 @@ def metrics_main_loop(stop_event):
                     peak_pct=bottom_peak if peak_enabled else None,
                 )
                 bar_state = {"mode": "classic", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None, "osd_active": False}
+
+        if cfg.get("leds_reverse"):
+            # Физический реверс - см. докстринг leds_reverse в
+            # DEFAULT_SETTINGS выше. Разворачиваем УЖЕ ГОТОВЫЙ список
+            # пикселей здесь, ОДИН РАЗ, для результата ЛЮБОЙ ветки выше
+            # (OSD громкости и все режимы classic/center/edges/flat) -
+            # переприсваиваем и pixels (используется ниже при упаковке в
+            # BAR: для платы), и bar_state["pixels"] (уходит в state["bar"]
+            # для превью на /), чтобы превью на сайте всегда совпадало с
+            # тем, что реально отправляется на плату.
+            pixels = list(reversed(pixels))
+            bar_state["pixels"] = pixels
 
         with state_lock:
             state["bar"] = bar_state
