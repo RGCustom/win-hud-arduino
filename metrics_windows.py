@@ -249,6 +249,93 @@ def read_disk_usage(letter):
     return {"used_pct": used_pct, "free_gb": free_gb, "total_gb": total_gb}
 
 
+def read_disk_io_counters():
+    """
+    (read_bytes, write_bytes) - накопленные счётчики I/O СРАЗУ ПО ВСЕМ дискам
+    (psutil.disk_io_counters() без per-disk разбивки - большинству достаточно
+    общей цифры "сколько сейчас читается/пишется на диски вообще", а не по
+    конкретной букве) с момента загрузки ОС - как и read_iface_counters() для
+    сети, разница между двумя тиками считается в главном цикле (pc_hud.py),
+    здесь только сырые счётчики.
+
+    (None, None), если недоступно - на некоторых системах (редко: без прав,
+    либо особая конфигурация диска) psutil.disk_io_counters() может вернуть
+    None вместо объекта со счётчиками.
+    """
+    try:
+        counters = psutil.disk_io_counters()
+    except Exception:
+        return None, None
+    if counters is None:
+        return None, None
+    return counters.read_bytes, counters.write_bytes
+
+
+# ---------------- Топ-процесс (CPU/RAM) ----------------
+
+class TopProcessMonitor:
+    """
+    Процесс с наибольшей загрузкой CPU прямо сейчас - аналог столбца CPU в
+    Диспетчере задач, отсортированного по убыванию.
+
+    psutil.Process.cpu_percent(interval=None) - "неблокирующий" режим:
+    считает загрузку МЕЖДУ двумя вызовами для ОДНОГО И ТОГО ЖЕ объекта
+    Process (точно то же поведение, что у psutil.cpu_percent(percpu=True) в
+    read_cpu_stats() выше) - первый вызов сразу после создания объекта
+    Process всегда возвращает 0.0 (нет предыдущей точки для сравнения),
+    осмысленное значение появляется со второго вызова. Поэтому Process-
+    объекты кэшируются между тиками в self._procs по pid, а не создаются
+    заново на каждый read() - иначе top_process_cpu_pct был бы всегда 0.
+    """
+
+    def __init__(self):
+        self._procs = {}  # pid -> psutil.Process
+
+    def read(self):
+        """dict: top_process_name (str|None - None, если ни один процесс не
+        удалось прочитать), top_process_cpu_pct, top_process_ram_pct (0.0,
+        если name is None)."""
+        current_pids = set()
+        try:
+            for p in psutil.process_iter(["pid"]):
+                pid = p.info["pid"]
+                current_pids.add(pid)
+                if pid not in self._procs:
+                    self._procs[pid] = p
+                    try:
+                        p.cpu_percent(None)  # "прайминг" первой точки отсчёта - результат не нужен
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+        except Exception as e:
+            print(f"[procs] process_iter failed: {e}", flush=True)
+
+        # чистим завершившиеся процессы - иначе словарь бесконечно растёт
+        # за время долгой работы приложения
+        for pid in list(self._procs.keys()):
+            if pid not in current_pids:
+                del self._procs[pid]
+
+        best_name, best_cpu, best_ram = None, -1.0, 0.0
+        for proc in self._procs.values():
+            try:
+                cpu = proc.cpu_percent(None)
+                if cpu > best_cpu:
+                    best_cpu = cpu
+                    best_ram = proc.memory_percent()
+                    best_name = proc.name()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if best_name is None:
+            return {"top_process_name": None, "top_process_cpu_pct": 0.0, "top_process_ram_pct": 0.0}
+
+        return {
+            "top_process_name": best_name,
+            "top_process_cpu_pct": round(best_cpu, 1),
+            "top_process_ram_pct": round(best_ram, 1),
+        }
+
+
 # ---------------- Сеть ----------------
 
 def list_network_interfaces():
@@ -733,8 +820,14 @@ if __name__ == "__main__":
     print("CPU:", read_cpu_stats())
     print("RAM:", read_ram_stats())
     print("Disks:", list_disk_letters())
+    print("Disk I/O counters:", read_disk_io_counters())
     print("Net ifaces:", list_network_interfaces())
     print("Keyboard layout:", get_keyboard_layout())
+
+    top_proc = TopProcessMonitor()
+    print("Top process (1st call, ожидаемо 0.0 - см. докстринг класса):", top_proc.read())
+    time.sleep(1)
+    print("Top process (2nd call, через 1с):", top_proc.read())
 
     gpu = GpuMonitor()
     print("GPU:", gpu.read())

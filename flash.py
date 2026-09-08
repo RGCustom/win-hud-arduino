@@ -45,7 +45,41 @@ AVRDUDE_TIMEOUT = 60.0  # секунд - типичная заливка зан�
 # образа shkaf-hud, где `apt install avrdude` решал это раз и навсегда) -
 # если бинарник не найден в PATH, можно переопределить полным путём через
 # переменную окружения AVRDUDE_PATH (например путь внутрь установки Arduino IDE).
+# Это ДЕФОЛТ на случай, если ничего не настроено через /flash (см.
+# resolve_avrdude_exe() ниже) - живая настройка avrdude_path в /settings
+# (settings.json), сохраняемая через веб (страница /flash), имеет приоритет
+# над этой переменной окружения, аналогично tick_interval/serial_port и
+# прочим "живым" настройкам в pc_hud.py.
 AVRDUDE_EXE = os.environ.get("AVRDUDE_PATH", "avrdude")
+
+
+def resolve_avrdude_exe(avrdude_path):
+    """
+    Превращает настройку avrdude_path из /settings в реальный исполняемый
+    файл для subprocess.Popen(). avrdude_path - то, что пользователь ввёл на
+    странице /flash - может быть:
+      - пустой строкой/None - тогда используется дефолт AVRDUDE_EXE (см.
+        выше - переменная окружения AVRDUDE_PATH, а если и её нет - просто
+        "avrdude", т.е. поиск в PATH, старое поведение без изменений);
+      - путём к ПАПКЕ, где лежит avrdude.exe (именно так подписано поле в
+        веб-интерфейсе - пользователю проще скопировать путь к папке
+        распакованного архива, чем помнить точное имя exe) - тогда
+        дописываем "avrdude.exe" к этому пути;
+      - уже ПОЛНЫМ путём к самому avrdude.exe (на случай, если кто-то
+        всё же введёт путь к файлу, а не к папке) - os.path.isdir()
+        для файла вернёт False, путь используется как есть без изменений.
+
+    Не проверяет реальное существование файла - subprocess.Popen() в
+    flash() сам бросит OSError с понятным сообщением, если путь окажется
+    неверным (см. except OSError в flash() ниже) - дублировать эту
+    проверку тут смысла нет.
+    """
+    p = (avrdude_path or "").strip()
+    if not p:
+        return AVRDUDE_EXE
+    if os.path.isdir(p):
+        return os.path.join(p, "avrdude.exe")
+    return p
 
 
 class FlashError(Exception):
@@ -109,7 +143,7 @@ def wait_for_bootloader_port(before_ports, original_device, timeout=BOOTLOADER_W
     )
 
 
-def flash(hex_path, serial_port, mcu="atmega32u4", cancel_event=None):
+def flash(hex_path, serial_port, mcu="atmega32u4", cancel_event=None, avrdude_path=None):
     """
     Генератор: делает touch + ищет bootloader-порт + запускает avrdude,
     построчно yield-ит текстовые статус-сообщения (включая живой вывод
@@ -120,6 +154,12 @@ def flash(hex_path, serial_port, mcu="atmega32u4", cancel_event=None):
     (кнопка "Отмена" в /flash) во время работы avrdude, процесс принудительно
     убивается тем же способом, что и при таймауте, только с другим текстом
     ошибки.
+
+    avrdude_path - живая настройка из /settings (папка или полный путь к
+    avrdude.exe, введённая на странице /flash) - см. resolve_avrdude_exe()
+    выше за подробностями резолва. None/пустая строка - используется
+    дефолт AVRDUDE_EXE (переменная окружения AVRDUDE_PATH или просто поиск
+    "avrdude" в PATH, старое поведение).
     """
     if not os.path.isfile(hex_path):
         raise FlashError(f"файл прошивки не найден: {hex_path}")
@@ -148,8 +188,10 @@ def flash(hex_path, serial_port, mcu="atmega32u4", cancel_event=None):
     yield f"Бутлоадер поднялся на {bootloader_port}, жду {BOOTLOADER_SETTLE_DELAY:.1f}с..."
     time.sleep(BOOTLOADER_SETTLE_DELAY)
 
+    avrdude_exe = resolve_avrdude_exe(avrdude_path)
+
     cmd = [
-        AVRDUDE_EXE,
+        avrdude_exe,
         "-c", "avr109",
         "-p", mcu,
         "-P", bootloader_port,
@@ -169,9 +211,10 @@ def flash(hex_path, serial_port, mcu="atmega32u4", cancel_event=None):
         )
     except OSError as e:
         raise FlashError(
-            f"не удалось запустить avrdude ({AVRDUDE_EXE}): {e} - "
-            f"проверь, что avrdude установлен и доступен в PATH (или укажи "
-            f"полный путь через переменную окружения AVRDUDE_PATH)"
+            f"не удалось запустить avrdude ({avrdude_exe}): {e} - "
+            f"проверь путь к avrdude на странице /flash (или что он "
+            f"установлен и доступен в PATH / через переменную окружения "
+            f"AVRDUDE_PATH)"
         )
 
     output_q = queue.Queue()

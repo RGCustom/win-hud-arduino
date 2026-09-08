@@ -2,7 +2,10 @@
 variables.py  (win-hud-arduino)
 
 Реестр переменных для OLED-шаблонов (L1/L2/L3) - портировано из проекта
-shkaf-hud, но под метрики Windows-PC вместо Unraid/Tautulli/qBittorrent.
+shkaf-hud, но под метрики Windows-PC вместо Unraid/Tautulli/qBittorrent...
+если не считать того, что Tautulli/qBittorrent сюда всё же вернулись (см.
+ниже) - только уже не как метрики самого NAS, а как внешние интеграции с
+любого PC, на котором крутится win-hud-arduino.
 
 Ничего сам не собирает - работает поверх "context": обычного словаря с уже
 готовыми данными, который раз в тик формирует главный скрипт (pc_hud.py) и
@@ -12,13 +15,22 @@ context", плюс легенда для веб-интерфейса (те же 
 
 Два вида переменных:
   - "scalar" - одно значение, всегда одно и то же (cpu_pct, gpu_temp_c и т.п.)
-  - служебные списки (сеть net1/net2, диски) - тоже scalar, просто с
-    вложенным путём в context (см. _net_field/_disk_field)
+  - "stream"/"recent"/"qbt" - REPEATING-группы: экран, использующий
+    переменную такой группы, автоматически размножается ротацией на N копий
+    (по числу активных Plex-сеансов / недавно добавленного в Plex / активно
+    скачивающихся торрентов ПРЯМО СЕЙЧАС) - см. group_count() и
+    screens.build_active_screens() (общий с shkaf-hud движок, никаких правок
+    там ради этого не понадобилось - он уже был готов к repeating-группам).
+    Источники данных - metrics_tautulli.TautulliClient (stream/recent) и
+    metrics_qbittorrent.QbittorrentClient (qbt); pc_hud.py раз в тик кладёт
+    их списки в context как context["streams"] / context["recent"] /
+    context["torrents"].
 
-В отличие от shkaf-hud, здесь НЕТ повторяющихся групп (Plex-стримы,
-qBittorrent-торренты) - весь Media/qBittorrent пласт с этого PC не снимается,
-поэтому REPEATING_GROUPS ниже пустой, а screens.py/templates.py (общий с
-shkaf-hud код) просто никогда не пойдёт по repeating-ветке рендера.
+Изначально (первая версия win-hud-arduino) повторяющихся групп тут не было
+вовсе - Media/qBittorrent пласт с shkaf-hud сюда не переезжал. Позже решили
+всё же вернуть Plex (через Tautulli, а не напрямую через Plex API - готовая
+статистика по библиотекам/сеансам/недавнему это сильно упрощает) и
+qBittorrent - под них и появились "stream"/"recent"/"qbt" ниже.
 """
 
 # ---------------- структура context (для справки) ----------------
@@ -62,6 +74,32 @@ shkaf-hud код) просто никогда не пойдёт по repeating-�
 #                                # ничего не играет (в т.ч. на паузе) - см.
 #                                # metrics_windows.MediaMonitor
 #     "media_playing": str,     # "да"/"нет" - уже отформатировано
+#
+#     "top_process_name": str|None, "top_process_cpu_pct": float, "top_process_ram_pct": float,
+#     "disk_io_read_mbps": float, "disk_io_write_mbps": float,
+#
+#     # --- Plex (через Tautulli, см. metrics_tautulli.TautulliClient) ---
+#     "plex_movies": int|None, "plex_series": int|None, "plex_songs": int|None,
+#     "plex_server_status": str,           # "online"/"offline"
+#     "plex_transcode_count": int|None,
+#     "plex_users_count": int|None,
+#     "streams": [                          # repeating-группа "stream"
+#         {"user": str, "title": str, "mode": str, "progress": int, "bandwidth": str},
+#         ...
+#     ],
+#     "recent": [                           # repeating-группа "recent"
+#         {"title": str, "code": str, "ago": str},
+#         ...
+#     ],
+#
+#     # --- qBittorrent (см. metrics_qbittorrent.QbittorrentClient) ---
+#     "qbt_total_dl": str|None, "qbt_total_ul": str|None,
+#     "qbt_ratio": float|None, "qbt_free_space_gb": float|None,
+#     "qbt_count_all": int|None,
+#     "torrents": [                         # repeating-группа "qbt"
+#         {"name": str, "speed": str, "eta": str},
+#         ...
+#     ],
 # }
 
 
@@ -115,9 +153,68 @@ def _disk_field(letter_key, field):
     return resolver
 
 
+def _group_field(list_key, field):
+    """
+    Универсальный резолвер для REPEATING-групп (stream/recent/qbt).
+    list_key - имя списка в context (context['streams']/['recent']/
+    ['torrents']), field - какое поле взять из элемента списка ПО ИНДЕКСУ
+    index. index сюда приходит от движка рендера (см. templates.render() ->
+    screens.build_active_screens(), где index пробегает 0..group_count()-1) -
+    именно index, а не сам резолвер, определяет, "какая копия" экрана сейчас
+    рендерится.
+
+    None, если index не передан (сюда не должно доходить для repeating-
+    переменной при нормальной работе screens.py, но резолверы обязаны
+    выдерживать любой вызов без падения - см. общий принцип "resolve()
+    гасит исключения" ниже) либо вышел за пределы списка (список сократился
+    между вызовом group_count() и рендером - маловероятно, но не должно
+    падать).
+    """
+
+    def resolver(context, index=None):
+        items = context.get(list_key) or []
+        if index is None or index >= len(items):
+            return None
+        return items[index].get(field)
+
+    return resolver
+
+
+def _group_pos(list_key):
+    """1-based позиция элемента внутри repeating-группы (stream_pos/
+    recent_pos/qbt_pos) - вызывающему код на экране обычно нужен человеческий
+    номер "2 из 3", а не 0-based index."""
+
+    def resolver(context, index=None):
+        items = context.get(list_key) or []
+        if index is None or index >= len(items):
+            return None
+        return index + 1
+
+    return resolver
+
+
+def _group_total(list_key):
+    """Общее число элементов repeating-группы (stream_count/recent_count/
+    qbt_count) - ОДНО И ТО ЖЕ значение на каждой копии экрана, не зависит от
+    index. None при пустом списке - но практического значения это не имеет:
+    если список пуст, group_count() вернёт 0, цикл рендера в
+    screens.build_active_screens() не выполнится ни разу, и эта ветка
+    попросту не будет вызвана ни для одной копии экрана."""
+
+    def resolver(context, index=None):
+        items = context.get(list_key) or []
+        if not items:
+            return None
+        return len(items)
+
+    return resolver
+
+
 # ---------------- реестр ----------------
 #
-# group: всегда "scalar" в win-hud-arduino (повторяющихся групп нет - см. шапку файла)
+# group: "scalar" для обычных переменных; "stream"/"recent"/"qbt" - см.
+#         REPEATING_GROUPS/_GROUP_LIST_KEYS ниже
 # category: только для группировки легенды на /screens (buildLegend() в
 #         screens_webui.py) - общий с shkaf-hud код, категории свои
 
@@ -132,6 +229,11 @@ VARIABLES = {
     "uptime":            {"label": "Аптайм Windows",                       "group": "scalar", "category": "Система", "resolver": _scalar("uptime")},
     "container_uptime":  {"label": "Аптайм win-hud-arduino",               "group": "scalar", "category": "Система", "resolver": _scalar("container_uptime")},
     "time_now":          {"label": "Текущее время (ЧЧ:ММ)",                "group": "scalar", "category": "Система", "resolver": _scalar("time_now")},
+    "top_process_name":     {"label": "Топ-процесс: имя",             "group": "scalar", "category": "Система", "resolver": _scalar("top_process_name")},
+    "top_process_cpu_pct":  {"label": "Топ-процесс: CPU, %",          "group": "scalar", "category": "Система", "resolver": _scalar("top_process_cpu_pct")},
+    "top_process_ram_pct":  {"label": "Топ-процесс: RAM, %",          "group": "scalar", "category": "Система", "resolver": _scalar("top_process_ram_pct")},
+    "disk_io_read_mbps":    {"label": "Диски: чтение, MB/s",          "group": "scalar", "category": "Система", "resolver": _scalar("disk_io_read_mbps")},
+    "disk_io_write_mbps":   {"label": "Диски: запись, MB/s",          "group": "scalar", "category": "Система", "resolver": _scalar("disk_io_write_mbps")},
 
     # --- GPU (NVIDIA, через pynvml) ---
     "gpu_name":          {"label": "GPU: модель",                  "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_name")},
@@ -187,25 +289,99 @@ VARIABLES = {
     "net2_tx":         {"label": "Net2: исходящая скорость", "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "tx")},
     "net2_total_rx":   {"label": "Net2: накоплено принято (с запуска)", "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "total_rx")},
     "net2_total_tx":   {"label": "Net2: накоплено отдано (с запуска)",  "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "total_tx")},
+
+    # --- Plex (через Tautulli, см. metrics_tautulli.TautulliClient) - счётчики
+    # библиотек/пользователей обновляются раз в минуту, plex_server_status ==
+    # "offline", если Tautulli недоступен ИЛИ ещё не настроен в /settings
+    # (пустые url/api-ключ) - экраны на этих переменных сами выпадут из
+    # ротации через общий механизм build_active_screens(), если резолвер
+    # вернёт None (пока Tautulli не настроен - вернёт None только
+    # plex_transcode_count/plex_users_count, остальные - фиксированный
+    # "offline"/0, т.к. это не None-типа поля, см. TautulliClient.read()) ---
+    "plex_movies":           {"label": "Plex: фильмов в библиотеке",             "group": "scalar", "category": "Plex", "resolver": _scalar("plex_movies")},
+    "plex_series":           {"label": "Plex: сериалов в библиотеке",            "group": "scalar", "category": "Plex", "resolver": _scalar("plex_series")},
+    "plex_songs":            {"label": "Plex: исполнителей в музыкальной библиотеке", "group": "scalar", "category": "Plex", "resolver": _scalar("plex_songs")},
+    "plex_server_status":    {"label": "Plex: статус сервера (online/offline)",  "group": "scalar", "category": "Plex", "resolver": _scalar("plex_server_status")},
+    "plex_transcode_count":  {"label": "Plex: число транскодирующихся сеансов",  "group": "scalar", "category": "Plex", "resolver": _scalar("plex_transcode_count")},
+    "plex_users_count":      {"label": "Plex: число разных зрителей сейчас",     "group": "scalar", "category": "Plex", "resolver": _scalar("plex_users_count")},
+
+    # --- Plex: активные сеансы (REPEATING-группа "stream") - экран с этими
+    # переменными автоматически размножается по числу активных сеансов прямо
+    # сейчас (потолок - TautulliClient.ACTIVE_STREAMS_MAX) ---
+    "stream_user":      {"label": "Сеанс: пользователь",                      "group": "stream", "category": "Plex", "resolver": _group_field("streams", "user")},
+    "stream_title":     {"label": "Сеанс: название",                          "group": "stream", "category": "Plex", "resolver": _group_field("streams", "title")},
+    "stream_mode":      {"label": "Сеанс: режим (D=Direct Play/Stream, T=Transcode)", "group": "stream", "category": "Plex", "resolver": _group_field("streams", "mode")},
+    "stream_progress":  {"label": "Сеанс: прогресс просмотра, %",             "group": "stream", "category": "Plex", "resolver": _group_field("streams", "progress")},
+    "stream_bandwidth": {"label": "Сеанс: битрейт потока",                     "group": "stream", "category": "Plex", "resolver": _group_field("streams", "bandwidth")},
+    "stream_pos":       {"label": "Сеанс: номер по порядку",                  "group": "stream", "category": "Plex", "resolver": _group_pos("streams")},
+    "stream_count":     {"label": "Сеанс: всего активных сеансов сейчас",     "group": "stream", "category": "Plex", "resolver": _group_total("streams")},
+
+    # --- Plex: недавно добавленное (REPEATING-группа "recent") ---
+    "recent_title": {"label": "Недавнее: название (для эпизода - имя сериала)", "group": "recent", "category": "Plex", "resolver": _group_field("recent", "title")},
+    "recent_code":  {"label": "Недавнее: код (sNNeNN для эпизода / год для фильма)", "group": "recent", "category": "Plex", "resolver": _group_field("recent", "code")},
+    "recent_ago":   {"label": "Недавнее: сколько времени назад добавлено",     "group": "recent", "category": "Plex", "resolver": _group_field("recent", "ago")},
+    "recent_pos":   {"label": "Недавнее: номер по порядку",                    "group": "recent", "category": "Plex", "resolver": _group_pos("recent")},
+    "recent_count": {"label": "Недавнее: всего элементов в списке",           "group": "recent", "category": "Plex", "resolver": _group_total("recent")},
+
+    # --- qBittorrent (см. metrics_qbittorrent.QbittorrentClient) - ДВА сервера
+    # (qbt1_*/qbt2_* в /settings), но переменные шаблонов ОДНИ на оба -
+    # qbt_total_*/ratio/free_space/count_all это СУММА по обоим серверам, не
+    # зависят от repeating-группы "qbt" ниже. qbt_total_dl/ul - ТЕКУЩАЯ
+    # суммарная скорость (не "скачано за всё время"!), qbt_free_space_gb -
+    # уже готовая строка с единицей ("123.4 GB"/"1.20 TB") ---
+    "qbt_total_dl":      {"label": "qBittorrent: суммарная скорость скачивания", "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_total_dl")},
+    "qbt_total_ul":      {"label": "qBittorrent: суммарная скорость раздачи",    "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_total_ul")},
+    "qbt_ratio":         {"label": "qBittorrent: общий рейтинг раздачи (оба сервера)", "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_ratio")},
+    "qbt_free_space_gb": {"label": "qBittorrent: свободно на диске (сумма по серверам)", "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_free_space_gb")},
+    "qbt_count_all":     {"label": "qBittorrent: торрентов всего (оба сервера)", "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_count_all")},
+
+    # --- qBittorrent: активные торренты (REPEATING-группа "qbt") - С ОБОИХ
+    # серверов вперемешку, отсортированы по убыванию скорости скачивания (см.
+    # QbittorrentClient.read()) - "активные" тут - это qBittorrent-фильтр
+    # filter=active (качается ИЛИ раздаётся), не только скачивающиеся ---
+    "qbt_name":  {"label": "Торрент: имя",                        "group": "qbt", "category": "qBittorrent", "resolver": _group_field("torrents", "name")},
+    "qbt_speed": {"label": "Торрент: скорость скачивания",        "group": "qbt", "category": "qBittorrent", "resolver": _group_field("torrents", "speed")},
+    "qbt_eta":   {"label": "Торрент: ETA",                         "group": "qbt", "category": "qBittorrent", "resolver": _group_field("torrents", "eta")},
+    "qbt_pos":   {"label": "Торрент: номер по порядку",            "group": "qbt", "category": "qBittorrent", "resolver": _group_pos("torrents")},
+    "qbt_count": {"label": "Торрент: всего активных закачек сейчас","group": "qbt", "category": "qBittorrent", "resolver": _group_total("torrents")},
 }
 
 # Порядок категорий в легенде на /screens (buildLegend() в screens_webui.py -
 # общий с shkaf-hud код, сортирует по этому списку, а не по алфавиту).
-CATEGORY_ORDER = ["Система", "GPU", "Диски", "Сеть", "Аудио", "Медиа"]
+CATEGORY_ORDER = ["Система", "GPU", "Диски", "Сеть", "Аудио", "Медиа", "Plex", "qBittorrent"]
 
-# Повторяющихся групп в win-hud-arduino нет (Plex-стримы/qBittorrent-торренты
-# сюда не переехали) - оставлено пустым для совместимости с общим
-# screens.py/templates.py, которые проверяют REPEATING_GROUPS.
-REPEATING_GROUPS = ()
-REPEATING_GROUP_MAX = {}
+# Repeating-группы - экран, использующий переменную такой группы,
+# автоматически размножается на N копий (см. group_count() ниже и докстринг
+# модуля выше). _GROUP_LIST_KEYS сопоставляет имя группы с ключом списка в
+# context - тот же список, что используют резолверы _group_field/_group_pos/
+# _group_total выше, просто с явным именем на стороне group_count().
+REPEATING_GROUPS = ("stream", "recent", "qbt")
+
+_GROUP_LIST_KEYS = {
+    "stream": "streams",
+    "recent": "recent",
+    "qbt": "torrents",
+}
+
+# Информационный потолок числа элементов на группу - фактическое ограничение
+# применяется на стороне источника данных (TautulliClient.ACTIVE_STREAMS_MAX/
+# RECENT_ADDED_COUNT, QbittorrentClient.ACTIVE_TORRENTS_MAX) - тут только для
+# случаев, когда потолок нужно показать/учесть на стороне веб-интерфейса.
+REPEATING_GROUP_MAX = {"stream": 6, "recent": 5, "qbt": 6}
 
 
 def group_count(group_name, context):
-    """Оставлено для совместимости с общим screens.py - в win-hud-arduino
-    повторяющихся групп нет, поэтому всегда 0 (экран такой группы никогда
-    не будет создан через веб-интерфейс, т.к. в легенде такие переменные
-    просто не появятся)."""
-    return 0
+    """
+    Возвращает число элементов repeating-группы group_name ПРЯМО СЕЙЧАС -
+    используется screens.build_active_screens() для развёртывания экрана в
+    N копий (см. докстринг screens.py). 0, если group_name не repeating-
+    группа (по историческим причинам - совместимость с общим screens.py) или
+    в context ещё нет соответствующего списка (Tautulli/qBittorrent ещё не
+    опрашивались ни разу - список просто отсутствует/пуст)."""
+    list_key = _GROUP_LIST_KEYS.get(group_name)
+    if not list_key:
+        return 0
+    return len(context.get(list_key) or [])
 
 
 def resolve(var_name, context, index=None):
@@ -222,8 +398,9 @@ def resolve(var_name, context, index=None):
 
 def legend():
     """Для веб-интерфейса: список переменных с категорией (для группировки на
-    /screens) и признаком repeating (в win-hud-arduino всегда False - см.
-    REPEATING_GROUPS выше)."""
+    /screens) и признаком repeating (True для stream/recent/qbt - см.
+    REPEATING_GROUPS выше; на фронтенде отмечается отдельным бейджем, см.
+    screens_webui.py buildLegend())."""
     return [
         {
             "name": name,

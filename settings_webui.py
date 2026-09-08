@@ -5,12 +5,16 @@ settings_webui.py  (win-hud-arduino)
 ОДНУ ленту (вместо 4 независимых баров): режим (classic/center), метрика(и),
 цвета, solid, peak hold, а также число диодов (leds_count - настройка, не
 константа, см. ledbar.py). Плюс НОВЫЙ блок - настройки энкодера громкости:
-шаг на клик, действие на клик кнопки, тайминг и цвета OSD-попапа.
+шаг на клик, действие на клик кнопки, тайминг и цвета OSD-попапа. И ЕЩЁ
+НОВЫЕ блоки - подключение к Tautulli (Plex) и к двум серверам qBittorrent
+(см. metrics_tautulli.py/metrics_qbittorrent.py) - просто адрес/API-ключ(и),
+опрашиваются отдельным фоновым потоком (integrations_loop в pc_hud.py), не
+главным циклом.
 
 Как и в shkaf-hud, вся серверная логика/состояние - в pc_hud.py (эндпойнты
 /api/state, /api/mode, /api/assignment(_top), /api/colors(_top), /api/solid(_top),
-/api/peak, /api/leds_count, /api/encoder - этот файл только читает/пишет
-через них). Этот файл - чистая разметка + JS.
+/api/peak, /api/leds_count, /api/encoder, /api/tautulli, /api/qbittorrent -
+этот файл только читает/пишет через них). Этот файл - чистая разметка + JS.
 """
 
 from flask import Response
@@ -45,7 +49,7 @@ SETTINGS_PAGE_HTML = """<!doctype html>
 
   .row { display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
   .row label { font-size:12px; color:var(--muted); min-width:130px; }
-  select, input[type=number] { background:#101112; color:var(--text); border:1px solid var(--border);
+  select, input[type=number], input[type=text] { background:#101112; color:var(--text); border:1px solid var(--border);
            border-radius:6px; padding:6px 8px; font-size:13px; flex:1; min-width:120px; }
   input[type=color] { width:26px; height:26px; border:none; background:none; border-radius:6px; cursor:pointer; padding:0; }
   input[type=checkbox] { width:16px; height:16px; }
@@ -166,6 +170,43 @@ SETTINGS_PAGE_HTML = """<!doctype html>
   <!-- ---- Сама лента: режим/метрика/цвета/solid/peak (как один bar0 из shkaf-hud) ---- -->
   <div id="bar-container"></div>
 
+  <!-- ---- Tautulli (Plex) ---- -->
+  <div class="global-card">
+    <h2>Tautulli (Plex)</h2>
+    <div class="hint">Адрес Tautulli и API-ключ (в самом Tautulli: Settings -> Web Interface -> API,
+      там же кнопка показать/сгенерировать ключ). Сеансы/библиотека/недавно добавленное
+      опрашиваются ОТДЕЛЬНЫМ фоновым потоком раз в несколько секунд, не главным циклом ленты -
+      пусто здесь = интеграция выключена, экраны/переменные Plex просто не резолвятся.</div>
+    <div class="row">
+      <label>Адрес (URL)</label>
+      <input type="text" id="tautulli-url" placeholder="http://192.168.1.10:8181">
+    </div>
+    <div class="row">
+      <label>API-ключ</label>
+      <input type="text" id="tautulli-api-key" placeholder="API key">
+    </div>
+  </div>
+
+  <!-- ---- qBittorrent (два сервера, объединяются в одни переменные) ---- -->
+  <div class="global-card">
+    <h2>qBittorrent</h2>
+    <div class="hint">API-ключ генерируется в самом qBittorrent (Preferences -> WebUI -> API Key ->
+      Generate, нужен qBittorrent >= 5.2.0) - логин/пароль не требуются. Данные с обоих серверов
+      объединяются в одни и те же переменные шаблонов (qbt_total_dl/qbt_name и т.п.) - пустой
+      слот означает, что этот сервер выключен.</div>
+
+    <div class="half">
+      <div class="half-title">Сервер 1</div>
+      <div class="row"><label>Адрес (URL)</label><input type="text" id="qbt1-url" placeholder="http://192.168.1.11:8080"></div>
+      <div class="row"><label>API-ключ</label><input type="text" id="qbt1-api-key" placeholder="API key"></div>
+    </div>
+    <div class="half">
+      <div class="half-title">Сервер 2</div>
+      <div class="row"><label>Адрес (URL)</label><input type="text" id="qbt2-url" placeholder="http://192.168.1.12:8080"></div>
+      <div class="row"><label>API-ключ</label><input type="text" id="qbt2-api-key" placeholder="API key"></div>
+    </div>
+  </div>
+
   <footer>win-hud-arduino</footer>
 </div>
 
@@ -174,6 +215,8 @@ const BAR_ID = "bar0";  // одна лента - один "бар" во внут
 let metricsMap = {};
 let editingPeakHold = false, editingPeakFade = false, editingOsdHold = false;
 let editingLedsCount = false, editingVolumeStep = false, editingWarningThreshold = false;
+let editingTautulliUrl = false, editingTautulliApiKey = false;
+let editingQbt1Url = false, editingQbt1ApiKey = false, editingQbt2Url = false, editingQbt2ApiKey = false;
 
 function debounceSave(el, flagSetter, sendFn) {
   el.addEventListener("input", () => flagSetter(true));
@@ -240,6 +283,30 @@ osdHoldEl.addEventListener("change", () => {
 muteColorEl.addEventListener("change", () => sendEncoderSettings({ mute_color: muteColorEl.value.slice(1).toUpperCase() }));
 warningColorEl.addEventListener("change", () => sendEncoderSettings({ warning_color: warningColorEl.value.slice(1).toUpperCase() }));
 debounceSave(warningThresholdEl, v => editingWarningThreshold = v, () => sendEncoderSettings({ warning_threshold_pct: parseInt(warningThresholdEl.value) }));
+
+// ---- Tautulli (Plex) ----
+function sendTautulli(partial) {
+  fetch("/api/tautulli", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(partial) });
+}
+const tautulliUrlEl = document.getElementById("tautulli-url");
+const tautulliApiKeyEl = document.getElementById("tautulli-api-key");
+debounceSave(tautulliUrlEl, v => editingTautulliUrl = v, () => sendTautulli({ url: tautulliUrlEl.value }));
+debounceSave(tautulliApiKeyEl, v => editingTautulliApiKey = v, () => sendTautulli({ api_key: tautulliApiKeyEl.value }));
+
+// ---- qBittorrent (два сервера, один эндпоинт на оба - см. /api/qbittorrent в pc_hud.py) ----
+function sendQbt(partial) {
+  fetch("/api/qbittorrent", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(partial) });
+}
+const qbt1UrlEl = document.getElementById("qbt1-url");
+const qbt1ApiKeyEl = document.getElementById("qbt1-api-key");
+const qbt2UrlEl = document.getElementById("qbt2-url");
+const qbt2ApiKeyEl = document.getElementById("qbt2-api-key");
+debounceSave(qbt1UrlEl, v => editingQbt1Url = v, () => sendQbt({ qbt1_url: qbt1UrlEl.value }));
+debounceSave(qbt1ApiKeyEl, v => editingQbt1ApiKey = v, () => sendQbt({ qbt1_api_key: qbt1ApiKeyEl.value }));
+debounceSave(qbt2UrlEl, v => editingQbt2Url = v, () => sendQbt({ qbt2_url: qbt2UrlEl.value }));
+debounceSave(qbt2ApiKeyEl, v => editingQbt2ApiKey = v, () => sendQbt({ qbt2_api_key: qbt2ApiKeyEl.value }));
 
 function renderVolumeColors(colors) {
   const wrap = document.getElementById("volume-colors");
@@ -480,6 +547,13 @@ function render(state) {
   warningColorEl.value = "#" + state.cfg.encoder.warning_color;
   if (!editingWarningThreshold) warningThresholdEl.value = state.cfg.encoder.warning_threshold_pct;
   renderVolumeColors(state.cfg.encoder.volume_colors);
+
+  if (!editingTautulliUrl) tautulliUrlEl.value = state.cfg.tautulli_url;
+  if (!editingTautulliApiKey) tautulliApiKeyEl.value = state.cfg.tautulli_api_key;
+  if (!editingQbt1Url) qbt1UrlEl.value = state.cfg.qbt1_url;
+  if (!editingQbt1ApiKey) qbt1ApiKeyEl.value = state.cfg.qbt1_api_key;
+  if (!editingQbt2Url) qbt2UrlEl.value = state.cfg.qbt2_url;
+  if (!editingQbt2ApiKey) qbt2ApiKeyEl.value = state.cfg.qbt2_api_key;
 
   if (!editingPeakHold) {
     peakHoldEl.value = state.cfg.peak_hold_seconds;

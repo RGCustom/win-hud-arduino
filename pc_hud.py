@@ -20,6 +20,15 @@ pc_hud.py  (win-hud-arduino)
      основной цикл метрик крутятся в фоновых потоках, сама трей-иконка
      блокирует главный поток (так требует pystray на Windows).
 
+  3. Tautulli (Plex)/qBittorrent - ТРЕТИЙ фоновый поток (integrations_loop) -
+     см. подробное обоснование у константы INTEGRATIONS_POLL_INTERVAL ниже:
+     это обычные сетевые HTTP-сервисы, которые могут зависнуть/быть
+     выключены, и держать такой риск в главном цикле (там же VU/BAR на
+     TICK_INTERVAL, 25 Гц по умолчанию) означало бы регресс к проблеме,
+     которую уже решали для read_vu() (см. комментарий там же в
+     metrics_windows.py) - только тут причина не баг, а сама природа
+     сетевого вызова.
+
 Зависимости (requirements.txt):
     pyserial, flask, psutil, pynvml, pycaw, comtypes, pywin32, pystray, pillow
 """
@@ -43,10 +52,12 @@ import settings_webui
 import protocol
 import ledbar
 import metrics_windows
+import metrics_tautulli
+import metrics_qbittorrent
 import flash
 import flash_webui
 
-SCRIPT_VERSION = "2026-08-31-1"
+SCRIPT_VERSION = "2026-09-05-1"
 
 CONTAINER_START_TIME = time.time()
 
@@ -70,6 +81,19 @@ TICK_INTERVAL = float(os.environ.get("TICK_INTERVAL", "0.04"))        # част
                                                                         # поднять обратно через переменную окружения
                                                                         # TICK_INTERVAL=0.06 и т.п., без правки кода.
 FULL_RESYNC_SECONDS = float(os.environ.get("FULL_RESYNC_SECONDS", "30"))
+
+# Tautulli/qBittorrent - обычные сетевые HTTP-сервисы (могут тормозить/быть
+# выключены/недоступны по сети, в отличие от локальных psutil/pynvml/pycaw-
+# вызовов остальных метрик) - опрашиваются ОТДЕЛЬНЫМ фоновым потоком
+# (integrations_loop ниже), не главным циклом (metrics_main_loop), и своим,
+# более редким интервалом - этим данным не нужна секундная свежесть, а
+# заблокировать ими главный цикл (там же VU/BAR/serial на TICK_INTERVAL,
+# 25 Гц по умолчанию) означало бы вернуть ровно ту проблему, которую уже
+# решали для read_vu() (см. комментарий там же в metrics_windows.py) - только
+# тут причина не баг в коде, а сама природа сетевого вызова (см.
+# REQUEST_TIMEOUT в metrics_tautulli.py/metrics_qbittorrent.py - до
+# нескольких секунд на один недоступный сервис).
+INTEGRATIONS_POLL_INTERVAL = float(os.environ.get("INTEGRATIONS_POLL_INTERVAL", "5.0"))
 
 WEB_PORT = int(os.environ.get("WEB_PORT", "8189"))
 
@@ -180,6 +204,28 @@ DEFAULT_SETTINGS = {
     "disk1_letter": "",
     "disk2_letter": "",
     "encoder": DEFAULT_ENCODER,
+    # Tautulli (Plex) - адрес/ключ подключения, тот же принцип, что и
+    # serial_port/net1_iface выше - живая настройка в /settings, а не
+    # переменная окружения.
+    "tautulli_url": "",
+    "tautulli_api_key": "",
+    # qBittorrent - ДВА сервера (два разных инстанса с разными IP и разными
+    # API-ключами, см. metrics_qbittorrent.py) - плоские qbt1_*/qbt2_* ключи,
+    # тот же паттерн, что net1_iface/net2_iface/disk1_letter/disk2_letter
+    # выше. API-ключ хранится в settings.json открытым текстом - тот же
+    # уровень доверия, что и у остальных данных приложения (локальный файл
+    # на машине пользователя, Flask слушает только 127.0.0.1 - см. run_web()
+    # ниже), шифрование тут избыточно.
+    "qbt1_url": "",
+    "qbt1_api_key": "",
+    "qbt2_url": "",
+    "qbt2_api_key": "",
+    # avrdude - путь к папке (или сразу к avrdude.exe), если он не в PATH -
+    # см. flash.resolve_avrdude_exe(). Живая настройка со страницы /flash,
+    # тот же принцип, что serial_port/tautulli_url и т.п. выше. Пусто -
+    # используется переменная окружения AVRDUDE_PATH, а если и её нет -
+    # обычный поиск "avrdude" в PATH (старое поведение без изменений).
+    "avrdude_path": "",
 }
 
 
@@ -233,11 +279,30 @@ flashing_event = threading.Event()
 gpu_monitor = metrics_windows.GpuMonitor()
 audio_controller = metrics_windows.AudioController()
 media_monitor = metrics_windows.MediaMonitor()
+top_process_monitor = metrics_windows.TopProcessMonitor()
+
+# Tautulli/qBittorrent - см. integrations_loop() ниже и обоснование у
+# INTEGRATIONS_POLL_INTERVAL в шапке файла: отдельный фоновый поток пишет
+# сюда результат под своим локом, metrics_main_loop только читает
+# (get_integrations_state()) - ни одного сетевого вызова в главном цикле.
+_integrations_lock = threading.Lock()
+_integrations_state = {
+    "plex_movies": 0, "plex_series": 0, "plex_songs": 0,
+    "plex_server_status": "offline", "plex_transcode_count": None, "plex_users_count": 0,
+    "streams": [], "recent": [],
+    "qbt_total_dl": "0 B/s", "qbt_total_ul": "0 B/s", "qbt_ratio": 0.0, "qbt_free_space_gb": "?",
+    "qbt_count_all": 0, "torrents": [],
+}
 
 
 def get_context():
     with _context_lock:
         return dict(_last_context)
+
+
+def get_integrations_state():
+    with _integrations_lock:
+        return dict(_integrations_state)
 
 
 # ---------------- форматтеры (аналог shkaf-hud) ----------------
@@ -281,6 +346,20 @@ def format_speed_mbps(mbps):
     if mbps >= 1000:
         return f"{mbps / 1000:g}Gbit"
     return f"{mbps}Mbit"
+
+
+def _center_oled_line(text, width=16):
+    """Центрирует текст пробелами под ширину OLED-строки (16 символов -
+    тот же ориентир, что и {var:16} в остальных экранах - см. screens.py/
+    default-audio/default-gpu, с запасом от полных ~21 символа на 128px
+    при OLED_FONT_SIZE=1 в прошивке). Длинные значения обрезаются, а не
+    скроллятся - для короткого попапа громкости это не проблема."""
+    text = str(text)
+    if len(text) >= width:
+        return text[:width]
+    pad = width - len(text)
+    left = pad // 2
+    return " " * left + text + " " * (pad - left)
 
 
 # ---------------- assets (иконка трея/favicon - генерируются, если отсутствуют) ----------------
@@ -750,6 +829,20 @@ def api_serial_port():
     return jsonify({"ok": True})
 
 
+@app.route("/api/avrdude_path", methods=["POST"])
+def api_avrdude_path():
+    """Путь к папке с avrdude.exe (или сразу к самому .exe) - см.
+    flash.resolve_avrdude_exe(). Читается flash_webui.py непосредственно
+    перед запуском прошивки (живая настройка, как и serial_port выше -
+    немедленное переподключение тут не нужно, значение просто лежит в
+    settings.json до следующего клика "Прошить")."""
+    body = request.get_json(force=True)
+    with state_lock:
+        state["cfg"]["avrdude_path"] = body.get("value", state["cfg"]["avrdude_path"]).strip()
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
 @app.route("/api/disks", methods=["POST"])
 def api_disks():
     body = request.get_json(force=True)
@@ -770,6 +863,40 @@ def api_net_ifaces():
             state["cfg"]["net1_iface"] = body["net1_iface"]
         if "net2_iface" in body:
             state["cfg"]["net2_iface"] = body["net2_iface"]
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tautulli", methods=["POST"])
+def api_tautulli():
+    """Адрес и API-ключ Tautulli (см. metrics_tautulli.py) - опрашивается
+    ОТДЕЛЬНЫМ фоновым потоком (integrations_loop, см. ниже), поэтому
+    сохранение тут не требует немедленного переподключения - новое значение
+    cfg подхватится этим потоком на его следующем тике
+    (INTEGRATIONS_POLL_INTERVAL, по умолчанию 5с)."""
+    body = request.get_json(force=True)
+    with state_lock:
+        if "url" in body:
+            state["cfg"]["tautulli_url"] = body["url"].strip()
+        if "api_key" in body:
+            state["cfg"]["tautulli_api_key"] = body["api_key"].strip()
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/qbittorrent", methods=["POST"])
+def api_qbittorrent():
+    """Адрес/API-ключ ОБОИХ серверов qBittorrent за один запрос (см.
+    metrics_qbittorrent.py) - body: {"qbt1_url":.., "qbt1_api_key":..,
+    "qbt2_url":.., "qbt2_api_key":..} - тот же принцип, что и /api/net-ifaces
+    (net1_iface/net2_iface одним POST). Опрашивается фоновым потоком
+    (integrations_loop), поэтому сохранение тут не требует немедленного
+    переподключения."""
+    body = request.get_json(force=True)
+    with state_lock:
+        for key in ("qbt1_url", "qbt1_api_key", "qbt2_url", "qbt2_api_key"):
+            if key in body:
+                state["cfg"][key] = body[key].strip()
         save_settings(state["cfg"])
     return jsonify({"ok": True})
 
@@ -801,7 +928,11 @@ def api_encoder():
 
 screens_webui.register_screens_routes(app, get_context)
 settings_webui.register_settings_routes(app)
-flash_webui.register_flash_routes(app, lambda: state["cfg"]["serial_port"], flashing_event)
+flash_webui.register_flash_routes(
+    app, lambda: state["cfg"]["serial_port"], flashing_event,
+    is_serial_free=lambda: not state["serial_connected"],
+    get_avrdude_path=lambda: state["cfg"]["avrdude_path"],
+)
 
 
 def run_web():
@@ -828,6 +959,11 @@ def metrics_main_loop(stop_event):
     prev_net_iface = {"net1": None, "net2": None}
     prev_net_counters = {"net1": (None, None), "net2": (None, None)}
     net_base_counters = {"net1": (None, None), "net2": (None, None)}
+
+    # (read_bytes, write_bytes) с прошлого тика медленных метрик - для
+    # расчёта скорости диск I/O (МБ/с) дельтой, тот же паттерн, что и
+    # prev_net_counters выше (см. metrics_windows.read_disk_io_counters()).
+    prev_disk_io_counters = (None, None)
 
     peak_trackers = {"bottom": ledbar.PeakHold(), "top": ledbar.PeakHold()}
 
@@ -966,9 +1102,29 @@ def metrics_main_loop(stop_event):
                     "total_rx": total_rx_str, "total_tx": total_tx_str,
                 }
 
+            # ---- диск I/O (суммарно по всем дискам) - скорость чтения/записи, МБ/с ----
+            read_bytes, write_bytes = metrics_windows.read_disk_io_counters()
+            if read_bytes is not None and prev_disk_io_counters[0] is not None and dt > 0:
+                disk_io_read_mbps = round((read_bytes - prev_disk_io_counters[0]) / (1024 ** 2) / dt, 1)
+                disk_io_write_mbps = round((write_bytes - prev_disk_io_counters[1]) / (1024 ** 2) / dt, 1)
+            else:
+                disk_io_read_mbps = 0.0
+                disk_io_write_mbps = 0.0
+            if read_bytes is not None:
+                prev_disk_io_counters = (read_bytes, write_bytes)
+
+            # ---- топ-процесс по CPU (см. metrics_windows.TopProcessMonitor) ----
+            top_process = top_process_monitor.read()
+
             audio_state = audio_controller.read_state()
             media_state = media_monitor.read()
             keyboard_layout = metrics_windows.get_keyboard_layout()
+
+            # ---- Tautulli (Plex) / qBittorrent - ТОЛЬКО чтение уже готового
+            # результата фонового потока (integrations_loop), никаких
+            # сетевых вызовов прямо тут - см. обоснование у
+            # INTEGRATIONS_POLL_INTERVAL в шапке файла.
+            integrations = get_integrations_state()
 
             common_metrics = {
                 "cpu": cpu_pct, "ram": ram_pct,
@@ -988,10 +1144,14 @@ def metrics_main_loop(stop_event):
                 "gpu_vram_pct": round(gpu_stats["gpu_vram_pct"]), "gpu_power_w": gpu_stats["gpu_power_w"],
                 "disk_slots": {"disk1_letter": cfg["disk1_letter"], "disk2_letter": cfg["disk2_letter"]},
                 "disks": disks_ctx,
+                "disk_io_read_mbps": disk_io_read_mbps, "disk_io_write_mbps": disk_io_write_mbps,
                 "net": net_ctx,
                 "uptime": format_duration(time.time() - _boot_time()),
                 "container_uptime": format_duration(now - CONTAINER_START_TIME),
                 "time_now": time.strftime("%H:%M"),
+                "top_process_name": top_process["top_process_name"],
+                "top_process_cpu_pct": top_process["top_process_cpu_pct"],
+                "top_process_ram_pct": top_process["top_process_ram_pct"],
                 "volume_pct": audio_state["volume_pct"], "volume_muted": audio_state["volume_muted"],
                 "audio_device_name": audio_state["audio_device_name"],
                 # VU (реальный уровень звука) для OLED-шаблонов - берём уже
@@ -1006,6 +1166,11 @@ def metrics_main_loop(stop_event):
                 "media_title": media_state["media_title"],
                 "media_artist": media_state["media_artist"],
                 "media_playing": media_state["media_playing"],
+                # Plex (через Tautulli) + qBittorrent - integrations уже
+                # содержит РОВНО те ключи, что ожидают резолверы variables.py
+                # (plex_*/streams/recent/qbt_*/torrents) - см.
+                # get_integrations_state()/integrations_loop() ниже.
+                **integrations,
             }
             with _context_lock:
                 _last_context.clear()
@@ -1013,8 +1178,6 @@ def metrics_main_loop(stop_event):
 
             current_screens = screens_webui.get_screens()
             lines = rotation.current_lines(current_screens, context, now=now)
-            with state_lock:
-                state["oled_lines"] = lines
 
         # ---- VU (реальный уровень звука): каждый тик, НЕ раз в POLL_INTERVAL -
         # иначе индикатор ощутимо дёргается/лагает при интервале в секунду.
@@ -1059,6 +1222,15 @@ def metrics_main_loop(stop_event):
             bar_state = {"mode": "volume_osd", "pixels": pixels,
                          "pct_bottom": audio_state["volume_pct"], "pct_top": audio_state["volume_pct"],
                          "osd_active": True}
+
+            # OLED на это же время полностью заменяется попапом громкости -
+            # тем же таймером, что и лента выше. rotation.current_lines() тут
+            # НЕ вызывается и её внутренний индекс/switched_at не трогается -
+            # ротация экранов просто "стоит на паузе" и продолжится с того же
+            # места сама, как только osd_until истечёт (следующий тик медленных
+            # метрик снова вызовет rotation.current_lines() как обычно).
+            osd_line = "MUTE" if audio_state["volume_muted"] == "да" else f"Vol {audio_state['volume_pct']}%"
+            lines = ["", _center_oled_line(osd_line), ""]
         else:
             osd_active = False
             bar_mode = cfg["mode"]["bar0"]
@@ -1128,6 +1300,7 @@ def metrics_main_loop(stop_event):
 
         with state_lock:
             state["bar"] = bar_state
+            state["oled_lines"] = lines
 
         # ---- собрать и отправить serial-строку ----
         proto_values = {
@@ -1173,6 +1346,42 @@ def metrics_main_loop(stop_event):
     print("[win-hud-arduino] metrics loop stopped", flush=True)
 
 
+def integrations_loop(stop_event):
+    """
+    Опрашивает Tautulli (Plex) и qBittorrent - см. metrics_tautulli.py/
+    metrics_qbittorrent.py - в ОТДЕЛЬНОМ от metrics_main_loop потоке, своим
+    интервалом (INTEGRATIONS_POLL_INTERVAL, см. шапку файла). Результат
+    кладётся в _integrations_state под _integrations_lock; metrics_main_loop
+    только читает его (get_integrations_state()) - ни одного сетевого
+    вызова в главном цикле, см. подробное обоснование у константы
+    INTEGRATIONS_POLL_INTERVAL выше.
+
+    TautulliClient/QbittorrentClient создаются ЗДЕСЬ, а не на уровне
+    модуля - у обоих есть внутреннее состояние между вызовами (кэш библиотек
+    у Tautulli, сессионная cookie у qBittorrent), которое должно жить в
+    ОДНОМ потоке последовательно, а не делиться с чем-либо ещё.
+    """
+    tautulli_client = metrics_tautulli.TautulliClient()
+    qbt_client = metrics_qbittorrent.QbittorrentClient()
+
+    while not stop_event.is_set():
+        with state_lock:
+            cfg = copy.deepcopy(state["cfg"])
+
+        tautulli_data = tautulli_client.read(cfg["tautulli_url"], cfg["tautulli_api_key"])
+        qbt_servers = [
+            {"url": cfg["qbt1_url"], "api_key": cfg["qbt1_api_key"]},
+            {"url": cfg["qbt2_url"], "api_key": cfg["qbt2_api_key"]},
+        ]
+        qbt_data = qbt_client.read(qbt_servers)
+
+        with _integrations_lock:
+            _integrations_state.update(tautulli_data)
+            _integrations_state.update(qbt_data)
+
+        stop_event.wait(timeout=INTEGRATIONS_POLL_INTERVAL)
+
+
 def _boot_time():
     import psutil
     return psutil.boot_time()
@@ -1207,6 +1416,7 @@ def main():
     stop_event = threading.Event()
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=metrics_main_loop, args=(stop_event,), daemon=True).start()
+    threading.Thread(target=integrations_loop, args=(stop_event,), daemon=True).start()
 
     icon = build_tray_icon(stop_event)
     icon.run()  # блокирует главный поток, пока не нажмут "Выход"

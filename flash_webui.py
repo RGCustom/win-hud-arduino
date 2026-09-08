@@ -27,6 +27,7 @@ flashing_event  - threading.Event, общий с главным циклом: п
 
 import os
 import threading
+import time
 
 from flask import request, jsonify, Response
 
@@ -69,6 +70,9 @@ FLASH_PAGE_HTML = """<!doctype html>
           color:var(--muted); font-size:13px; cursor:pointer; }
   .drop.hasfile { color:var(--text); border-color:var(--accent); }
   input[type=file] { display:none; }
+  #avrdude-path { width:100%; background:#101112; color:var(--text); border:1px solid var(--border);
+                  border-radius:6px; padding:8px 10px; font-size:13px; font-family:monospace; }
+  #avrdude-path:focus { border-color:var(--accent); outline:none; }
 
   .btn { border:none; border-radius:8px; padding:11px 20px; font-size:14px; font-weight:600;
          cursor:pointer; margin-top:16px; width:100%; }
@@ -92,6 +96,16 @@ FLASH_PAGE_HTML = """<!doctype html>
 <div class="wrap">
   <div class="brand"><span class="dot"></span><h1>win-hud-arduino</h1></div>
   <div class="nav"><a href="/">Sensors</a><a href="/settings">Settings</a><a href="/screens">OLED screens</a><a href="/flash" class="active">Flash</a></div>
+
+  <div class="card">
+    <h2>ПУТЬ К AVRDUDE</h2>
+    <input type="text" id="avrdude-path" placeholder="C:\avrdude-v8.2-windows-arm64 (папка или полный путь к avrdude.exe)">
+    <div class="warn" style="margin-top:8px">
+      Заполни, если avrdude не в системном PATH - можно указать папку с avrdude.exe
+      (файл найдётся автоматически) либо сразу полный путь к самому .exe.
+      Пусто = поиск в PATH / переменная окружения AVRDUDE_PATH (как раньше).
+    </div>
+  </div>
 
   <div class="card">
     <h2>ПРОШИВКА ARDUINO</h2>
@@ -122,6 +136,21 @@ const flashBtn = document.getElementById('flash-btn');
 const cancelBtn = document.getElementById('cancel-btn');
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
+const avrdudePathEl = document.getElementById('avrdude-path');
+
+let editingAvrdudePath = false;
+avrdudePathEl.addEventListener('input', () => { editingAvrdudePath = true; });
+avrdudePathEl.addEventListener('change', () => {
+  fetch('/api/avrdude_path', { method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ value: avrdudePathEl.value }) })
+    .then(() => editingAvrdudePath = false);
+});
+// /api/state отдаёт весь cfg целиком (общий эндпоинт, тот же, что и на /)-
+// используем его тут только за одним полем avrdude_path, не дублируем
+// отдельный "лёгкий" эндпоинт ради одного значения.
+fetch('/api/state').then(r => r.json()).then(s => {
+  if (!editingAvrdudePath) avrdudePathEl.value = s.cfg.avrdude_path || '';
+});
 
 cancelBtn.addEventListener('click', () => {
   cancelBtn.disabled = true;
@@ -207,7 +236,7 @@ flashBtn.addEventListener('click', async () => {
 """
 
 
-def register_flash_routes(app, serial_port, flashing_event):
+def register_flash_routes(app, serial_port, flashing_event, is_serial_free=None, get_avrdude_path=None):
     """
     serial_port - COM-порт платы. Может быть:
       - строкой (фиксированный порт, как в shkaf-hud)
@@ -216,6 +245,26 @@ def register_flash_routes(app, serial_port, flashing_event):
         в вебе (/api/serial_port, см. pc_hud.py) и может поменяться уже
         после старта процесса, в отличие от shkaf-hud, где SERIAL_PORT
         читался один раз из переменной окружения при запуске контейнера.
+
+    is_serial_free - опциональная функция без аргументов, возвращающая True,
+        когда порт платы РЕАЛЬНО закрыт главным циклом (pc_hud.py:
+        metrics_main_loop). Нужна из-за гонки: flashing_event.set() ниже
+        только СИГНАЛИЗИРУЕТ главному циклу "пора закрыть порт" - сам он
+        закрывает serial только на СВОЕЙ следующей итерации (см. цикл в
+        pc_hud.py), а flash.flash() пытается открыть тот же COM-порт на
+        1200 бод СРАЗУ после set(), без всякой паузы. Если главный цикл
+        не успел закрыть порт первым - flash.py получает
+        "PermissionError(13, 'Отказано в доступе')" при попытке touch,
+        т.к. порт уже занят другим хендлом. Если is_serial_free не передан -
+        поведение как раньше (без ожидания, старый риск гонки сохраняется).
+
+    get_avrdude_path - опциональная функция без аргументов, возвращающая
+        АКТУАЛЬНЫЙ путь к avrdude из settings.json (поле "Путь к avrdude" на
+        этой же странице, см. /api/avrdude_path в pc_hud.py) - тот же
+        паттерн-геттер, что и serial_port выше (значение может поменяться в
+        любой момент через веб). Пусто/None - см. flash.resolve_avrdude_exe():
+        используется переменная окружения AVRDUDE_PATH, а если и её нет -
+        обычный поиск "avrdude" в PATH (старое поведение без изменений).
     """
 
     def _resolve_port():
@@ -245,8 +294,26 @@ def register_flash_routes(app, serial_port, flashing_event):
 
         def generate():
             flashing_event.set()
+
+            # Ждём, пока главный цикл РЕАЛЬНО закроет serial-порт - см.
+            # докстринг is_serial_free выше про гонку с PermissionError.
+            # Поллинг короткими интервалами с таймаутом - если по какой-то
+            # причине is_serial_free() так и не вернёт True (например
+            # главный цикл сейчас не крутится вовсе), не зависаем навечно,
+            # а просто пробуем прошить как раньше - хуже не будет, тот же
+            # риск гонки, что и без этой проверки.
+            if is_serial_free is not None:
+                wait_deadline = time.time() + 2.0
+                while time.time() < wait_deadline and not is_serial_free():
+                    time.sleep(0.05)
+                if not is_serial_free():
+                    yield "Порт платы всё ещё занят главным циклом - пробую всё равно...\n"
+
             try:
-                for line in flash.flash(HEX_UPLOAD_PATH, port, cancel_event=cancel_event):
+                for line in flash.flash(
+                    HEX_UPLOAD_PATH, port, cancel_event=cancel_event,
+                    avrdude_path=get_avrdude_path() if get_avrdude_path is not None else None,
+                ):
                     yield line + "\n"
             except flash.FlashError as e:
                 yield f"ОШИБКА: {e}\n"
