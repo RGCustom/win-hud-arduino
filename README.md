@@ -134,7 +134,9 @@ Plex/qBittorrent переменных нужно добавить туда же 
 - OLED SSD1306 128×64, I2C
 - Поворотный энкодер с кнопкой (громкость + клик)
 - Библиотеки для прошивки: FastLED, U8g2
-![hardwaredpic](win_hud_arduino_firmware/hardware.png)
+
+![hardwaredpic](win_hud_arduino/hardware.png)
+
 ## Структура репозитория
 
 ```
