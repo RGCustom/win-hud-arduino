@@ -135,7 +135,7 @@ Plex/qBittorrent переменных нужно добавить туда же 
 - Поворотный энкодер с кнопкой (громкость + клик)
 - Библиотеки для прошивки: FastLED, U8g2
 
-![hardwaredpic](win_hud_arduino/hardware.png)
+![hardwaredpic](win_hud_arduino_firmware/hardware.png)
 
 ## Структура репозитория
 
