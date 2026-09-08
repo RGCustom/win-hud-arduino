@@ -355,6 +355,19 @@ def format_speed_mbps(mbps):
         return f"{mbps / 1000:g}Gbit"
     return f"{mbps}Mbit"
 
+def _center_oled_line(text, width=16):
+    """Центрирует текст пробелами под ширину OLED-строки (16 символов -
+    тот же ориентир, что и {var:16} в остальных экранах - см. screens.py/
+    default-audio/default-gpu, с запасом от полных ~21 символа на 128px
+    при OLED_FONT_SIZE=1 в прошивке). Длинные значения обрезаются, а не
+    скроллятся - для короткого попапа громкости это не проблема."""
+    text = str(text)
+    if len(text) >= width:
+        return text[:width]
+    pad = width - len(text)
+    left = pad // 2
+    return " " * left + text + " " * (pad - left)
+
 
 # ---------------- assets (иконка трея/favicon - генерируются, если отсутствуют) ----------------
 
@@ -1171,8 +1184,8 @@ def metrics_main_loop(stop_event):
 
             current_screens = screens_webui.get_screens()
             lines = rotation.current_lines(current_screens, context, now=now)
-            with state_lock:
-                state["oled_lines"] = lines
+        #    with state_lock:
+        #        state["oled_lines"] = lines
 
         # ---- VU (реальный уровень звука): каждый тик, НЕ раз в POLL_INTERVAL -
         # иначе индикатор ощутимо дёргается/лагает при интервале в секунду.
@@ -1217,6 +1230,15 @@ def metrics_main_loop(stop_event):
             bar_state = {"mode": "volume_osd", "pixels": pixels,
                          "pct_bottom": audio_state["volume_pct"], "pct_top": audio_state["volume_pct"],
                          "osd_active": True}
+
+            # OLED на это же время полностью заменяется попапом громкости -
+            # тем же таймером, что и лента выше. rotation.current_lines() тут
+            # НЕ вызывается и её внутренний индекс/switched_at не трогается -
+            # ротация экранов просто "стоит на паузе" и продолжится с того же
+            # места сама, как только osd_until истечёт (следующий тик медленных
+            # метрик снова вызовет rotation.current_lines() как обычно).
+            osd_line = "MUTE" if audio_state["volume_muted"] == "да" else f"Vol {audio_state['volume_pct']}%"
+            lines = ["", _center_oled_line(osd_line), ""]
         else:
             osd_active = False
             bar_mode = cfg["mode"]["bar0"]
@@ -1286,6 +1308,7 @@ def metrics_main_loop(stop_event):
 
         with state_lock:
             state["bar"] = bar_state
+            state["oled_lines"] = lines
 
         # ---- собрать и отправить serial-строку ----
         proto_values = {
