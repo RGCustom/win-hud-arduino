@@ -292,6 +292,14 @@ _integrations_state = {
     "streams": [], "recent": [],
     "qbt_total_dl": "0 B/s", "qbt_total_ul": "0 B/s", "qbt_ratio": 0.0, "qbt_free_space_gb": "?",
     "qbt_count_all": 0, "torrents": [],
+    # top_process_* - НОВОЕ: топ-процесс по CPU переехал сюда из главного
+    # цикла (metrics_main_loop) в integrations_loop, см. комментарий там же -
+    # psutil.Process.cpu_percent()/memory_percent()/name() на КАЖДЫЙ процесс
+    # в системе на Windows оказался достаточно тяжёлым, чтобы раз в секунду
+    # (POLL_INTERVAL) блокировать главный цикл на заметное время и приводить
+    # к тому, что VU/BAR/serial обновлялись гораздо реже tick_interval,
+    # независимо от значения слайдера в /settings.
+    "top_process_name": None, "top_process_cpu_pct": 0.0, "top_process_ram_pct": 0.0,
 }
 
 
@@ -346,20 +354,6 @@ def format_speed_mbps(mbps):
     if mbps >= 1000:
         return f"{mbps / 1000:g}Gbit"
     return f"{mbps}Mbit"
-
-
-def _center_oled_line(text, width=16):
-    """Центрирует текст пробелами под ширину OLED-строки (16 символов -
-    тот же ориентир, что и {var:16} в остальных экранах - см. screens.py/
-    default-audio/default-gpu, с запасом от полных ~21 символа на 128px
-    при OLED_FONT_SIZE=1 в прошивке). Длинные значения обрезаются, а не
-    скроллятся - для короткого попапа громкости это не проблема."""
-    text = str(text)
-    if len(text) >= width:
-        return text[:width]
-    pad = width - len(text)
-    left = pad // 2
-    return " " * left + text + " " * (pad - left)
 
 
 # ---------------- assets (иконка трея/favicon - генерируются, если отсутствуют) ----------------
@@ -1113,9 +1107,6 @@ def metrics_main_loop(stop_event):
             if read_bytes is not None:
                 prev_disk_io_counters = (read_bytes, write_bytes)
 
-            # ---- топ-процесс по CPU (см. metrics_windows.TopProcessMonitor) ----
-            top_process = top_process_monitor.read()
-
             audio_state = audio_controller.read_state()
             media_state = media_monitor.read()
             keyboard_layout = metrics_windows.get_keyboard_layout()
@@ -1149,9 +1140,11 @@ def metrics_main_loop(stop_event):
                 "uptime": format_duration(time.time() - _boot_time()),
                 "container_uptime": format_duration(now - CONTAINER_START_TIME),
                 "time_now": time.strftime("%H:%M"),
-                "top_process_name": top_process["top_process_name"],
-                "top_process_cpu_pct": top_process["top_process_cpu_pct"],
-                "top_process_ram_pct": top_process["top_process_ram_pct"],
+                # top_process_name/top_process_cpu_pct/top_process_ram_pct -
+                # НЕ читаются тут напрямую (см. удалённый top_process_monitor.read()
+                # выше) - приходят через **integrations ниже, т.к. опрос
+                # переехал в integrations_loop (см. пояснение у
+                # _integrations_state/integrations_loop).
                 "volume_pct": audio_state["volume_pct"], "volume_muted": audio_state["volume_muted"],
                 "audio_device_name": audio_state["audio_device_name"],
                 # VU (реальный уровень звука) для OLED-шаблонов - берём уже
@@ -1178,6 +1171,8 @@ def metrics_main_loop(stop_event):
 
             current_screens = screens_webui.get_screens()
             lines = rotation.current_lines(current_screens, context, now=now)
+            with state_lock:
+                state["oled_lines"] = lines
 
         # ---- VU (реальный уровень звука): каждый тик, НЕ раз в POLL_INTERVAL -
         # иначе индикатор ощутимо дёргается/лагает при интервале в секунду.
@@ -1222,15 +1217,6 @@ def metrics_main_loop(stop_event):
             bar_state = {"mode": "volume_osd", "pixels": pixels,
                          "pct_bottom": audio_state["volume_pct"], "pct_top": audio_state["volume_pct"],
                          "osd_active": True}
-
-            # OLED на это же время полностью заменяется попапом громкости -
-            # тем же таймером, что и лента выше. rotation.current_lines() тут
-            # НЕ вызывается и её внутренний индекс/switched_at не трогается -
-            # ротация экранов просто "стоит на паузе" и продолжится с того же
-            # места сама, как только osd_until истечёт (следующий тик медленных
-            # метрик снова вызовет rotation.current_lines() как обычно).
-            osd_line = "MUTE" if audio_state["volume_muted"] == "да" else f"Vol {audio_state['volume_pct']}%"
-            lines = ["", _center_oled_line(osd_line), ""]
         else:
             osd_active = False
             bar_mode = cfg["mode"]["bar0"]
@@ -1300,7 +1286,6 @@ def metrics_main_loop(stop_event):
 
         with state_lock:
             state["bar"] = bar_state
-            state["oled_lines"] = lines
 
         # ---- собрать и отправить serial-строку ----
         proto_values = {
@@ -1348,18 +1333,41 @@ def metrics_main_loop(stop_event):
 
 def integrations_loop(stop_event):
     """
-    Опрашивает Tautulli (Plex) и qBittorrent - см. metrics_tautulli.py/
-    metrics_qbittorrent.py - в ОТДЕЛЬНОМ от metrics_main_loop потоке, своим
-    интервалом (INTEGRATIONS_POLL_INTERVAL, см. шапку файла). Результат
-    кладётся в _integrations_state под _integrations_lock; metrics_main_loop
-    только читает его (get_integrations_state()) - ни одного сетевого
-    вызова в главном цикле, см. подробное обоснование у константы
-    INTEGRATIONS_POLL_INTERVAL выше.
+    Опрашивает Tautulli (Plex), qBittorrent И топ-процесс по CPU - см.
+    metrics_tautulli.py/metrics_qbittorrent.py/metrics_windows.TopProcessMonitor -
+    в ОТДЕЛЬНОМ от metrics_main_loop потоке, своим интервалом
+    (INTEGRATIONS_POLL_INTERVAL, см. шапку файла). Результат кладётся в
+    _integrations_state под _integrations_lock; metrics_main_loop только
+    читает его (get_integrations_state()) - ни одного сетевого вызова и
+    ни одного тяжёлого psutil-обхода процессов в главном цикле.
+
+    ПОЧЕМУ ТУТ ЖИВЁТ ТОП-ПРОЦЕСС (не сетевая интеграция, но переехал сюда же):
+    top_process_monitor.read() раньше вызывался прямо в metrics_main_loop,
+    в том же блоке "раз в POLL_INTERVAL", что и остальные метрики. На
+    практике на Windows psutil.Process.cpu_percent()/memory_percent()/
+    name() на КАЖДЫЙ процесс в системе (а _procs со временем накапливает
+    их все, не только "топ-N") оказались достаточно дорогими, чтобы этот
+    вызов занимал заметную долю секунды. Поскольку это происходило раз в
+    POLL_INTERVAL (1с по умолчанию) ВНУТРИ главного цикла - того же цикла,
+    что шлёт BAR/читает serial/обновляет VU на каждый tick_interval - лента
+    и VU-метр фактически переставали успевать обновляться быстрее ~1 Гц,
+    независимо от значения слайдера "Частота опроса" в /settings (см. отчёт
+    Konstantin: "лента обновляется медленно, VU раз в секунду"). Тот же
+    класс проблемы, что уже решался для read_vu() (см. комментарий в
+    metrics_windows.py) и для самих Tautulli/qBittorrent (см. обоснование у
+    INTEGRATIONS_POLL_INTERVAL выше) - секундная свежесть топ-процессу тоже
+    не нужна, поэтому он просто присоединился к этому же фоновому потоку и
+    интервалу, а не заводит третий отдельный поток ради одной метрики.
 
     TautulliClient/QbittorrentClient создаются ЗДЕСЬ, а не на уровне
     модуля - у обоих есть внутреннее состояние между вызовами (кэш библиотек
     у Tautulli, сессионная cookie у qBittorrent), которое должно жить в
     ОДНОМ потоке последовательно, а не делиться с чем-либо ещё.
+    top_process_monitor, в отличие от них, СОЗДАЁТСЯ на уровне модуля (см.
+    выше, рядом с gpu_monitor/audio_controller/media_monitor) - раньше он
+    вызывался из metrics_main_loop, теперь исключительно отсюда; смены
+    треда, из которого идут обращения к нему, достаточно - никакой гонки
+    не возникает, т.к. второй читатель этого инстанса не появился.
     """
     tautulli_client = metrics_tautulli.TautulliClient()
     qbt_client = metrics_qbittorrent.QbittorrentClient()
@@ -1374,10 +1382,12 @@ def integrations_loop(stop_event):
             {"url": cfg["qbt2_url"], "api_key": cfg["qbt2_api_key"]},
         ]
         qbt_data = qbt_client.read(qbt_servers)
+        top_process_data = top_process_monitor.read()
 
         with _integrations_lock:
             _integrations_state.update(tautulli_data)
             _integrations_state.update(qbt_data)
+            _integrations_state.update(top_process_data)
 
         stop_event.wait(timeout=INTEGRATIONS_POLL_INTERVAL)
 
