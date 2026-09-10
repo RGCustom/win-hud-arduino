@@ -151,6 +151,60 @@ SETTINGS_PAGE_HTML = """<!doctype html>
       во время OSD-попапа - на основную метрику ниже не влияет.</div>
   </div>
 
+  <!-- ---- OSD: раскладка клавиатуры / устройство вывода (НОВОЕ) ---- -->
+  <div class="global-card">
+    <h2>OSD: раскладка клавиатуры / устройство вывода</h2>
+    <div class="hint">Смена раскладки клавиатуры (в том же окне, без alt-tab) и смена
+      устройства вывода звука временно замещают OLED коротким попапом - тем же механизмом,
+      что и громкость выше (единая очередь, см. осд.py). Раскладка имеет приоритет
+      над громкостью и устройством - прерывает их немедленно, если они показывались
+      в этот момент. У раскладки дополнительно перекрашивается вся лента сплошным цветом
+      (см. цвета ниже) - у устройства вывода лента не трогается, только текст.</div>
+
+    <div class="slider-row">
+      <label>Раскладка держится, сек</label>
+      <input type="range" id="layout-hold-seconds" min="0.3" max="5" step="0.1" value="1.2">
+      <span class="val" id="layout-hold-seconds-val">1.2с</span>
+    </div>
+    <div class="slider-row">
+      <label>Устройство держится, сек</label>
+      <input type="range" id="device-hold-seconds" min="0.5" max="10" step="0.5" value="2.0">
+      <span class="val" id="device-hold-seconds-val">2.0с</span>
+    </div>
+    <div class="slider-row">
+      <label>Общий кулдаун между попапами, сек</label>
+      <input type="range" id="osd-cooldown-seconds" min="0" max="5" step="0.1" value="0.5">
+      <span class="val" id="osd-cooldown-seconds-val">0.5с</span>
+    </div>
+    <div class="note">Кулдаун - минимальный интервал между ЛЮБЫМИ двумя срабатываниями
+      OSD (любого типа - громкость/раскладка/устройство), защита от дребезга источника.</div>
+
+    <div class="row" style="margin-top:14px">
+      <label>Цвета раскладки</label>
+    </div>
+    <div id="layout-colors-rows"></div>
+    <div class="note">Цвет, в который перекрашивается вся лента на время показа раскладки -
+      "по умолчанию" используется для языков без отдельной настройки ниже.</div>
+  </div>
+
+  <!-- ---- Приоритетная ротация экранов (НОВОЕ) ---- -->
+  <div class="global-card">
+    <h2>Приоритетная ротация экранов</h2>
+    <div class="hint">"Личные" экраны (например Now Playing - см. tier в редакторе /screens)
+      показывают чаще обычных и могут прервать текущий показ, если появились или сменился
+      их контент (например трек). "Фоновые" (Plex/qBittorrent) показываются чаще обычных,
+      но без права прерывания - просто получают более частые слоты. Число ниже - "каждый
+      N-й слот ротации" достаётся этой дорожке, если на неё сейчас есть что показать.</div>
+    <div class="row">
+      <label>Личные - каждый N-й слот</label>
+      <input type="number" id="priority-boost-personal" min="1" max="20" value="2">
+    </div>
+    <div class="row">
+      <label>Фоновые - каждый N-й слот</label>
+      <input type="number" id="priority-boost-ambient" min="1" max="20" value="4">
+    </div>
+  </div>
+
   <!-- ---- Peak hold - общие тайминги (как в shkaf-hud) ---- -->
   <div class="global-card">
     <h2>Peak hold — общие тайминги</h2>
@@ -183,8 +237,17 @@ SETTINGS_PAGE_HTML = """<!doctype html>
     </div>
     <div class="row">
       <label>API-ключ</label>
-      <input type="text" id="tautulli-api-key" placeholder="API key">
+      <input type="password" id="tautulli-api-key" placeholder="API key" autocomplete="off">
     </div>
+    <div class="row">
+      <label>Мой Plex-логин</label>
+      <input type="text" id="my-plex-user" placeholder="(необязательно) ваш friendly name в Plex">
+    </div>
+    <div class="note">Если заполнено - сеанс с этим пользователем на экранах, использующих
+      stream_* переменные (см. /screens), считается "личным" (tier=personal, показывается чаще
+      и может прервать текущий показ), а не "фоновым" - см. обсуждение "свой/чужой Plex-сеанс".
+      Работает, только если сам экран настроен как tier="ambient" (рекомендуемая настройка для
+      таких экранов). Пусто - ВСЕ Plex-сеансы считаются фоновыми.</div>
   </div>
 
   <!-- ---- qBittorrent (два сервера, объединяются в одни переменные) ---- -->
@@ -198,12 +261,12 @@ SETTINGS_PAGE_HTML = """<!doctype html>
     <div class="half">
       <div class="half-title">Сервер 1</div>
       <div class="row"><label>Адрес (URL)</label><input type="text" id="qbt1-url" placeholder="http://192.168.1.11:8080"></div>
-      <div class="row"><label>API-ключ</label><input type="text" id="qbt1-api-key" placeholder="API key"></div>
+      <div class="row"><label>API-ключ</label><input type="password" id="qbt1-api-key" placeholder="API key" autocomplete="off"></div>
     </div>
     <div class="half">
       <div class="half-title">Сервер 2</div>
       <div class="row"><label>Адрес (URL)</label><input type="text" id="qbt2-url" placeholder="http://192.168.1.12:8080"></div>
-      <div class="row"><label>API-ключ</label><input type="text" id="qbt2-api-key" placeholder="API key"></div>
+      <div class="row"><label>API-ключ</label><input type="password" id="qbt2-api-key" placeholder="API key" autocomplete="off"></div>
     </div>
   </div>
 
@@ -215,8 +278,11 @@ const BAR_ID = "bar0";  // одна лента - один "бар" во внут
 let metricsMap = {};
 let editingPeakHold = false, editingPeakFade = false, editingOsdHold = false;
 let editingLedsCount = false, editingVolumeStep = false, editingWarningThreshold = false;
-let editingTautulliUrl = false, editingTautulliApiKey = false;
+let editingTautulliUrl = false, editingTautulliApiKey = false, editingMyPlexUser = false;
 let editingQbt1Url = false, editingQbt1ApiKey = false, editingQbt2Url = false, editingQbt2ApiKey = false;
+let editingLayoutHold = false, editingDeviceHold = false, editingOsdCooldown = false;
+let editingPriorityPersonal = false, editingPriorityAmbient = false;
+let layoutColorsBuilt = false;
 
 function debounceSave(el, flagSetter, sendFn) {
   el.addEventListener("input", () => flagSetter(true));
@@ -284,6 +350,89 @@ muteColorEl.addEventListener("change", () => sendEncoderSettings({ mute_color: m
 warningColorEl.addEventListener("change", () => sendEncoderSettings({ warning_color: warningColorEl.value.slice(1).toUpperCase() }));
 debounceSave(warningThresholdEl, v => editingWarningThreshold = v, () => sendEncoderSettings({ warning_threshold_pct: parseInt(warningThresholdEl.value) }));
 
+// ---- OSD: раскладка клавиатуры / устройство вывода ----
+function sendOsd(partial) {
+  fetch("/api/osd", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(partial) });
+}
+
+const layoutHoldEl = document.getElementById("layout-hold-seconds");
+const layoutHoldValEl = document.getElementById("layout-hold-seconds-val");
+layoutHoldEl.addEventListener("input", () => {
+  editingLayoutHold = true;
+  layoutHoldValEl.textContent = parseFloat(layoutHoldEl.value).toFixed(1) + "с";
+});
+layoutHoldEl.addEventListener("change", () => {
+  sendOsd({ layout_hold_seconds: parseFloat(layoutHoldEl.value) });
+  editingLayoutHold = false;
+});
+
+const deviceHoldEl = document.getElementById("device-hold-seconds");
+const deviceHoldValEl = document.getElementById("device-hold-seconds-val");
+deviceHoldEl.addEventListener("input", () => {
+  editingDeviceHold = true;
+  deviceHoldValEl.textContent = parseFloat(deviceHoldEl.value).toFixed(1) + "с";
+});
+deviceHoldEl.addEventListener("change", () => {
+  sendOsd({ device_hold_seconds: parseFloat(deviceHoldEl.value) });
+  editingDeviceHold = false;
+});
+
+const osdCooldownEl = document.getElementById("osd-cooldown-seconds");
+const osdCooldownValEl = document.getElementById("osd-cooldown-seconds-val");
+osdCooldownEl.addEventListener("input", () => {
+  editingOsdCooldown = true;
+  osdCooldownValEl.textContent = parseFloat(osdCooldownEl.value).toFixed(1) + "с";
+});
+osdCooldownEl.addEventListener("change", () => {
+  sendOsd({ osd_cooldown_seconds: parseFloat(osdCooldownEl.value) });
+  editingOsdCooldown = false;
+});
+
+// Известные коды раскладки (см. metrics_windows._PRIMARY_LANG_NAMES) +
+// "_default" - fallback-цвет для языков без отдельной настройки. Строится
+// ОДИН РАЗ (layoutColorsBuilt) - создание/пересоздание input[type=color]
+// на каждый refresh() сбрасывало бы фокус/незакоммиченный выбор пользователя,
+// тот же принцип, что и populateSelects()/selectsPopulated на странице /.
+const KNOWN_LAYOUT_CODES = ["_default", "EN", "RU"];
+function buildLayoutColorsRows(colors) {
+  const wrap = document.getElementById("layout-colors-rows");
+  wrap.innerHTML = "";
+  KNOWN_LAYOUT_CODES.forEach(code => {
+    const row = document.createElement("div");
+    row.className = "row";
+    const label = document.createElement("label");
+    label.textContent = code === "_default" ? "По умолчанию" : code;
+    row.appendChild(label);
+    const colorsWrap = document.createElement("div");
+    colorsWrap.className = "colors";
+    const inp = document.createElement("input");
+    inp.type = "color";
+    inp.value = "#" + (colors[code] || "808080");
+    inp.addEventListener("change", () => {
+      const body = { layout_colors: {} };
+      body.layout_colors[code] = inp.value.slice(1).toUpperCase();
+      sendOsd(body);
+    });
+    colorsWrap.appendChild(inp);
+    row.appendChild(colorsWrap);
+    wrap.appendChild(row);
+  });
+  layoutColorsBuilt = true;
+}
+
+// ---- Приоритетная ротация экранов ----
+function sendPriorityBoost(partial) {
+  fetch("/api/priority_boost", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(partial) });
+}
+const priorityPersonalEl = document.getElementById("priority-boost-personal");
+const priorityAmbientEl = document.getElementById("priority-boost-ambient");
+debounceSave(priorityPersonalEl, v => editingPriorityPersonal = v,
+  () => sendPriorityBoost({ priority_boost_personal: parseInt(priorityPersonalEl.value) }));
+debounceSave(priorityAmbientEl, v => editingPriorityAmbient = v,
+  () => sendPriorityBoost({ priority_boost_ambient: parseInt(priorityAmbientEl.value) }));
+
 // ---- Tautulli (Plex) ----
 function sendTautulli(partial) {
   fetch("/api/tautulli", { method: "POST", headers: {"Content-Type":"application/json"},
@@ -291,8 +440,10 @@ function sendTautulli(partial) {
 }
 const tautulliUrlEl = document.getElementById("tautulli-url");
 const tautulliApiKeyEl = document.getElementById("tautulli-api-key");
+const myPlexUserEl = document.getElementById("my-plex-user");
 debounceSave(tautulliUrlEl, v => editingTautulliUrl = v, () => sendTautulli({ url: tautulliUrlEl.value }));
 debounceSave(tautulliApiKeyEl, v => editingTautulliApiKey = v, () => sendTautulli({ api_key: tautulliApiKeyEl.value }));
+debounceSave(myPlexUserEl, v => editingMyPlexUser = v, () => sendTautulli({ my_plex_user: myPlexUserEl.value }));
 
 // ---- qBittorrent (два сервера, один эндпоинт на оба - см. /api/qbittorrent в pc_hud.py) ----
 function sendQbt(partial) {
@@ -550,10 +701,28 @@ function render(state) {
 
   if (!editingTautulliUrl) tautulliUrlEl.value = state.cfg.tautulli_url;
   if (!editingTautulliApiKey) tautulliApiKeyEl.value = state.cfg.tautulli_api_key;
+  if (!editingMyPlexUser) myPlexUserEl.value = state.cfg.my_plex_user || "";
   if (!editingQbt1Url) qbt1UrlEl.value = state.cfg.qbt1_url;
   if (!editingQbt1ApiKey) qbt1ApiKeyEl.value = state.cfg.qbt1_api_key;
   if (!editingQbt2Url) qbt2UrlEl.value = state.cfg.qbt2_url;
   if (!editingQbt2ApiKey) qbt2ApiKeyEl.value = state.cfg.qbt2_api_key;
+
+  if (!editingLayoutHold) {
+    layoutHoldEl.value = state.cfg.layout_hold_seconds;
+    layoutHoldValEl.textContent = parseFloat(state.cfg.layout_hold_seconds).toFixed(1) + "с";
+  }
+  if (!editingDeviceHold) {
+    deviceHoldEl.value = state.cfg.device_hold_seconds;
+    deviceHoldValEl.textContent = parseFloat(state.cfg.device_hold_seconds).toFixed(1) + "с";
+  }
+  if (!editingOsdCooldown) {
+    osdCooldownEl.value = state.cfg.osd_cooldown_seconds;
+    osdCooldownValEl.textContent = parseFloat(state.cfg.osd_cooldown_seconds).toFixed(1) + "с";
+  }
+  if (!layoutColorsBuilt) buildLayoutColorsRows(state.cfg.layout_colors || {});
+
+  if (!editingPriorityPersonal) priorityPersonalEl.value = state.cfg.priority_boost_personal;
+  if (!editingPriorityAmbient) priorityAmbientEl.value = state.cfg.priority_boost_ambient;
 
   if (!editingPeakHold) {
     peakHoldEl.value = state.cfg.peak_hold_seconds;

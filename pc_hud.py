@@ -51,6 +51,7 @@ import screens_webui
 import settings_webui
 import protocol
 import ledbar
+import osd
 import metrics_windows
 import metrics_tautulli
 import metrics_qbittorrent
@@ -131,6 +132,36 @@ DEFAULT_ENCODER = {
     "volume_colors": {"c1": "00FF42", "c2": "FFF600", "c3": "FF0000"},
 }
 
+# ---- OSD-очередь (НОВОЕ) - см. osd.py/класс OsdManager и обсуждение в чате
+# про унификацию: раскладка клавиатуры и смена аудио-устройства теперь тоже
+# popup'ы через ТУ ЖЕ очередь, что и громкость (DEFAULT_ENCODER.osd_hold_seconds
+# выше - её длительность не трогаем, у каждого типа своя). Приоритет
+# прерывания зашит в OSD_TYPES (см. osd.py), тут только тайминги/цвета -
+# живые настройки, редактируются в /settings.
+DEFAULT_LAYOUT_HOLD_SECONDS = 1.2   # короче, чем у громкости - раскладка меняется
+                                      # часто, задерживать надолго не нужно (см.
+                                      # обсуждение в чате - "боковым зрением зацепить")
+DEFAULT_DEVICE_HOLD_SECONDS = 2.0
+DEFAULT_OSD_COOLDOWN_SECONDS = 0.5   # минимальный интервал между ЛЮБЫМИ двумя
+                                      # срабатываниями OSD (любого типа) - защита
+                                      # от дребезга источника (см. осуждение п.3.3/4)
+# Цвет LED-вспышки на layout OSD, по коду раскладки (см.
+# metrics_windows._PRIMARY_LANG_NAMES за списком известных кодов) - "_default"
+# используется для языков, для которых отдельный цвет не задан. Только для
+# типа "layout" - у "device" вспышки на ленте нет вообще (см. обсуждение -
+# смена устройства вывода не настолько срочное событие, только OLED-текст).
+DEFAULT_LAYOUT_COLORS = {
+    "EN": "1E90FF", "RU": "FF4500", "UA": "FFD700", "_default": "808080",
+}
+
+# ---- Приоритетная ротация экранов (НОВОЕ) - см. screens.RotationState.
+# "Каждый N-й слот" для personal/ambient дорожек - см. докстринг screens.py
+# за полным описанием алгоритма (round-robin внутри дорожки + форс-прерывание
+# только у personal). Живые настройки в /settings, а не константы - т.к.
+# "насколько часто" это вопрос личного вкуса пользователя, как и tick_interval.
+DEFAULT_PRIORITY_BOOST_PERSONAL = 2
+DEFAULT_PRIORITY_BOOST_AMBIENT = 4
+
 BAR_METRICS = {
     "cpu": "CPU",
     "ram": "RAM",
@@ -204,11 +235,29 @@ DEFAULT_SETTINGS = {
     "disk1_letter": "",
     "disk2_letter": "",
     "encoder": DEFAULT_ENCODER,
+    # OSD раскладки/устройства - см. DEFAULT_LAYOUT_HOLD_SECONDS и т.п. выше
+    # за обоснованием значений. layout_colors - словарь код_раскладки -> hex,
+    # merge-логика load_settings() обрабатывает его так же, как colors/bar0
+    # (dict-of-dict, один уровень вложенности) - пользователь может
+    # переопределить/добавить отдельные языки, не обнуляя остальные.
+    "layout_hold_seconds": DEFAULT_LAYOUT_HOLD_SECONDS,
+    "device_hold_seconds": DEFAULT_DEVICE_HOLD_SECONDS,
+    "osd_cooldown_seconds": DEFAULT_OSD_COOLDOWN_SECONDS,
+    "layout_colors": DEFAULT_LAYOUT_COLORS,
+    # Приоритетная ротация экранов (tier=personal/ambient, см. screens.py) -
+    # "каждый N-й слот" для каждой дорожки.
+    "priority_boost_personal": DEFAULT_PRIORITY_BOOST_PERSONAL,
+    "priority_boost_ambient": DEFAULT_PRIORITY_BOOST_AMBIENT,
     # Tautulli (Plex) - адрес/ключ подключения, тот же принцип, что и
     # serial_port/net1_iface выше - живая настройка в /settings, а не
-    # переменная окружения.
+    # переменная окружения. my_plex_user - НОВОЕ: если заполнено и совпадает
+    # со stream_user активного сеанса (Tautulli отдаёт friendly_name) - этот
+    # сеанс считается tier="personal" (тот же человек смотрит на этом же ПК),
+    # а не "ambient" - см. обсуждение в чате про "чужой/свой Plex-сеанс".
+    # Пусто (дефолт) - ВСЕ Plex-сеансы считаются ambient, безопасное поведение.
     "tautulli_url": "",
     "tautulli_api_key": "",
+    "my_plex_user": "",
     # qBittorrent - ДВА сервера (два разных инстанса с разными IP и разными
     # API-ключами, см. metrics_qbittorrent.py) - плоские qbt1_*/qbt2_* ключи,
     # тот же паттерн, что net1_iface/net2_iface/disk1_letter/disk2_letter
@@ -355,20 +404,6 @@ def format_speed_mbps(mbps):
         return f"{mbps / 1000:g}Gbit"
     return f"{mbps}Mbit"
 
-def _center_oled_line(text, width=16):
-    """Центрирует текст пробелами под ширину OLED-строки (16 символов -
-    тот же ориентир, что и {var:16} в остальных экранах - см. screens.py/
-    default-audio/default-gpu, с запасом от полных ~21 символа на 128px
-    при OLED_FONT_SIZE=1 в прошивке). Длинные значения обрезаются, а не
-    скроллятся - для короткого попапа громкости это не проблема."""
-    text = str(text)
-    if len(text) >= width:
-        return text[:width]
-    pad = width - len(text)
-    left = pad // 2
-    return " " * left + text + " " * (pad - left)
-
-
 # ---------------- assets (иконка трея/favicon - генерируются, если отсутствуют) ----------------
 
 def _ensure_assets():
@@ -489,7 +524,7 @@ SENSORS_PAGE_HTML = """<!doctype html>
     Pro Micro не подключена - лента и OLED не обновляются, метрики продолжают собираться</div>
 
   <div class="card">
-    <h2>ЛЕНТА <span class="osd-badge" id="osd-badge">VOLUME OSD</span></h2>
+    <h2>ЛЕНТА <span class="osd-badge" id="osd-badge">OSD</span></h2>
     <div class="strip-track" id="pixels-strip"></div>
     <div class="label"><b><span id="val-strip"></span></b></div>
     <div class="brightness-row">
@@ -621,7 +656,11 @@ function refresh() {
     });
     const label = bar.mode === "center" ? (bar.pct_bottom + "% / " + bar.pct_top + "%") : (bar.pct_bottom + "%");
     document.getElementById("val-strip").textContent = label;
-    document.getElementById("osd-badge").classList.toggle("show", bar.osd_active);
+    const osdBadge = document.getElementById("osd-badge");
+    osdBadge.classList.toggle("show", bar.osd_active);
+    if (bar.osd_active && bar.osd_type) {
+      osdBadge.textContent = bar.osd_type.toUpperCase() + " OSD";
+    }
 
     if (!editingBrightness) {
       brightnessEl.value = s.cfg.brightness;
@@ -880,13 +919,64 @@ def api_tautulli():
     ОТДЕЛЬНЫМ фоновым потоком (integrations_loop, см. ниже), поэтому
     сохранение тут не требует немедленного переподключения - новое значение
     cfg подхватится этим потоком на его следующем тике
-    (INTEGRATIONS_POLL_INTERVAL, по умолчанию 5с)."""
+    (INTEGRATIONS_POLL_INTERVAL, по умолчанию 5с).
+
+    my_plex_user - НОВОЕ (та же карточка на /settings, см. обсуждение в чате
+    про "свой/чужой Plex-сеанс") - сравнивается со stream_user активного
+    сеанса построчно в screens.build_active_screens() при вычислении tier
+    конкретной копии repeating-экрана "stream" - см. там же за подробностями
+    point-override. Пусто (дефолт) - ВСЕ сеансы считаются ambient."""
     body = request.get_json(force=True)
     with state_lock:
         if "url" in body:
             state["cfg"]["tautulli_url"] = body["url"].strip()
         if "api_key" in body:
             state["cfg"]["tautulli_api_key"] = body["api_key"].strip()
+        if "my_plex_user" in body:
+            state["cfg"]["my_plex_user"] = body["my_plex_user"].strip()
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/osd", methods=["POST"])
+def api_osd():
+    """Тайминги/цвета OSD-попапов раскладки/устройства + общий кулдаун (см.
+    osd.py) - громкость (osd_hold_seconds/mute_color/warning_*) остаётся в
+    /api/encoder, как и раньше (обратная совместимость с уже сохранёнными
+    settings.json, см. osd._hold_seconds() за обоснованием этого решения).
+    layout_colors - точечное обновление ОДНОГО кода раскладки за запрос
+    (body: {"layout_colors": {"RU": "FF4500"}}) - тот же паттерн, что и
+    encoder.volume_colors (dict.update, не полная замена словаря), чтобы
+    правка одного языка в UI не затирала остальные."""
+    body = request.get_json(force=True)
+    with state_lock:
+        if "layout_hold_seconds" in body:
+            state["cfg"]["layout_hold_seconds"] = round(max(0.3, min(5.0, float(body["layout_hold_seconds"]))), 1)
+        if "device_hold_seconds" in body:
+            state["cfg"]["device_hold_seconds"] = round(max(0.5, min(10.0, float(body["device_hold_seconds"]))), 1)
+        if "osd_cooldown_seconds" in body:
+            state["cfg"]["osd_cooldown_seconds"] = round(max(0.0, min(5.0, float(body["osd_cooldown_seconds"]))), 1)
+        if "layout_colors" in body and isinstance(body["layout_colors"], dict):
+            for code, color in body["layout_colors"].items():
+                if isinstance(color, str) and color:
+                    state["cfg"]["layout_colors"][code] = color.upper()
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/priority_boost", methods=["POST"])
+def api_priority_boost():
+    """"Каждый N-й слот" для personal/ambient дорожек ротации (см.
+    screens.RotationState) - нижняя граница 1 (личный/фоновый экран получает
+    ВООБЩЕ КАЖДЫЙ слот - предельный случай, отдельно не запрещаем, это
+    осмысленная настройка "показывать только это"), верхняя - произвольный
+    разумный потолок, чтобы не запутаться в UI."""
+    body = request.get_json(force=True)
+    with state_lock:
+        if "priority_boost_personal" in body:
+            state["cfg"]["priority_boost_personal"] = max(1, min(20, int(body["priority_boost_personal"])))
+        if "priority_boost_ambient" in body:
+            state["cfg"]["priority_boost_ambient"] = max(1, min(20, int(body["priority_boost_ambient"])))
         save_settings(state["cfg"])
     return jsonify({"ok": True})
 
@@ -985,8 +1075,33 @@ def metrics_main_loop(stop_event):
     media_state = {"media_title": None, "media_artist": None, "media_playing": "нет"}
     lines = ["", "", ""]
 
-    osd_active = False
-    osd_until = 0.0
+    # OSD-очередь (громкость/раскладка/устройство вывода) - см. osd.py за
+    # унификацией: раньше тут были только osd_active/osd_until под громкость,
+    # теперь единый OsdManager с приоритетом и общим кулдауном.
+    osd_manager = osd.OsdManager()
+
+    # pixels/bar_state - объявлены ДО цикла и переиспользуются между
+    # итерациями НАМЕРЕННО: когда активен OSD-тип с pixels=None (см.
+    # osd._render_device) - "не подменять ленту" реализуется буквально как
+    # "не переприсваивать эти переменные в этой итерации", то есть лента
+    # остаётся ровно такой же, какой её оставила ПРЕДЫДУЩАЯ итерация (обычная
+    # метрика/другой OSD) - без явного "запоминания" пришлось бы городить
+    # отдельный кэш. Дефолт ниже используется только в теории (на первой же
+    # итерации OsdManager пуст, activate ещё никто не успел).
+    pixels = ["000000"] * DEFAULT_SETTINGS["leds_count"]
+    bar_state = {"mode": "classic", "pixels": pixels, "pct_bottom": 0, "pct_top": None,
+                 "osd_active": False, "osd_type": None}
+
+    # watched-value diff для layout/device OSD (см. osd.py про природу этих
+    # триггеров - НЕ событие, а сравнение значения тик-к-тику). None -
+    # "ещё не было ни одного успешного чтения" - первый тик после старта
+    # процесса НЕ должен триггерить popup (иначе при запуске мигнёт
+    # бесполезный "сменили на текущий язык/устройство"). Обновляются внутри
+    # блока медленных метрик ниже - keyboard_layout/audio_device_name
+    # читаются именно там, не каждый тик.
+    watched_layout = None
+    watched_layout_pid = None
+    watched_device_name = None
 
     last_metrics_tick = 0.0
     # last_vu_time - ОТДЕЛЬНЫЙ от last_metrics_tick таймер: VU обновляется
@@ -1038,9 +1153,16 @@ def metrics_main_loop(stop_event):
                         elif kind == "button":
                             apply_button_click(cfg)
                         # любое событие энкодера/кнопки - показать OSD громкости
+                        # через единую очередь (см. osd.py) - push() сам решает,
+                        # прервать ли уже показываемый более приоритетный (layout)
+                        # popup, встать в очередь, или показаться сразу; общий
+                        # кулдаун (cfg["osd_cooldown_seconds"]) тоже внутри push().
                         audio_state = audio_controller.read_state()
-                        osd_active = True
-                        osd_until = now + cfg["encoder"]["osd_hold_seconds"]
+                        osd_manager.push(
+                            "volume",
+                            {"volume_pct": audio_state["volume_pct"], "muted": audio_state["volume_muted"] == "да"},
+                            now, cfg,
+                        )
             except (serial.SerialException, OSError):
                 print("[serial] read failed, will reconnect", flush=True)
                 try:
@@ -1122,7 +1244,39 @@ def metrics_main_loop(stop_event):
 
             audio_state = audio_controller.read_state()
             media_state = media_monitor.read()
-            keyboard_layout = metrics_windows.get_keyboard_layout()
+            keyboard_state = metrics_windows.read_keyboard_state()
+            keyboard_layout = keyboard_state["keyboard_layout"]
+            foreground_pid = keyboard_state["foreground_pid"]
+
+            # ---- watched-value diff: раскладка клавиатуры (см. osd.py) -
+            # триггерим popup, только если раскладка ДЕЙСТВИТЕЛЬНО сменилась
+            # (не первый тик после старта - watched_layout is not None) И
+            # foreground_pid НЕ изменился одновременно с ней - иначе это не
+            # реальное переключение языка, а alt-tab между окнами с разной
+            # per-window раскладкой (см. подробное обоснование в докстринге
+            # metrics_windows.read_keyboard_state()).
+            if (
+                watched_layout is not None
+                and keyboard_layout is not None
+                and keyboard_layout != watched_layout
+                and foreground_pid == watched_layout_pid
+            ):
+                osd_manager.push("layout", {"layout": keyboard_layout}, now, cfg)
+            watched_layout = keyboard_layout
+            watched_layout_pid = foreground_pid
+
+            # ---- watched-value diff: устройство вывода звука (см. osd.py) -
+            # без фильтра по окну (переключение устройства не связано с
+            # фокусом окна, в отличие от раскладки выше). "N/A" (pycaw
+            # недоступен/устройство временно не определилось) не триггерит -
+            # иначе временный сбой чтения устройства выглядел бы как "смена".
+            if (
+                watched_device_name is not None
+                and audio_state["audio_device_name"] not in (None, "N/A")
+                and audio_state["audio_device_name"] != watched_device_name
+            ):
+                osd_manager.push("device", {"device_name": audio_state["audio_device_name"]}, now, cfg)
+            watched_device_name = audio_state["audio_device_name"]
 
             # ---- Tautulli (Plex) / qBittorrent - ТОЛЬКО чтение уже готового
             # результата фонового потока (integrations_loop), никаких
@@ -1172,6 +1326,13 @@ def metrics_main_loop(stop_event):
                 "media_title": media_state["media_title"],
                 "media_artist": media_state["media_artist"],
                 "media_playing": media_state["media_playing"],
+                # my_plex_user - НЕ переменная OLED-шаблонов (не зарегистрирована
+                # в variables.VARIABLES, не появится в легенде /screens) -
+                # используется ТОЛЬКО screens.build_active_screens() для
+                # point-override tier у отдельных копий repeating-группы
+                # "stream" (см. обсуждение в чате про "свой/чужой Plex-сеанс"
+                # и докстринг build_active_screens() в screens.py).
+                "my_plex_user": cfg.get("my_plex_user", ""),
                 # Plex (через Tautulli) + qBittorrent - integrations уже
                 # содержит РОВНО те ключи, что ожидают резолверы variables.py
                 # (plex_*/streams/recent/qbt_*/torrents) - см.
@@ -1183,7 +1344,22 @@ def metrics_main_loop(stop_event):
                 _last_context.update(context)
 
             current_screens = screens_webui.get_screens()
-            lines = rotation.current_lines(current_screens, context, now=now)
+            # Гейт по OsdManager - если сейчас показывается ЛЮБОЙ OSD-попап
+            # (громкость/раскладка/устройство), rotation.current_lines() НЕ
+            # вызывается вовсе: её внутренние курсоры/таймеры/started_at не
+            # двигаются, ротация реально "стоит на паузе" (а не просто её
+            # результат визуально перезаписывается, как было раньше только
+            # для громкости) - продолжится с того же места сама, как только
+            # OSD-очередь опустеет. osd_manager.tick(now, cfg) тут ничего не
+            # меняет состояние очереди даже при повторном вызове с тем же
+            # now (см. осд.py) - тот же теккущий/следующий popup будет ещё
+            # раз прочитан ниже, в блоке расчёта ленты, идемпотентно.
+            if osd_manager.tick(now, cfg) is None:
+                lines = rotation.current_lines(
+                    current_screens, context, now=now,
+                    priority_boost_personal=cfg.get("priority_boost_personal", DEFAULT_PRIORITY_BOOST_PERSONAL),
+                    priority_boost_ambient=cfg.get("priority_boost_ambient", DEFAULT_PRIORITY_BOOST_AMBIENT),
+                )
         #    with state_lock:
         #        state["oled_lines"] = lines
 
@@ -1214,33 +1390,45 @@ def metrics_main_loop(stop_event):
         common_metrics["vu_left"] = vu_state["vu_left_pct"]
         common_metrics["vu_right"] = vu_state["vu_right_pct"]
 
-        # ---- лента: OSD громкости ИЛИ обычная метрика (каждый тик) ----
+        # ---- лента: OSD popup (громкость/раскладка/устройство) ИЛИ обычная
+        # метрика (каждый тик) - см. osd.py за унификацией трёх типов ----
         leds_count = cfg["leds_count"]
+        osd_result = osd_manager.tick(now, cfg)
 
-        if osd_active and now < osd_until:
-            enc = cfg["encoder"]
-            pixels = ledbar.compute_volume_osd_pixels(
-                audio_state["volume_pct"],
-                enc["volume_colors"]["c1"], enc["volume_colors"]["c2"], enc["volume_colors"]["c3"],
-                muted=(audio_state["volume_muted"] == "да"),
-                mute_color=enc["mute_color"], warning_color=enc["warning_color"],
-                warning_threshold_pct=enc["warning_threshold_pct"],
-                leds_per_bar=leds_count,
-            )
-            bar_state = {"mode": "volume_osd", "pixels": pixels,
-                         "pct_bottom": audio_state["volume_pct"], "pct_top": audio_state["volume_pct"],
-                         "osd_active": True}
-
-            # OLED на это же время полностью заменяется попапом громкости -
-            # тем же таймером, что и лента выше. rotation.current_lines() тут
-            # НЕ вызывается и её внутренний индекс/switched_at не трогается -
-            # ротация экранов просто "стоит на паузе" и продолжится с того же
-            # места сама, как только osd_until истечёт (следующий тик медленных
-            # метрик снова вызовет rotation.current_lines() как обычно).
-            osd_line = "MUTE" if audio_state["volume_muted"] == "да" else f"Vol {audio_state['volume_pct']}%"
-            lines = ["", _center_oled_line(osd_line), ""]
+        if osd_result is not None:
+            # ЛЮБОЙ активный OSD-тип - OLED полностью заменяется попапом.
+            # Лента подменяется, ТОЛЬКО если рендерер это предусмотрел (см.
+            # osd.OSD_TYPES - у "device" render возвращает pixels=None,
+            # означающее "не трогай ленту"). В этом случае pixels/bar_state
+            # НЕ переприсваиваются вовсе и остаются такими, какими их
+            # оставила ПРЕДЫДУЩАЯ итерация (см. их объявление до while) -
+            # "не подменять" реализовано буквально, без отдельного кэша.
+            #
+            # peak_trackers/обычная метрика бара (см. else-ветку ниже) НЕ
+            # пересчитываются, пока показывается любой OSD - та же пауза,
+            # что раньше была только у громкости (после окончания OSD
+            # peak hold продолжит отсчёт от значения ДО паузы, не от
+            # накопленного "в фоне" - это осознанное поведение, тот же
+            # компромисс, что был и в прежнем коде).
+            osd_lines, osd_pixels = osd_manager.render(osd_result["type"], osd_result["payload"], cfg, leds_count)
+            lines = osd_lines
+            if osd_pixels is not None:
+                pixels = osd_pixels
+                # pct_bottom - для превью на / (см. SENSORS_PAGE_HTML ниже) -
+                # volume_pct для типа "volume", иначе просто "полная шкала"
+                # (100) ради вменяемого числа в UI, содержательного смысла
+                # как у обычных метрик тут нет (см. osd._render_layout).
+                pct_display = osd_result["payload"].get("volume_pct", 100)
+                bar_state = {
+                    "mode": f"{osd_result['type']}_osd", "pixels": pixels,
+                    "pct_bottom": pct_display, "pct_top": None,
+                    "osd_active": True, "osd_type": osd_result["type"],
+                }
+            else:
+                bar_state = dict(bar_state)
+                bar_state["osd_active"] = True
+                bar_state["osd_type"] = osd_result["type"]
         else:
-            osd_active = False
             bar_mode = cfg["mode"]["bar0"]
             peak_info = cfg["peak"]["bar0"]
             peak_enabled = peak_info["enabled"]
@@ -1272,7 +1460,8 @@ def metrics_main_loop(stop_event):
                     peak_pct_bottom=bottom_peak if peak_enabled else None,
                     peak_pct_top=top_peak if peak_enabled else None,
                 )
-                bar_state = {"mode": bar_mode, "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": pct_top, "osd_active": False}
+                bar_state = {"mode": bar_mode, "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": pct_top,
+                             "osd_active": False, "osd_type": None}
             elif bar_mode == "flat":
                 # flat - однометричный режим (как classic - только нижняя/
                 # единственная метрика assignment, без top-половины), но без
@@ -1285,14 +1474,16 @@ def metrics_main_loop(stop_event):
                     cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"],
                     leds_per_bar=leds_count,
                 )
-                bar_state = {"mode": "flat", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None, "osd_active": False}
+                bar_state = {"mode": "flat", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None,
+                             "osd_active": False, "osd_type": None}
             else:
                 pixels = ledbar.compute_bar_pixels(
                     pct_bottom, cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"], cfg["solid"]["bar0"],
                     leds_per_bar=leds_count,
                     peak_pct=bottom_peak if peak_enabled else None,
                 )
-                bar_state = {"mode": "classic", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None, "osd_active": False}
+                bar_state = {"mode": "classic", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None,
+                             "osd_active": False, "osd_type": None}
 
         if cfg.get("leds_reverse"):
             # Физический реверс - см. докстринг leds_reverse в

@@ -68,6 +68,10 @@ SCREENS_PAGE_HTML = """<!doctype html>
   .screen-row .handle { color:var(--muted); font-size:16px; }
   .screen-row .info { flex:1; min-width:0; }
   .screen-row .name { font-size:14px; }
+  .tier-badge { display:inline-block; font-size:9px; font-weight:700; letter-spacing:.03em;
+                border-radius:4px; padding:1px 5px; margin-left:8px; vertical-align:middle; }
+  .tier-badge-personal { background:var(--accent); color:#151515; }
+  .tier-badge-ambient { background:#2c2e31; color:var(--muted); border:1px solid var(--border); }
   .screen-row .preview { font-size:11px; color:var(--muted); font-family:monospace; white-space:nowrap;
                           overflow:hidden; text-overflow:ellipsis; }
   .screen-row input[type=checkbox] { width:16px; height:16px; }
@@ -90,6 +94,15 @@ SCREENS_PAGE_HTML = """<!doctype html>
     width:100%; background:#101112; color:var(--text); border:1px solid var(--border);
     border-radius:6px; padding:8px 10px; font-size:14px; font-family:monospace;
   }
+  .modal select {
+    width:100%; background:#101112; color:var(--text); border:1px solid var(--border);
+    border-radius:6px; padding:8px 10px; font-size:13px;
+  }
+  .tier-hint { font-size:11px; color:var(--muted); margin-top:4px; line-height:1.4; }
+  .trigger-vars-list { display:flex; flex-wrap:wrap; gap:4px 12px; margin-top:6px; }
+  .trigger-vars-list label { display:inline-flex; align-items:center; gap:5px; margin:0;
+                              font-size:12px; color:var(--text); font-family:monospace; }
+  .trigger-vars-list .empty-hint { font-size:12px; color:var(--muted); font-family:inherit; }
   .line-preview { font-size:12px; color:var(--accent); font-family:monospace; margin-top:4px; min-height:16px; }
   .line-preview.err { color:var(--danger); }
   .modal-actions { display:flex; justify-content:space-between; gap:10px; margin-top:20px; }
@@ -133,6 +146,19 @@ SCREENS_PAGE_HTML = """<!doctype html>
 
     <label>Время показа, сек</label>
     <input type="number" id="edit-duration" min="1" step="0.5" value="4">
+
+    <label>Приоритет (tier)</label>
+    <select id="edit-tier">
+      <option value="normal">Обычный</option>
+      <option value="personal">Личный (чаще + может прервать другой экран)</option>
+      <option value="ambient">Фоновый (чаще, без права прерывания)</option>
+    </select>
+    <div class="tier-hint" id="tier-hint"></div>
+
+    <div id="trigger-vars-block" style="display:none">
+      <label>Триггер-переменные (мгновенное обновление, без ожидания своей очереди)</label>
+      <div class="trigger-vars-list" id="trigger-vars-list"></div>
+    </div>
 
     <label>Строка 1</label>
     <input type="text" id="edit-l1" placeholder="CPU {cpu_pct}%">
@@ -214,6 +240,12 @@ function renderList() {
     const name = document.createElement('div');
     name.className = 'name';
     name.textContent = s.name;
+    if (s.tier === 'personal' || s.tier === 'ambient') {
+      const tierBadge = document.createElement('span');
+      tierBadge.className = 'tier-badge tier-badge-' + s.tier;
+      tierBadge.textContent = s.tier === 'personal' ? 'ЛИЧНЫЙ' : 'ФОНОВЫЙ';
+      name.appendChild(tierBadge);
+    }
     const preview = document.createElement('div');
     preview.className = 'preview';
     preview.textContent = [s.l1, s.l2, s.l3].filter(Boolean).join('  |  ');
@@ -310,8 +342,79 @@ function livePreview(inputEl, previewEl) {
 ['l1','l2','l3'].forEach(k => {
   const input = document.getElementById('edit-' + k);
   const preview = document.getElementById('preview-' + k);
-  input.addEventListener('input', () => livePreview(input, preview));
+  input.addEventListener('input', () => { livePreview(input, preview); rebuildTriggerVars(); });
 });
+
+const TIER_HINTS = {
+  normal: 'Обычная ротация, без особого поведения.',
+  personal: 'Показывается чаще (см. "Приоритетная ротация" на /settings) и может мгновенно ' +
+    'прервать текущий показ - как при появлении (например, началась музыка), так и при смене ' +
+    'выбранных ниже триггер-переменных на уже показываемом экране (например, сменился трек).',
+  ambient: 'Показывается чаще обычного, но НЕ прерывает текущий показ - просто получает более ' +
+    'частые слоты в очереди.',
+};
+
+// Текущий выбор триггер-переменных ХРАНИТСЯ ОТДЕЛЬНО от чекбоксов (Set имён) -
+// чекбоксы пересоздаются при каждой правке l1/l2/l3 (см. rebuildTriggerVars),
+// поэтому сам DOM не может быть источником правды для "что было отмечено до
+// того, как в списке появилась/исчезла переменная".
+let currentTriggerVars = new Set();
+
+// Извлекает имена переменных из l1+l2+l3 - тот же синтаксис, что и
+// templates.TOKEN_RE (см. templates.py) - {name} или {name:spec}. Разбор
+// клиентский (не через /api/preview), т.к. нужен просто список ИМЁН, а не
+// рендер значений - незачем ходить на сервер ради этого.
+function extractUsedVars() {
+  const text = ['l1', 'l2', 'l3'].map(k => document.getElementById('edit-' + k).value).join(' ');
+  const re = /\\{([a-zA-Z0-9_]+)(?::[^}]*)?\\}/g;
+  const seen = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (!seen.includes(m[1])) seen.push(m[1]);
+  }
+  return seen;
+}
+
+function rebuildTriggerVars() {
+  const usedVars = extractUsedVars();
+  // Убираем из выбора переменные, которых больше нет в l1/l2/l3 - иначе
+  // сохранённый trigger_vars мог бы содержать имя, которого экран уже не
+  // использует (безвредно для screens.py, но сбивает с толку в UI).
+  currentTriggerVars = new Set(usedVars.filter(name => currentTriggerVars.has(name)));
+
+  const wrap = document.getElementById('trigger-vars-list');
+  wrap.innerHTML = '';
+  if (usedVars.length === 0) {
+    const hint = document.createElement('span');
+    hint.className = 'empty-hint';
+    hint.textContent = '(добавьте {переменные} в строки выше, чтобы выбрать триггеры)';
+    wrap.appendChild(hint);
+    return;
+  }
+  usedVars.forEach(name => {
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = currentTriggerVars.has(name);
+    cb.addEventListener('change', () => {
+      if (cb.checked) currentTriggerVars.add(name);
+      else currentTriggerVars.delete(name);
+    });
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode('{' + name + '}'));
+    wrap.appendChild(label);
+  });
+}
+
+function applyTierVisibility(tier) {
+  document.getElementById('tier-hint').textContent = TIER_HINTS[tier] || '';
+  // trigger_vars имеют смысл ТОЛЬКО для tier=personal (мгновенное
+  // продление показа при смене контента - см. докстринг screens.py, для
+  // ambient/normal такого права нет) - не показываем блок зря.
+  document.getElementById('trigger-vars-block').style.display = tier === 'personal' ? 'block' : 'none';
+}
+
+document.getElementById('edit-tier').addEventListener('change', e => applyTierVisibility(e.target.value));
 
 function openModal(s) {
   document.getElementById('modal-title').textContent = s ? 'Редактировать экран' : 'Новый экран';
@@ -322,6 +425,11 @@ function openModal(s) {
   document.getElementById('edit-l2').value = s ? s.l2 : '';
   document.getElementById('edit-l3').value = s ? s.l3 : '';
   document.getElementById('delete-btn').style.display = s ? 'inline-block' : 'none';
+  const tier = (s && s.tier) || 'normal';
+  document.getElementById('edit-tier').value = tier;
+  applyTierVisibility(tier);
+  currentTriggerVars = new Set((s && s.trigger_vars) || []);
+  rebuildTriggerVars();
   ['l1','l2','l3'].forEach(k => livePreview(document.getElementById('edit-'+k), document.getElementById('preview-'+k)));
   document.getElementById('modal-bg').classList.add('show');
 }
@@ -341,6 +449,8 @@ document.getElementById('save-btn').addEventListener('click', () => {
     l2: document.getElementById('edit-l2').value,
     l3: document.getElementById('edit-l3').value,
     duration: parseFloat(document.getElementById('edit-duration').value) || 4,
+    tier: document.getElementById('edit-tier').value,
+    trigger_vars: Array.from(currentTriggerVars),
   };
   const req = id
     ? fetch('/api/screens/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })

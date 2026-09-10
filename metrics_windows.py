@@ -789,29 +789,49 @@ _PRIMARY_LANG_NAMES = {
 }
 
 
-def get_keyboard_layout():
+def read_keyboard_state():
     """
-    Текущая раскладка клавиатуры - по решению из обсуждения берём "глобальную
-    системную" в упрощённом виде: раскладку потока переднего окна (foreground
-    window), опрашиваемую поллингом раз в тик, БЕЗ хуков на переключение
-    фокуса/языка. Это самый простой надёжный способ без win32-message-hook
-    инфраструктуры, и в обычном режиме (без индивидуальной раскладки на
-    приложение, включаемой отдельной опцией Windows) он показывает ровно то
-    же значение, что и системный индикатор языка в трее.
+    Раскладка клавиатуры + PID окна переднего плана ЗА ОДИН системный вызов
+    GetForegroundWindow() - см. докстринг про подход "глобальная системная
+    раскладка" ниже (не изменился). foreground_pid добавлен ради грядущего
+    OSD-попапа смены раскладки (см. обсуждение в README/чате): при per-window
+    раскладке (индивидуальная раскладка на приложение - отдельная опция
+    Windows) alt-tab между окнами с разным языком меняет keyboard_layout
+    САМ ПО СЕБЕ, без реального переключения языка пользователем - сравнивая
+    foreground_pid тик-к-тику, вызывающий код (pc_hud.py) сможет отличить
+    "сменили язык в том же окне" (триггерить popup) от "переключили окно"
+    (не триггерить, это не то событие, которое хотел увидеть пользователь).
+    При глобальной (не per-window) раскладке foreground_pid просто не влияет
+    на результат фильтра - разницы в поведении нет.
 
-    Возвращает короткое имя ('EN'/'RU'/...) или '??' если язык не опознан
-    по таблице выше, или None при ошибке доступа к API.
+    Возвращает dict: {"keyboard_layout": str|None, "foreground_pid": int|None}.
+    keyboard_layout - короткое имя ('EN'/'RU'/...) или '??' если язык не
+    опознан по таблице _PRIMARY_LANG_NAMES выше, или None при ошибке доступа
+    к API. foreground_pid - None при той же ошибке (оба поля всегда либо
+    заполнены, либо оба None - один и тот же try/except на весь вызов).
     """
     try:
         user32 = ctypes.windll.user32
         hwnd = user32.GetForegroundWindow()
-        thread_id = user32.GetWindowThreadProcessId(hwnd, None)
+        pid = ctypes.c_ulong()
+        thread_id = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         hkl = user32.GetKeyboardLayout(thread_id)
         lang_id = hkl & 0xFFFF
         primary_lang = lang_id & 0x3FF
-        return _PRIMARY_LANG_NAMES.get(primary_lang, "??")
+        layout = _PRIMARY_LANG_NAMES.get(primary_lang, "??")
+        return {"keyboard_layout": layout, "foreground_pid": pid.value}
     except Exception:
-        return None
+        return {"keyboard_layout": None, "foreground_pid": None}
+
+
+def get_keyboard_layout():
+    """
+    Обёртка над read_keyboard_state() ради обратной совместимости - старые
+    вызывающие места (см. самотест модуля ниже) ожидают просто строку.
+    НЕ используется главным циклом pc_hud.py - там нужен foreground_pid тоже,
+    см. read_keyboard_state() выше и его использование в metrics_main_loop.
+    """
+    return read_keyboard_state()["keyboard_layout"]
 
 
 # ---------------- самотест модуля (запуск напрямую: python metrics_windows.py) ----------------
@@ -823,6 +843,7 @@ if __name__ == "__main__":
     print("Disk I/O counters:", read_disk_io_counters())
     print("Net ifaces:", list_network_interfaces())
     print("Keyboard layout:", get_keyboard_layout())
+    print("Keyboard state (layout + foreground_pid):", read_keyboard_state())
 
     top_proc = TopProcessMonitor()
     print("Top process (1st call, ожидаемо 0.0 - см. докстринг класса):", top_proc.read())
