@@ -567,6 +567,11 @@ SENSORS_PAGE_HTML = """<!doctype html>
 <script>
 let editingBrightness = false, editingContrast = false, editingSelects = false;
 let selectsPopulated = false, pixelsBuilt = false, lastLedsCount = 0;
+// Интервал опроса /api/state - ДО первого успешного ответа используется
+// дефолт 500мс, дальше refresh() сам подстраивает его под cfg.tick_interval
+// (та же живая настройка "Частота опроса", что управляет главным циклом
+// в pc_hud.py) - см. refresh() ниже.
+let pollDelayMs = 500;
 
 const brightnessEl = document.getElementById("brightness");
 brightnessEl.addEventListener("input", () => {
@@ -672,13 +677,27 @@ function refresh() {
     }
 
     document.getElementById("oled").innerHTML = s.oled_lines.map(l => l || "&nbsp;").join("<br>");
+
+    // Подстраиваем частоту опроса ПРЕВЬЮ под cfg.tick_interval - ту же
+    // живую настройку (слайдер "Частота опроса" на /settings), что
+    // управляет частотой главного цикла (VU/лента/serial) в pc_hud.py.
+    // Без этого превью на / всегда опрашивалось бы фиксированным
+    // интервалом (раньше - 500мс), независимо от того, насколько быстро
+    // в реальности обновляются данные тиком - VU-метр выглядел заметно
+    // "тормознее", чем на самой ленте. Нижняя граница 20мс - та же, что и
+    // у /api/tick_interval (см. api_tick_interval() выше).
+    pollDelayMs = Math.max(20, Math.round((s.cfg.tick_interval || 0.04) * 1000));
+  }).catch(() => {
+    // сеть/сервер недоступны на этой итерации - не роняем цикл опроса,
+    // просто повторим на последнем известном pollDelayMs (см. finally ниже)
+  }).finally(() => {
+    setTimeout(refresh, pollDelayMs);
   });
 }
 
 if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(() => {}); }
 
-setInterval(refresh, 500);
-refresh();
+refresh();  // дальше сама себя перепланирует через setTimeout(pollDelayMs) - см. refresh() выше
 </script>
 </body></html>
 """

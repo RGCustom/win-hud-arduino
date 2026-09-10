@@ -416,6 +416,13 @@ class AudioController:
         self._volume_iface = None
         self._device_name = None
         self._meter_iface = None
+        # Имя устройства, НА КОТОРОЕ СЕЙЧАС УКАЗЫВАЕТ _meter_iface (если он
+        # создан) - см. read_state() ниже за тем, как это используется для
+        # обнаружения смены устройства вывода и сброса протухшего кэша
+        # meter-интерфейса (баг: VU-метр молча "умирал" после переключения
+        # устройства и "оживал" при возврате на исходное - см. подробное
+        # объяснение в докстринге read_vu() ниже про природу проблемы).
+        self._meter_device_name = None
         # "Отображаемые" (уже сглаженные затуханием) VU-уровни - состояние
         # между тиками, см. read_vu() ниже. Сразу в процентах (0-100) - так
         # удобнее отдавать напрямую в common_metrics ленты (pc_hud.py).
@@ -467,6 +474,27 @@ class AudioController:
             level = vol.GetMasterVolumeLevelScalar()  # 0.0 - 1.0
             muted = bool(vol.GetMute())
             device_name = self._read_device_name()
+
+            # Устройство вывода по умолчанию сменилось (переключили вручную
+            # в Windows, либо через switch_output_device() в будущем) -
+            # закэшированный _meter_iface (если он вообще был создан)
+            # указывает на СТАРЫЙ endpoint. Тот физически никуда не делся -
+            # он просто перестал быть default, поэтому COM-вызовы на него
+            # продолжают отрабатывать БЕЗ исключений, только пики на нём
+            # теперь всегда 0.0 (звук туда больше не льётся) - именно
+            # поэтому обычный путь реинициализации в read_vu() (там кэш
+            # сбрасывается только при реальном COMError/AttributeError/...)
+            # тут никогда не срабатывает сам по себе. Баг проявлялся как
+            # "VU молча умирает после смены устройства и оживает при
+            # возврате на исходное" - оживал он потому, что тот же самый
+            # старый (но по-прежнему валидный) meter-интерфейс снова
+            # оказывался на активном default-устройстве. read_state()
+            # вызывается раз в POLL_INTERVAL (см. metrics_main_loop в
+            # pc_hud.py) - этого достаточно, чтобы поймать смену раньше,
+            # чем пользователь успеет заметить залипший VU.
+            if device_name != self._meter_device_name:
+                self._meter_iface = None
+
             return {
                 "volume_pct": round(level * 100),
                 "volume_muted": "да" if muted else "нет",
@@ -517,6 +545,11 @@ class AudioController:
             device = AudioUtilities.GetSpeakers()
             iface = device._dev.Activate(_IAudioMeterInformationFull._iid_, CLSCTX_ALL, None)
             self._meter_iface = iface.QueryInterface(_IAudioMeterInformationFull)
+            # Запоминаем, ДЛЯ КАКОГО устройства создан этот meter-интерфейс -
+            # см. read_state() ниже: как только default-устройство сменится,
+            # это позволит явно сбросить кэш, а не полагаться на исключение,
+            # которого в этом сценарии не будет (см. докстринг read_vu()).
+            self._meter_device_name = getattr(device, "FriendlyName", None)
             return self._meter_iface
         except (COMError, OSError, AttributeError) as e:
             print(f"[audio] GetMeterInformation failed: {e}", flush=True)
