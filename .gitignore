@@ -1,0 +1,28 @@
+# --- PyInstaller (сборка в .exe, см. README "Сборка в .exe") ---
+build/
+dist/
+*.spec
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- виртуальное окружение (см. README "Установка") ---
+venv/
+.venv/
+
+# --- локальные настройки/логи, если вдруг запускались из репозитория, а не
+# из %APPDATA%\win-hud-arduino (обычно settings.json/screens.json там и
+# живут - см. CONFIG_DIR в pc_hud.py/screens.py - но на всякий случай) ---
+settings.json
+screens.json
+
+# --- временный .hex при загрузке через /flash (см. HEX_UPLOAD_PATH в
+# flash_webui.py - обычно пишется в %TEMP%, но на всякий случай) ---
+*.hex
+
+# --- IDE/редакторы ---
+.vscode/
+.idea/
+*.swp
