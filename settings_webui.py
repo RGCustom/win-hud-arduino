@@ -11,10 +11,19 @@ settings_webui.py  (win-hud-arduino)
 опрашиваются отдельным фоновым потоком (integrations_loop в pc_hud.py), не
 главным циклом.
 
+ПЕРЕЕХАЛО СЮДА С /  (см. обсуждение в чате): выбор COM-порта платы, дисков
+(disk1_letter/disk2_letter) и сетевых интерфейсов (net1_iface/net2_iface) -
+это настройки "один раз выбрал и забыл", их место рядом с остальным
+конфигом, а не на главном экране (/) с живыми показаниями ленты/OLED.
+Карточка "Подключение" ниже читает те же /api/serial_port, /api/disks,
+/api/net-ifaces эндпоинты в pc_hud.py, что и раньше использовала страница /
+- сам бэкенд не менялся.
+
 Как и в shkaf-hud, вся серверная логика/состояние - в pc_hud.py (эндпойнты
 /api/state, /api/mode, /api/assignment(_top), /api/colors(_top), /api/solid(_top),
-/api/peak, /api/leds_count, /api/encoder, /api/tautulli, /api/qbittorrent -
-этот файл только читает/пишет через них). Этот файл - чистая разметка + JS.
+/api/peak, /api/leds_count, /api/encoder, /api/tautulli, /api/qbittorrent,
+/api/serial_port, /api/disks, /api/net-ifaces - этот файл только читает/пишет
+через них). Этот файл - чистая разметка + JS.
 """
 
 from flask import Response
@@ -75,6 +84,29 @@ SETTINGS_PAGE_HTML = """<!doctype html>
 <div class="wrap">
   <div class="brand"><span class="dot"></span><h1>win-hud-arduino</h1></div>
   <div class="nav"><a href="/">Sensors</a><a href="/settings" class="active">Settings</a><a href="/screens">OLED screens</a><a href="/flash">Flash</a></div>
+
+  <!-- ---- Подключение (ПЕРЕЕХАЛО с Sensors, см. докстринг модуля выше) ---- -->
+  <div class="global-card">
+    <h2>Подключение</h2>
+    <div class="hint">COM-порт платы - список читается прямо с системы при загрузке страницы
+      (см. Диспетчер устройств -> Порты (COM и LPT), если плата не появилась в списке).</div>
+    <div class="row">
+      <label>COM-порт платы</label>
+      <select id="serial-port"></select>
+    </div>
+  </div>
+
+  <div class="global-card">
+    <h2>Диски (для экранов и метрики ленты)</h2>
+    <div class="row"><label>Диск 1</label><select id="disk1-letter"><option value="">(не выбран)</option></select></div>
+    <div class="row"><label>Диск 2</label><select id="disk2-letter"><option value="">(не выбран)</option></select></div>
+  </div>
+
+  <div class="global-card">
+    <h2>Сетевые интерфейсы (для экранов и метрики ленты "net")</h2>
+    <div class="row"><label>Network 1</label><select id="net1-iface"></select></div>
+    <div class="row"><label>Network 2</label><select id="net2-iface"><option value="">(не выбран)</option></select></div>
+  </div>
 
   <!-- ---- Лента: число диодов (настройка, не константа - см. ledbar.py) ---- -->
   <div class="global-card">
@@ -284,6 +316,54 @@ let editingLayoutHold = false, editingDeviceHold = false, editingOsdCooldown = f
 let editingPriorityPersonal = false, editingPriorityAmbient = false;
 let layoutColorsBuilt = false;
 
+// ---- Подключение / диски / сеть (ПЕРЕЕХАЛО с Sensors, см. докстринг модуля) ----
+// Заполняется ОДИН РАЗ на загрузку страницы (см. render() ниже) - в отличие
+// от живой ленты/OLED на Sensors, эти списки (порты/диски/интерфейсы)
+// меняются редко, отдельный поллинг тут не нужен.
+let selectsPopulated = false;
+
+function fillSelect(sel, options, current, allowEmpty) {
+  sel.innerHTML = allowEmpty ? '<option value="">(не выбран)</option>' : "";
+  options.forEach(name => {
+    const o = document.createElement("option");
+    o.value = name; o.textContent = name;
+    if (name === current) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+function populateConnectionSelects(s) {
+  fillSelect(document.getElementById("serial-port"), s.available_ports, s.cfg.serial_port, false);
+  fillSelect(document.getElementById("disk1-letter"), s.available_disks, s.cfg.disk1_letter, true);
+  fillSelect(document.getElementById("disk2-letter"), s.available_disks, s.cfg.disk2_letter, true);
+  fillSelect(document.getElementById("net1-iface"), s.available_interfaces, s.cfg.net1_iface, false);
+  fillSelect(document.getElementById("net2-iface"), s.available_interfaces, s.cfg.net2_iface, true);
+  selectsPopulated = true;
+
+  document.getElementById("serial-port").addEventListener("change", e => {
+    fetch("/api/serial_port", { method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ value: e.target.value }) });
+  });
+  ["disk1-letter", "disk2-letter"].forEach(id => {
+    document.getElementById(id).addEventListener("change", () => {
+      fetch("/api/disks", { method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({
+          disk1_letter: document.getElementById("disk1-letter").value,
+          disk2_letter: document.getElementById("disk2-letter").value,
+        }) });
+    });
+  });
+  ["net1-iface", "net2-iface"].forEach(id => {
+    document.getElementById(id).addEventListener("change", () => {
+      fetch("/api/net-ifaces", { method: "POST", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({
+          net1_iface: document.getElementById("net1-iface").value,
+          net2_iface: document.getElementById("net2-iface").value,
+        }) });
+    });
+  });
+}
+
 function debounceSave(el, flagSetter, sendFn) {
   el.addEventListener("input", () => flagSetter(true));
   el.addEventListener("change", () => { sendFn(); flagSetter(false); });
@@ -393,7 +473,7 @@ osdCooldownEl.addEventListener("change", () => {
 // "_default" - fallback-цвет для языков без отдельной настройки. Строится
 // ОДИН РАЗ (layoutColorsBuilt) - создание/пересоздание input[type=color]
 // на каждый refresh() сбрасывало бы фокус/незакоммиченный выбор пользователя,
-// тот же принцип, что и populateSelects()/selectsPopulated на странице /.
+// тот же принцип, что и populateConnectionSelects()/selectsPopulated выше.
 const KNOWN_LAYOUT_CODES = ["_default", "EN", "RU"];
 function buildLayoutColorsRows(colors) {
   const wrap = document.getElementById("layout-colors-rows");
@@ -675,6 +755,8 @@ function renderBar(cfg) {
 
 function render(state) {
   metricsMap = state.metrics;
+
+  if (!selectsPopulated) populateConnectionSelects(state);
 
   if (!editingLedsCount) ledsCountEl.value = state.cfg.leds_count;
   ledsReverseEl.checked = !!state.cfg.leds_reverse;

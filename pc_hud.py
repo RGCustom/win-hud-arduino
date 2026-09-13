@@ -29,17 +29,48 @@ pc_hud.py  (win-hud-arduino)
      metrics_windows.py) - только тут причина не баг, а сама природа
      сетевого вызова.
 
+  4. Лог serial-обмена (см. _log_serial()/api_serial_log() ниже) -
+     кольцевой буфер в памяти процесса, куда пишется КАЖДАЯ строка,
+     реально ушедшая на плату (tx) или пришедшая от платы (rx). Питает
+     терминал "СЕРИЙНЫЙ ПОРТ" на странице / (см. SENSORS_PAGE_HTML) - это
+     тот же самый serial-обмен, что и BAR:/L1-3:/ENC:/BTN:, просто с
+     человекочитаемым логом поверх.
+
+  5. Лог программы (см. _log_app()/_StdoutTee/api_app_log() ниже) - ВТОРОЙ,
+     независимый кольцевой буфер - подключение/отключение платы, ошибки
+     чтения звука/GPU/сети и т.п., т.е. всё, что и так печатается через
+     print(..., flush=True) по всему проекту (metrics_windows.py, flash.py,
+     сам pc_hud.py). Вместо переписывания каждого print() на вызов отдельной
+     функции логирования - перехватывается сам sys.stdout ОДИН РАЗ (см.
+     _StdoutTee) - консоль (если она есть, без --windowed) по-прежнему
+     получает все строки как раньше, а КАЖДАЯ завершённая строка
+     ДОПОЛНИТЕЛЬНО оседает в _app_log. Питает терминал "ЛОГ ПРОГРАММЫ" на /
+     - независимый от serial-лога, свой ring buffer, свой набор чекбоксов.
+
+     Werkzeug (встроенный HTTP-сервер Flask) по умолчанию логирует КАЖДЫЙ
+     запрос строкой вида '127.0.0.1 - - [...] "GET /api/state ..." 200 -'
+     через свой logging-логгер "werkzeug" (НЕ через print()) - раз /api/state
+     и /api/app_log сами опрашиваются раз в доли секунды с фронтенда (см.
+     refresh()/pollAppLog() в SENSORS_PAGE_HTML), эти строки моментально
+     заваливают лог программы бесполезным шумом. Раз это идёт через
+     logging, а не print(), _StdoutTee их в принципе не видит - тем не
+     менее уровень логгера "werkzeug" явно поднят до ERROR в run_web() ниже,
+     чтобы Flask вообще не форматировал и не печатал такие строки (дешевле,
+     чем текстовый фильтр по паттерну "GET ... HTTP/1.1").
+
 Зависимости (requirements.txt):
     pyserial, flask, psutil, pynvml, pycaw, comtypes, pywin32, pystray, pillow
 """
 
 import copy
 import json
+import logging
 import os
 import sys
 import threading
 import time
 import webbrowser
+from collections import deque
 
 import serial
 from flask import Flask, request, jsonify, Response, send_file
@@ -58,7 +89,7 @@ import metrics_qbittorrent
 import flash
 import flash_webui
 
-SCRIPT_VERSION = "2026-09-05-1"
+SCRIPT_VERSION = "2026-09-13-2"
 
 CONTAINER_START_TIME = time.time()
 
@@ -132,9 +163,9 @@ DEFAULT_ENCODER = {
     "volume_colors": {"c1": "00FF42", "c2": "FFF600", "c3": "FF0000"},
 }
 
-# ---- OSD-очередь (НОВОЕ) - см. osd.py/класс OsdManager и обсуждение в чате
-# про унификацию: раскладка клавиатуры и смена аудио-устройства теперь тоже
-# popup'ы через ТУ ЖЕ очередь, что и громкость (DEFAULT_ENCODER.osd_hold_seconds
+# ---- OSD-очередь (см. osd.py/класс OsdManager и обсуждение в чате про
+# унификацию: раскладка клавиатуры и смена аудио-устройства тоже popup'ы
+# через ТУ ЖЕ очередь, что и громкость (DEFAULT_ENCODER.osd_hold_seconds
 # выше - её длительность не трогаем, у каждого типа своя). Приоритет
 # прерывания зашит в OSD_TYPES (см. osd.py), тут только тайминги/цвета -
 # живые настройки, редактируются в /settings.
@@ -154,7 +185,7 @@ DEFAULT_LAYOUT_COLORS = {
     "EN": "1E90FF", "RU": "FF4500", "UA": "FFD700", "_default": "808080",
 }
 
-# ---- Приоритетная ротация экранов (НОВОЕ) - см. screens.RotationState.
+# ---- Приоритетная ротация экранов - см. screens.RotationState.
 # "Каждый N-й слот" для personal/ambient дорожек - см. докстринг screens.py
 # за полным описанием алгоритма (round-robin внутри дорожки + форс-прерывание
 # только у personal). Живые настройки в /settings, а не константы - т.к.
@@ -250,7 +281,7 @@ DEFAULT_SETTINGS = {
     "priority_boost_ambient": DEFAULT_PRIORITY_BOOST_AMBIENT,
     # Tautulli (Plex) - адрес/ключ подключения, тот же принцип, что и
     # serial_port/net1_iface выше - живая настройка в /settings, а не
-    # переменная окружения. my_plex_user - НОВОЕ: если заполнено и совпадает
+    # переменная окружения. my_plex_user - если заполнено и совпадает
     # со stream_user активного сеанса (Tautulli отдаёт friendly_name) - этот
     # сеанс считается tier="personal" (тот же человек смотрит на этом же ПК),
     # а не "ambient" - см. обсуждение в чате про "чужой/свой Plex-сеанс".
@@ -341,7 +372,7 @@ _integrations_state = {
     "streams": [], "recent": [],
     "qbt_total_dl": "0 B/s", "qbt_total_ul": "0 B/s", "qbt_ratio": 0.0, "qbt_free_space_gb": "?",
     "qbt_count_all": 0, "torrents": [],
-    # top_process_* - НОВОЕ: топ-процесс по CPU переехал сюда из главного
+    # top_process_* - топ-процесс по CPU переехал сюда из главного
     # цикла (metrics_main_loop) в integrations_loop, см. комментарий там же -
     # psutil.Process.cpu_percent()/memory_percent()/name() на КАЖДЫЙ процесс
     # в системе на Windows оказался достаточно тяжёлым, чтобы раз в секунду
@@ -350,6 +381,123 @@ _integrations_state = {
     # независимо от значения слайдера в /settings.
     "top_process_name": None, "top_process_cpu_pct": 0.0, "top_process_ram_pct": 0.0,
 }
+
+# ---------------- лог serial-обмена (для терминала на /) ----------------
+# Кольцевой буфер последних строк - живёт ТОЛЬКО в памяти процесса (как и
+# остальной module-level state), не сохраняется на диск. Пишутся сюда РЕАЛЬНО
+# отправленные/полученные serial-строки (см. metrics_main_loop ниже - хуки в
+# точке чтения входящих строк и в точке ser.write()) - это та же самая
+# информация, что видна в протоколе (BAR:/BRI:/CON:/L1-3:/ENC:/BTN:), просто
+# с человекочитаемым временем и направлением поверх, для отладки на живом
+# железе без отдельного serial-монитора.
+_SERIAL_LOG_MAXLEN = 500
+_SERIAL_LOG_TEXT_LIMIT = 300  # BAR: с большим leds_count может быть длинной -
+                               # обрезаем для читаемости терминала, это лог
+                               # для человека, не протокольный дамп
+
+_serial_log_lock = threading.Lock()
+_serial_log = deque(maxlen=_SERIAL_LOG_MAXLEN)
+_serial_log_seq = 0  # монотонно растущий id - НЕ len(deque) (deque сам роняет
+                      # старые записи при переполнении maxlen) - нужен, чтобы
+                      # фронтенд мог опрашивать инкрементально (?after=<id>),
+                      # не перекачивая весь буфер на каждый тик.
+
+
+def _log_serial(direction, text):
+    """direction: 'rx' (пришло от платы) | 'tx' (отправлено на плату)."""
+    global _serial_log_seq
+    if len(text) > _SERIAL_LOG_TEXT_LIMIT:
+        text = text[:_SERIAL_LOG_TEXT_LIMIT] + "…"
+    with _serial_log_lock:
+        _serial_log_seq += 1
+        _serial_log.append({"id": _serial_log_seq, "ts": time.time(), "dir": direction, "text": text})
+
+
+# ---------------- лог программы (для терминала "Лог программы" на /) ----------------
+# ВТОРОЙ, независимый от serial-лога кольцевой буфер - подключение/отключение
+# платы, ошибки чтения звука/GPU/сети, старт/стоп потоков и т.п. Всё это и
+# так уже печатается через print(..., flush=True) по всему проекту
+# (metrics_windows.py/flash.py/сам pc_hud.py) - вместо переписывания каждого
+# такого print() на отдельный вызов логгера, перехватывается сам sys.stdout
+# ОДИН РАЗ (см. _StdoutTee ниже, устанавливается в main()) - реальная
+# консоль (если она есть, т.е. без --windowed при сборке PyInstaller) по-
+# прежнему получает все строки как раньше, а КАЖДАЯ завершённая строка
+# ДОПОЛНИТЕЛЬНО оседает сюда.
+_APP_LOG_MAXLEN = 500
+_APP_LOG_TEXT_LIMIT = 500
+
+
+def _log_app(text):
+    """Одна ЗАВЕРШЁННАЯ строка (без '\\n') лога программы - см. _StdoutTee
+    ниже за тем, откуда она берётся. Пустые строки (например от print() без
+    аргументов) не логируются - не несут информации, только шумят терминал."""
+    global _app_log_seq
+    text = text.rstrip("\r")
+    if not text:
+        return
+    if len(text) > _APP_LOG_TEXT_LIMIT:
+        text = text[:_APP_LOG_TEXT_LIMIT] + "…"
+    with _app_log_lock:
+        _app_log_seq += 1
+        _app_log.append({"id": _app_log_seq, "ts": time.time(), "text": text})
+
+
+_app_log_lock = threading.Lock()
+_app_log = deque(maxlen=_APP_LOG_MAXLEN)
+_app_log_seq = 0
+
+
+class _StdoutTee:
+    """Перехватывает sys.stdout/sys.stderr построчно - каждая строка
+    одновременно (а) пишется в РЕАЛЬНЫЙ поток (если он есть - без него, при
+    сборке --windowed, это просто no-op, см. write() ниже) И (б) попадает в
+    _app_log (см. _log_app() выше). Буферизует до символа '\\n', т.к.
+    print() может вызвать write() несколькими кусками (сам текст, потом
+    отдельно перевод строки) - логировать нужно только ПОЛНЫЕ строки, не
+    произвольные фрагменты записи.
+
+    Устанавливается ОДИН РАЗ в main() (см. sys.stdout = _StdoutTee(...)) -
+    благодаря этому НИ ОДИН print(..., flush=True) по всему проекту не
+    нужно переписывать на отдельный вызов логгера: они и так уже есть везде,
+    где важно видеть событие (подключение/отключение serial, ошибки
+    аудио/GPU/сети - см. metrics_windows.py/flash.py/сам этот файл).
+
+    ВАЖНО: это ловит только print()/sys.stdout.write() - НЕ логи через
+    модуль logging (например Werkzeug пишет свой access-лог именно через
+    logging, а не print()) - см. run_web() ниже, где уровень логгера
+    "werkzeug" явно поднят до ERROR, чтобы такие строки вообще не
+    генерировались (а не фильтровались тут постфактум)."""
+
+    def __init__(self, original):
+        self._original = original
+        self._buf = ""
+        self._lock = threading.Lock()
+
+    def write(self, text):
+        if self._original is not None:
+            try:
+                self._original.write(text)
+            except Exception:
+                pass
+        with self._lock:
+            self._buf += text
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                _log_app(line)
+        return len(text)
+
+    def flush(self):
+        if self._original is not None:
+            try:
+                self._original.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        try:
+            return bool(self._original and self._original.isatty())
+        except Exception:
+            return False
 
 
 def get_context():
@@ -438,9 +586,10 @@ def try_open_serial(port):
             state["serial_connected"] = True
         print(f"[serial] connected: {port}", flush=True)
         return s
-    except (serial.SerialException, OSError):
+    except (serial.SerialException, OSError) as e:
         with state_lock:
             state["serial_connected"] = False
+        print(f"[serial] connect to {port} failed: {e}", flush=True)
         return None
 
 
@@ -494,6 +643,18 @@ SENSORS_PAGE_HTML = """<!doctype html>
   .card { background:var(--panel); border:1px solid var(--border); border-radius:14px;
           padding:22px; margin-bottom:18px; }
   .card h2 { font-size:11px; color:var(--muted); margin:0 0 18px; font-weight:600; }
+  .card h2 .log-controls { float:right; display:flex; align-items:center; gap:12px; font-weight:400; }
+  .card h2 .log-controls label { font-size:11px; color:var(--muted); display:flex; align-items:center;
+                                  gap:5px; cursor:pointer; }
+  .card h2 .log-controls input[type=checkbox] { width:13px; height:13px; }
+  .card h2 .log-controls button { background:none; border:1px solid var(--border); color:var(--muted);
+                                   border-radius:5px; padding:2px 8px; font-size:11px; cursor:pointer; }
+  .card h2 .log-controls button:hover { color:var(--text); border-color:var(--accent); }
+
+  .log-box { background:#000; color:#9fd3a0; font-family:monospace; font-size:11px; line-height:1.5;
+             padding:12px; border-radius:8px; height:220px; overflow-y:auto; white-space:pre-wrap;
+             word-break:break-all; transition:opacity .15s; }
+  .log-box.log-disabled { opacity:0.35; }
 
   .strip-track { width:100%; height:36px; background:#101112; border-radius:6px;
                  display:flex; flex-direction:row; overflow:hidden; border:1px solid var(--border);
@@ -509,9 +670,6 @@ SENSORS_PAGE_HTML = """<!doctype html>
   .brightness-row label, .field-row label { color:var(--muted); min-width:110px; }
   .brightness-row input[type=range] { flex:1; }
   .brightness-row .val { min-width:36px; text-align:right; color:var(--text); }
-
-  select.iface { background:#101112; color:var(--text); border:1px solid var(--border);
-                  border-radius:6px; font-size:12px; padding:5px 6px; width:100%; }
 
   footer { text-align:center; color:var(--border); font-size:11px; margin-top:20px; }
 </style></head>
@@ -545,28 +703,34 @@ SENSORS_PAGE_HTML = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>ПОДКЛЮЧЕНИЕ</h2>
-    <div class="field-row"><label>COM-порт платы</label><select class="iface" id="serial-port"></select></div>
+    <h2>СЕРИЙНЫЙ ПОРТ (лог)
+      <span class="log-controls">
+        <label><input type="checkbox" id="terminal-enabled" checked> включено</label>
+        <label><input type="checkbox" id="terminal-hide-bar"> скрыть BAR:</label>
+        <label><input type="checkbox" id="terminal-autoscroll" checked> автопрокрутка</label>
+        <button id="terminal-clear">Очистить</button>
+      </span>
+    </h2>
+    <div class="log-box" id="serial-terminal"></div>
   </div>
 
   <div class="card">
-    <h2>ДИСКИ (для экранов и метрики ленты)</h2>
-    <div class="field-row"><label>Диск 1</label><select class="iface" id="disk1-letter"><option value="">(не выбран)</option></select></div>
-    <div class="field-row"><label>Диск 2</label><select class="iface" id="disk2-letter"><option value="">(не выбран)</option></select></div>
-  </div>
-
-  <div class="card">
-    <h2>СЕТЕВЫЕ ИНТЕРФЕЙСЫ (для экранов и метрики ленты "net")</h2>
-    <div class="field-row"><label>Network 1</label><select class="iface" id="net1-iface"></select></div>
-    <div class="field-row"><label>Network 2</label><select class="iface" id="net2-iface"><option value="">(не выбран)</option></select></div>
+    <h2>ЛОГ ПРОГРАММЫ
+      <span class="log-controls">
+        <label><input type="checkbox" id="applog-enabled" checked> включено</label>
+        <label><input type="checkbox" id="applog-autoscroll" checked> автопрокрутка</label>
+        <button id="applog-clear">Очистить</button>
+      </span>
+    </h2>
+    <div class="log-box" id="app-terminal"></div>
   </div>
 
   <footer>win-hud-arduino</footer>
 </div>
 
 <script>
-let editingBrightness = false, editingContrast = false, editingSelects = false;
-let selectsPopulated = false, pixelsBuilt = false, lastLedsCount = 0;
+let editingBrightness = false, editingContrast = false;
+let pixelsBuilt = false, lastLedsCount = 0;
 // Интервал опроса /api/state - ДО первого успешного ответа используется
 // дефолт 500мс, дальше refresh() сам подстраивает его под cfg.tick_interval
 // (та же живая настройка "Частота опроса", что управляет главным циклом
@@ -593,48 +757,6 @@ contrastEl.addEventListener("change", () => {
     body: JSON.stringify({ value: parseInt(contrastEl.value) }) }).then(() => editingContrast = false);
 });
 
-function fillSelect(sel, options, current, allowEmpty) {
-  sel.innerHTML = allowEmpty ? '<option value="">(не выбран)</option>' : "";
-  options.forEach(name => {
-    const o = document.createElement("option");
-    o.value = name; o.textContent = name;
-    if (name === current) o.selected = true;
-    sel.appendChild(o);
-  });
-}
-
-function populateSelects(s) {
-  fillSelect(document.getElementById("serial-port"), s.available_ports, s.cfg.serial_port, false);
-  fillSelect(document.getElementById("disk1-letter"), s.available_disks, s.cfg.disk1_letter, true);
-  fillSelect(document.getElementById("disk2-letter"), s.available_disks, s.cfg.disk2_letter, true);
-  fillSelect(document.getElementById("net1-iface"), s.available_interfaces, s.cfg.net1_iface, false);
-  fillSelect(document.getElementById("net2-iface"), s.available_interfaces, s.cfg.net2_iface, true);
-  selectsPopulated = true;
-
-  document.getElementById("serial-port").addEventListener("change", e => {
-    fetch("/api/serial_port", { method: "POST", headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ value: e.target.value }) });
-  });
-  ["disk1-letter", "disk2-letter"].forEach(id => {
-    document.getElementById(id).addEventListener("change", () => {
-      fetch("/api/disks", { method: "POST", headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({
-          disk1_letter: document.getElementById("disk1-letter").value,
-          disk2_letter: document.getElementById("disk2-letter").value,
-        }) });
-    });
-  });
-  ["net1-iface", "net2-iface"].forEach(id => {
-    document.getElementById(id).addEventListener("change", () => {
-      fetch("/api/net-ifaces", { method: "POST", headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({
-          net1_iface: document.getElementById("net1-iface").value,
-          net2_iface: document.getElementById("net2-iface").value,
-        }) });
-    });
-  });
-}
-
 function buildPixelGrid(ledsCount) {
   const track = document.getElementById("pixels-strip");
   track.innerHTML = "";
@@ -651,7 +773,6 @@ function buildPixelGrid(ledsCount) {
 function refresh() {
   fetch("/api/state").then(r => r.json()).then(s => {
     document.getElementById("banner").classList.toggle("show", !s.serial_connected);
-    if (!selectsPopulated) populateSelects(s);
     if (!pixelsBuilt || lastLedsCount !== s.leds_count) buildPixelGrid(s.leds_count);
 
     const bar = s.bar;
@@ -695,6 +816,118 @@ function refresh() {
   });
 }
 
+// ---- Общий хелпер для обоих терминалов: свитч "включено" не только
+// скрывает панель визуально (opacity через .log-disabled), но и реально
+// останавливает поллинг (see pollFn ниже - каждый вызов сам проверяет
+// enabledEl.checked и просто не шлёт запрос, если выключено) - т.е. "не
+// собирать данные, пока выключено" в смысле "не тратить сеть/CPU на клиенте",
+// а не в смысле остановки самого backend-буфера (тот продолжает копить
+// строки в фоне - это дёшево, ring buffer ограничен по размеру).
+function wireLogToggle(enabledEl, boxEl) {
+  const apply = () => boxEl.classList.toggle("log-disabled", !enabledEl.checked);
+  enabledEl.addEventListener("change", apply);
+  apply();
+}
+
+// ---- Терминал serial-обмена (см. _log_serial()/api_serial_log() в pc_hud.py) ----
+let serialLogAfter = 0;
+const terminalEl = document.getElementById("serial-terminal");
+const terminalEnabledEl = document.getElementById("terminal-enabled");
+const autoscrollEl = document.getElementById("terminal-autoscroll");
+const hideBarEl = document.getElementById("terminal-hide-bar");
+const clearBtnEl = document.getElementById("terminal-clear");
+wireLogToggle(terminalEnabledEl, terminalEl);
+
+// "Скрыть BAR:" - протокол пайп-разделённый (см. protocol.ProtocolState.build()/
+// L1-3:.ino) - BAR: это ОДНО поле среди прочих в строке, поэтому фильтруем
+// по частям после split("|"), а не всю строку целиком: полный ресинк
+// (FULL_RESYNC_SECONDS) шлёт BRI/CON/L1-3 В ТОЙ ЖЕ строке, что и BAR - грубое
+// "скрыть строки с BAR" спрятало бы и их. Если после фильтра в строке ничего
+// не осталось (был чистый BAR-тик без остальных полей) - строка не рисуется
+// вовсе, а не показывается пустой. Применяется только к НОВЫМ записям -
+// переключение чекбокса не переразбирает уже отрисованные строки (буфер DOM
+// не хранит исходный e.text) - осознанное упрощение, не стоит усложнять ради
+// ретроактивной перефильтровки чисто отладочного лога.
+function formatSerialEntry(e) {
+  if (!hideBarEl.checked) return e.text;
+  const parts = e.text.split("|").filter(p => !p.startsWith("BAR:"));
+  return parts.length ? parts.join("|") : null;
+}
+
+function pollSerialLog() {
+  if (!terminalEnabledEl.checked) return;
+  fetch("/api/serial_log?after=" + serialLogAfter).then(r => r.json()).then(data => {
+    if (!data.entries.length) return;
+    data.entries.forEach(e => {
+      serialLogAfter = e.id;  // курсор двигаем ВСЕГДА, даже если строка отфильтрована -
+                                // иначе скрытые BAR-тики запрашивались бы повторно на
+                                // каждый следующий poll
+      const text = formatSerialEntry(e);
+      if (text === null) return;
+      const row = document.createElement("div");
+      const t = new Date(e.ts * 1000).toLocaleTimeString();
+      row.style.color = e.dir === "tx" ? "#7fd8ff" : "#9fd3a0";
+      row.textContent = "[" + t + "] " + (e.dir === "tx" ? "\u2192 " : "\u2190 ") + text;
+      terminalEl.appendChild(row);
+    });
+    while (terminalEl.childNodes.length > 500) terminalEl.removeChild(terminalEl.firstChild);
+    if (autoscrollEl.checked) terminalEl.scrollTop = terminalEl.scrollHeight;
+  }).catch(() => {});
+}
+
+clearBtnEl.addEventListener("click", () => {
+  fetch("/api/serial_log/clear", { method: "POST" }).then(() => {
+    terminalEl.innerHTML = "";
+  });
+});
+
+setInterval(pollSerialLog, 500);
+pollSerialLog();
+
+// ---- Терминал лога программы (см. _log_app()/_StdoutTee/api_app_log() в
+// pc_hud.py) - независимый от serial-терминала: свой курсор, свой чекбокс
+// "включено"/"автопрокрутка", своя кнопка "Очистить". Строки, похожие на
+// сообщение об ошибке, подсвечиваются - тот же прицип "человекочитаемый
+// лог", что и у serial-терминала (там - направление tx/rx цветом).
+let appLogAfter = 0;
+const appTerminalEl = document.getElementById("app-terminal");
+const appLogEnabledEl = document.getElementById("applog-enabled");
+const appLogAutoscrollEl = document.getElementById("applog-autoscroll");
+const appLogClearBtnEl = document.getElementById("applog-clear");
+wireLogToggle(appLogEnabledEl, appTerminalEl);
+
+const APP_LOG_ERROR_HINTS = ["ошиб", "failed", "error", "traceback", "exception"];
+function isErrorLine(text) {
+  const lower = text.toLowerCase();
+  return APP_LOG_ERROR_HINTS.some(h => lower.includes(h));
+}
+
+function pollAppLog() {
+  if (!appLogEnabledEl.checked) return;
+  fetch("/api/app_log?after=" + appLogAfter).then(r => r.json()).then(data => {
+    if (!data.entries.length) return;
+    data.entries.forEach(e => {
+      appLogAfter = e.id;
+      const row = document.createElement("div");
+      const t = new Date(e.ts * 1000).toLocaleTimeString();
+      row.style.color = isErrorLine(e.text) ? "#ffb3ab" : "#9fd3a0";
+      row.textContent = "[" + t + "] " + e.text;
+      appTerminalEl.appendChild(row);
+    });
+    while (appTerminalEl.childNodes.length > 500) appTerminalEl.removeChild(appTerminalEl.firstChild);
+    if (appLogAutoscrollEl.checked) appTerminalEl.scrollTop = appTerminalEl.scrollHeight;
+  }).catch(() => {});
+}
+
+appLogClearBtnEl.addEventListener("click", () => {
+  fetch("/api/app_log/clear", { method: "POST" }).then(() => {
+    appTerminalEl.innerHTML = "";
+  });
+});
+
+setInterval(pollAppLog, 500);
+pollAppLog();
+
 if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(() => {}); }
 
 refresh();  // дальше сама себя перепланирует через setTimeout(pollDelayMs) - см. refresh() выше
@@ -730,6 +963,46 @@ def api_state():
         out["available_ports"] = sorted(flash.list_com_ports())
         out["leds_count"] = state["cfg"]["leds_count"]
         return jsonify(out)
+
+
+@app.route("/api/serial_log")
+def api_serial_log():
+    """Последние строки serial-обмена для терминала на / - ?after=<id>
+    отдаёт только записи новее указанного id (инкрементальный опрос с
+    фронтенда без перекачки всего буфера каждый раз)."""
+    after = request.args.get("after", type=int, default=0)
+    with _serial_log_lock:
+        entries = [e for e in _serial_log if e["id"] > after]
+    return jsonify({"entries": entries})
+
+
+@app.route("/api/serial_log/clear", methods=["POST"])
+def api_serial_log_clear():
+    """Очистить буфер серийного лога (кнопка "Очистить" в терминале на /) -
+    _serial_log_seq НЕ сбрасывается (id продолжают расти монотонно) - только
+    сам deque пустеет, чтобы не плодить коллизии id, если фронтенд как-то
+    закэшировал старый serialLogAfter."""
+    with _serial_log_lock:
+        _serial_log.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/app_log")
+def api_app_log():
+    """Последние строки лога программы (см. _log_app()/_StdoutTee выше) -
+    тот же паттерн инкрементального опроса, что и /api/serial_log."""
+    after = request.args.get("after", type=int, default=0)
+    with _app_log_lock:
+        entries = [e for e in _app_log if e["id"] > after]
+    return jsonify({"entries": entries})
+
+
+@app.route("/api/app_log/clear", methods=["POST"])
+def api_app_log_clear():
+    """Очистить буфер лога программы - независим от /api/serial_log/clear."""
+    with _app_log_lock:
+        _app_log.clear()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/colors", methods=["POST"])
@@ -940,8 +1213,8 @@ def api_tautulli():
     cfg подхватится этим потоком на его следующем тике
     (INTEGRATIONS_POLL_INTERVAL, по умолчанию 5с).
 
-    my_plex_user - НОВОЕ (та же карточка на /settings, см. обсуждение в чате
-    про "свой/чужой Plex-сеанс") - сравнивается со stream_user активного
+    my_plex_user - та же карточка на /settings, см. обсуждение в чате
+    про "свой/чужой Plex-сеанс" - сравнивается со stream_user активного
     сеанса построчно в screens.build_active_screens() при вычислении tier
     конкретной копии repeating-экрана "stream" - см. там же за подробностями
     point-override. Пусто (дефолт) - ВСЕ сеансы считаются ambient."""
@@ -1052,6 +1325,16 @@ flash_webui.register_flash_routes(
 
 
 def run_web():
+    # Werkzeug (встроенный dev-сервер Flask) по умолчанию пишет access-лог
+    # НА КАЖДЫЙ HTTP-запрос через logging-логгер "werkzeug" (не через
+    # print()) - т.к. фронтенд сам опрашивает /api/state и /api/app_log
+    # каждые доли секунды (см. refresh()/pollAppLog() в SENSORS_PAGE_HTML),
+    # это заваливает "Лог программы" бесполезным шумом вида
+    # '127.0.0.1 - - [...] "GET /api/state HTTP/1.1" 200 -'. Поднимаем
+    # уровень логгера до ERROR - строки такого уровня не генерируются
+    # вовсе, что дешевле и надёжнее, чем текстовый фильтр по паттерну после
+    # того, как строка уже сформирована.
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
     app.run(host="127.0.0.1", port=WEB_PORT, use_reloader=False)
 
 
@@ -1163,6 +1446,14 @@ def metrics_main_loop(stop_event):
                     read_buffer += ser.read(waiting).decode("utf-8", errors="ignore")
                     while "\n" in read_buffer:
                         line, read_buffer = read_buffer.split("\n", 1)
+                        line_stripped = line.strip()
+                        if line_stripped:
+                            # Лог serial-обмена для терминала на / - см.
+                            # _log_serial() выше. Пишем ЛЮБУЮ непустую строку
+                            # от платы, даже если parse_incoming_line() ниже
+                            # её не разберёт (serial-мусор на подключении -
+                            # это тоже полезно видеть в терминале при отладке).
+                            _log_serial("rx", line_stripped)
                         event = protocol.parse_incoming_line(line)
                         if event is None:
                             continue
@@ -1182,8 +1473,8 @@ def metrics_main_loop(stop_event):
                             {"volume_pct": audio_state["volume_pct"], "muted": audio_state["volume_muted"] == "да"},
                             now, cfg,
                         )
-            except (serial.SerialException, OSError):
-                print("[serial] read failed, will reconnect", flush=True)
+            except (serial.SerialException, OSError) as e:
+                print(f"[serial] read failed, will reconnect: {e}", flush=True)
                 try:
                     ser.close()
                 except Exception:
@@ -1532,8 +1823,9 @@ def metrics_main_loop(stop_event):
         if ser is not None and not flashing_event.is_set() and line_to_send is not None:
             try:
                 ser.write((line_to_send + "\n").encode("utf-8"))
-            except (serial.SerialException, OSError):
-                print("[serial] write failed, will reconnect", flush=True)
+                _log_serial("tx", line_to_send)
+            except (serial.SerialException, OSError) as e:
+                print(f"[serial] write failed, will reconnect: {e}", flush=True)
                 try:
                     ser.close()
                 except Exception:
@@ -1653,6 +1945,17 @@ def build_tray_icon(stop_event):
 
 
 def main():
+    # Перехват stdout/stderr ДО первых print() - см. _StdoutTee/_log_app()
+    # выше: это единственное место, где устанавливается тея, дальше ЛЮБОЙ
+    # print(...) по всему проекту (в этом файле и в остальных модулях)
+    # автоматически питает терминал "Лог программы" на /, без единой правки
+    # в самих модулях. Оригинальный sys.stdout может быть None при сборке
+    # --windowed без консоли - _StdoutTee.write()/flush() на этот случай
+    # просто проглатывают ошибку записи в оригинал и продолжают логировать
+    # в буфер.
+    sys.stdout = _StdoutTee(sys.stdout)
+    sys.stderr = _StdoutTee(sys.stderr)
+
     print(f"[win-hud-arduino] starting, version {SCRIPT_VERSION}", flush=True)
     _ensure_assets()
 
