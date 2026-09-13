@@ -512,6 +512,18 @@ def get_integrations_state():
 
 # ---------------- форматтеры (аналог shkaf-hud) ----------------
 
+# Короткие русские имена дней недели по tm_wday (0=Пн..6=Вс) - НЕ через
+# time.strftime("%a"), т.к. это зависит от локали ОС (на англоязычной
+# Windows дало бы "Mon"/"Tue"/... независимо от языка интерфейса) - тут же
+# нужен предсказуемый результат независимо от локали хоста, как и у
+# keyboard_layout в metrics_windows.py (своя таблица, а не системный API).
+_WEEKDAY_NAMES_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+
+def format_weekday_name():
+    return _WEEKDAY_NAMES_RU[time.localtime().tm_wday]
+
+
 def format_duration(seconds):
     seconds = max(0, int(seconds))
     days, rem = divmod(seconds, 86400)
@@ -1617,6 +1629,9 @@ def metrics_main_loop(stop_event):
                 "uptime": format_duration(time.time() - _boot_time()),
                 "container_uptime": format_duration(now - CONTAINER_START_TIME),
                 "time_now": time.strftime("%H:%M"),
+                "weekday_name": format_weekday_name(),
+                "date_now": time.strftime("%d.%m"),
+                "year_now": time.strftime("%Y"),
                 # top_process_name/top_process_cpu_pct/top_process_ram_pct -
                 # НЕ читаются тут напрямую (см. удалённый top_process_monitor.read()
                 # выше) - приходят через **integrations ниже, т.к. опрос

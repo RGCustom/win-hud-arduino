@@ -55,6 +55,9 @@ qBittorrent - под них и появились "stream"/"recent"/"qbt" ниж
 #     },
 #
 #     "uptime": str, "container_uptime": str, "time_now": str,
+#     "weekday_name": str,   # "Пн".."Вс" - короткое имя дня недели
+#     "date_now": str,       # "ДД.ММ", например "13.09"
+#     "year_now": str,       # "ГГГГ", например "2026"
 #
 #     "volume_pct": int, "volume_muted": str,   # "да"/"нет" - уже отформатировано
 #     "audio_device_name": str,
@@ -229,6 +232,9 @@ VARIABLES = {
     "uptime":            {"label": "Аптайм Windows",                       "group": "scalar", "category": "Система", "resolver": _scalar("uptime")},
     "container_uptime":  {"label": "Аптайм win-hud-arduino",               "group": "scalar", "category": "Система", "resolver": _scalar("container_uptime")},
     "time_now":          {"label": "Текущее время (ЧЧ:ММ)",                "group": "scalar", "category": "Система", "resolver": _scalar("time_now")},
+    "weekday_name":      {"label": "День недели (Пн/Вт/...)",              "group": "scalar", "category": "Система", "resolver": _scalar("weekday_name")},
+    "date_now":          {"label": "Дата (ДД.ММ)",                          "group": "scalar", "category": "Система", "resolver": _scalar("date_now")},
+    "year_now":          {"label": "Год (ГГГГ)",                           "group": "scalar", "category": "Система", "resolver": _scalar("year_now")},
     "top_process_name":     {"label": "Топ-процесс: имя",             "group": "scalar", "category": "Система", "resolver": _scalar("top_process_name")},
     "top_process_cpu_pct":  {"label": "Топ-процесс: CPU, %",          "group": "scalar", "category": "Система", "resolver": _scalar("top_process_cpu_pct")},
     "top_process_ram_pct":  {"label": "Топ-процесс: RAM, %",          "group": "scalar", "category": "Система", "resolver": _scalar("top_process_ram_pct")},
