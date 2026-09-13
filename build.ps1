@@ -1,0 +1,1 @@
+pyinstaller --onedir --name win-hud-arduino --windowed --collect-all comtypes --collect-all pycaw --collect-all winsdk --collect-all pystray --hidden-import serial.tools.list_ports_windows --hidden-import win32timezone pc_hud.py
