@@ -46,11 +46,34 @@
   лента гасится, OLED очищается - и остаются погашенными, пока не придут новые
   данные (никакого дополнительного подтверждения на возврат не нужно - первая
   же пришедшая BAR:/L1-3: команда перезапишет содержимое сама).
+
+  "РАЗБУДИТЬ" ХОСТА КЛИКОМ ЭНКОДЕРА (см. attemptWakeHost() ниже): пока
+  hostTimedOut==true, клик кнопки энкодера НЕ шлёт BTN:CLICK по serial (слать
+  некому - хост не читает порт) - вместо этого плата сама представляется
+  Windows USB HID-клавиатурой (Keyboard.h, штатно доступна на 32u4/Leonardo)
+  и шлёт одно короткое нажатие Left Ctrl. Left Ctrl выбран специально - это
+  модификатор, он ничего не печатает, даже если случайно попадёт в активное
+  текстовое поле после пробуждения.
+
+  ВАЖНО - что это реально может и не может разбудить (ограничение
+  железа/BIOS/Windows, не прошивки):
+    - Сон (Sleep/S3)              - работает практически всегда "из коробки".
+    - Полное выключение (Shutdown/S5) - работает, ТОЛЬКО если в BIOS
+      материнки явно включена опция вида "Power On By Keyboard/USB" (у
+      разных производителей называется по-разному) - без неё чипсет в S5
+      просто не слушает USB, и это никак не обойти со стороны прошивки.
+    - Зависание Windows / самопроизвольная перезагрузка - НЕ поможет и не
+      должно: это не про "включение", тут вмешиваться нечем.
+  Плата физически остаётся запитанной по USB даже в этих состояниях - иначе
+  сам watchdog выше не мог бы гасить ленту/OLED - поэтому USB HID в принципе
+  долетает до хоста, вопрос только в том, слушает ли его в данный момент
+  конкретная материнка/ОС.
 */
 
 #include <FastLED.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <Keyboard.h>
 
 // ---------------- КОНФИГ ЖЕЛЕЗА ----------------
 
@@ -101,7 +124,7 @@
 // tick_interval/leds_count, менять это на лету незачем, а завести отдельный
 // протокольный канал ради этого избыточно; значение просто правится тут же
 // перед перепрошивкой, как и OLED_SCROLL_STEP_PX/BUTTON_DEBOUNCE_MS выше.
-#define NO_DATA_TIMEOUT_MS (3UL * 60UL * 1000UL)
+#define NO_DATA_TIMEOUT_MS 45000UL
 
 // ---------------- LED_MAP: калибровка физического порядка диодов ----------------
 // Индекс массива - логический номер (0 = "начало" ленты в терминах
@@ -298,6 +321,41 @@ void checkHostTimeout() {
   oledDirty = true;
 }
 
+// ---------------- "разбудить" хоста через USB HID (см. докстринг модуля) ----------------
+
+// Минимальный интервал между попытками - защита от повторных срабатываний
+// при удержании/частых кликах кнопки, пока хост ещё не откликнулся (первая
+// же валидная command-строка от хоста сбросит hostTimedOut в loop(), тогда
+// pollButton() снова пойдёт по обычной ветке BTN:CLICK, а не сюда).
+#define WAKE_KEY_COOLDOWN_MS 5000UL
+unsigned long lastWakeAttemptMs = 0;
+
+void attemptWakeHost() {
+  unsigned long now = millis();
+  // lastWakeAttemptMs == 0 - ещё не было ни одной попытки, кулдаун не
+  // применяется (иначе первый клик после старта платы пришлось бы ждать
+  // WAKE_KEY_COOLDOWN_MS от millis()==0, чего на практике не случится, но
+  // явная проверка понятнее неявного совпадения).
+  if (lastWakeAttemptMs != 0 && now - lastWakeAttemptMs < WAKE_KEY_COOLDOWN_MS) return;
+  lastWakeAttemptMs = now;
+
+  Keyboard.press(KEY_LEFT_CTRL);
+  delay(15);  // достаточно для регистрации нажатия хостом, короче незаметно для пользователя
+  Keyboard.release(KEY_LEFT_CTRL);
+
+  // Визуальное подтверждение "клик принят, попытка ушла" - обычным путём
+  // (через OLED/ленту от хоста) подтвердить нечего, хоста ещё нет. Короткая
+  // синяя вспышка всей ленты - checkHostTimeout() не будет с ней бороться
+  // (он ничего не делает повторно, пока hostTimedOut уже true, см. его
+  // докстринг), а следующий пришедший от хоста BAR: сам перезапишет ленту
+  // как обычно.
+  fill_solid(leds, NUM_LEDS, CRGB(0, 120, 255));
+  FastLED.show();
+  delay(200);
+  FastLED.clear();
+  FastLED.show();
+}
+
 // ---------------- калибровка ленты (команда CAL) ----------------
 
 void runCalibration() {
@@ -346,7 +404,15 @@ void pollButton() {
   if (now - lastButtonChangeMs > BUTTON_DEBOUNCE_MS && buttonDebounced != lastButtonState) {
     buttonDebounced = lastButtonState;
     if (buttonDebounced == LOW) {  // нажатие - активный уровень LOW (INPUT_PULLUP)
-      Serial.println(F("BTN:CLICK"));
+      if (hostTimedOut) {
+        // Хост не читает serial (см. checkHostTimeout()) - обычный
+        // BTN:CLICK слать некому, вместо этого пробуем разбудить его через
+        // USB HID (см. attemptWakeHost() и докстринг модуля за подробностями
+        // и ограничениями по Sleep/Shutdown/BIOS).
+        attemptWakeHost();
+      } else {
+        Serial.println(F("BTN:CLICK"));
+      }
     }
   }
 }
@@ -432,6 +498,10 @@ void setup() {
 
   lastButtonState = digitalRead(ENCODER_BTN_PIN);
   buttonDebounced = lastButtonState;
+
+  Keyboard.begin();  // USB HID-клавиатура (см. attemptWakeHost()) - composite
+                      // с уже поднятым Serial CDC, ничего дополнительно
+                      // настраивать не нужно на 32u4/Leonardo
 }
 
 void loop() {
