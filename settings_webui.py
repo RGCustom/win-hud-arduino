@@ -254,6 +254,21 @@ SETTINGS_PAGE_HTML = """<!doctype html>
     </div>
   </div>
 
+  <!-- ---- Топ-процесс по CPU (НОВОЕ) ---- -->
+  <div class="global-card">
+    <h2>Топ-процесс (CPU)</h2>
+    <div class="hint">Порог загрузки CPU, ниже которого экран "top_process_name" не показывается
+      (см. {top_process_name}/{top_process_cpu_pct}/{top_process_ram_pct} на /screens) - без порога
+      в топе постоянно мелькали бы лёгкие фоновые процессы. psutil считает загрузку НЕ нормализованной
+      по числу потоков (сумма по ядрам) - на многопоточном CPU один полностью загруженный поток даёт
+      лишь несколько процентов, поэтому нужное значение сильно зависит от конкретного железа.</div>
+    <div class="slider-row">
+      <label>Порог показа, %</label>
+      <input type="range" id="top-process-min-cpu" min="0" max="100" step="1" value="25">
+      <span class="val" id="top-process-min-cpu-val">25%</span>
+    </div>
+  </div>
+
   <!-- ---- Peak hold - общие тайминги (как в shkaf-hud) ---- -->
   <div class="global-card">
     <h2>Peak hold — общие тайминги</h2>
@@ -368,6 +383,7 @@ let editingQbt1Url = false, editingQbt1ApiKey = false, editingQbt2Url = false, e
 let editingLayoutHold = false, editingDeviceHold = false, editingOsdCooldown = false;
 let editingPriorityPersonal = false, editingPriorityAmbient = false;
 let editingPingInterval = false, editingPingTimeout = false, editingPingFail = false, editingPingRecover = false;
+let editingTopProcessMinCpu = false;
 let layoutColorsBuilt = false;
 
 // ---- Подключение / диски / сеть (ПЕРЕЕХАЛО с Sensors, см. докстринг модуля) ----
@@ -701,6 +717,19 @@ debounceSave(pingTimeoutEl, v => editingPingTimeout = v, () => sendPingSettings(
 debounceSave(pingFailEl, v => editingPingFail = v, () => sendPingSettings({ ping_fail_threshold: parseInt(pingFailEl.value) }));
 debounceSave(pingRecoverEl, v => editingPingRecover = v, () => sendPingSettings({ ping_recover_threshold: parseInt(pingRecoverEl.value) }));
 
+// ---- Топ-процесс по CPU (порог показа, см. metrics_windows.TopProcessMonitor) ----
+const topProcessMinCpuEl = document.getElementById("top-process-min-cpu");
+const topProcessMinCpuValEl = document.getElementById("top-process-min-cpu-val");
+topProcessMinCpuEl.addEventListener("input", () => {
+  editingTopProcessMinCpu = true;
+  topProcessMinCpuValEl.textContent = topProcessMinCpuEl.value + "%";
+});
+topProcessMinCpuEl.addEventListener("change", () => {
+  fetch("/api/top_process_settings", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ top_process_min_cpu_pct: parseFloat(topProcessMinCpuEl.value) }) });
+  editingTopProcessMinCpu = false;
+});
+
 function renderVolumeColors(colors) {
   const wrap = document.getElementById("volume-colors");
   wrap.innerHTML = "";
@@ -966,6 +995,11 @@ function render(state) {
   if (!editingPingTimeout) pingTimeoutEl.value = state.cfg.ping_timeout_ms;
   if (!editingPingFail) pingFailEl.value = state.cfg.ping_fail_threshold;
   if (!editingPingRecover) pingRecoverEl.value = state.cfg.ping_recover_threshold;
+
+  if (!editingTopProcessMinCpu) {
+    topProcessMinCpuEl.value = state.cfg.top_process_min_cpu_pct;
+    topProcessMinCpuValEl.textContent = Math.round(state.cfg.top_process_min_cpu_pct) + "%";
+  }
 
   if (!editingLayoutHold) {
     layoutHoldEl.value = state.cfg.layout_hold_seconds;

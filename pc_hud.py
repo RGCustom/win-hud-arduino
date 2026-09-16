@@ -156,6 +156,15 @@ DEFAULT_PING_FAIL_THRESHOLD = 2     # столько провалов подря
                                       # гистерезис в metrics_ping.PingMonitor)
 DEFAULT_PING_RECOVER_THRESHOLD = 1  # столько успехов подряд для возврата в online
 
+# Порог "top_process_name" (см. metrics_windows.TopProcessMonitor) - раньше
+# был захардкожен константой MIN_CPU_PCT прямо в metrics_windows.py, теперь
+# живая настройка в /settings (та же причина, что и у DEFAULT_PING_* выше -
+# верное значение зависит от конкретного железа, см. докстринг класса:
+# psutil отдаёт CPU% ненормализованным по числу потоков, поэтому на
+# многопоточных CPU один загруженный поток даёт всего несколько процентов).
+# Дефолт 25.0 - тот же, что был зашит раньше.
+DEFAULT_TOP_PROCESS_MIN_CPU_PCT = 25.0
+
 WEB_PORT = int(os.environ.get("WEB_PORT", "8189"))
 
 _DEFAULT_CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "win-hud-arduino")
@@ -341,6 +350,10 @@ DEFAULT_SETTINGS = {
     "ping_timeout_ms": DEFAULT_PING_TIMEOUT_MS,
     "ping_fail_threshold": DEFAULT_PING_FAIL_THRESHOLD,
     "ping_recover_threshold": DEFAULT_PING_RECOVER_THRESHOLD,
+    # Порог топ-процесса по CPU (см. DEFAULT_TOP_PROCESS_MIN_CPU_PCT выше и
+    # metrics_windows.TopProcessMonitor) - живая настройка, слайдер в
+    # /settings, читается в integrations_loop() на каждом опросе.
+    "top_process_min_cpu_pct": DEFAULT_TOP_PROCESS_MIN_CPU_PCT,
     # avrdude - путь к папке (или сразу к avrdude.exe), если он не в PATH -
     # см. flash.resolve_avrdude_exe(). Живая настройка со страницы /flash,
     # тот же принцип, что serial_port/tautulli_url и т.п. выше. Пусто -
@@ -1460,6 +1473,24 @@ def api_ping_settings():
     return jsonify({"ok": True})
 
 
+@app.route("/api/top_process_settings", methods=["POST"])
+def api_top_process_settings():
+    """Порог "top_process_name" (см. metrics_windows.TopProcessMonitor и
+    DEFAULT_TOP_PROCESS_MIN_CPU_PCT выше) - границы 0-100%, тот же принцип,
+    что у /api/ping_settings. Опрашивается фоновым потоком
+    (integrations_loop, см. ниже), поэтому сохранение тут не требует
+    немедленного пересчёта - новое значение подхватится на следующем тике
+    (INTEGRATIONS_POLL_INTERVAL)."""
+    body = request.get_json(force=True)
+    with state_lock:
+        if "top_process_min_cpu_pct" in body:
+            state["cfg"]["top_process_min_cpu_pct"] = round(
+                max(0.0, min(100.0, float(body["top_process_min_cpu_pct"]))), 1
+            )
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
 @app.route("/api/encoder", methods=["POST"])
 def api_encoder():
     body = request.get_json(force=True)
@@ -2087,7 +2118,9 @@ def integrations_loop(stop_event):
             {"url": cfg["qbt2_url"], "api_key": cfg["qbt2_api_key"]},
         ]
         qbt_data = qbt_client.read(qbt_servers)
-        top_process_data = top_process_monitor.read()
+        top_process_data = top_process_monitor.read(
+            min_cpu_pct=cfg.get("top_process_min_cpu_pct", DEFAULT_TOP_PROCESS_MIN_CPU_PCT)
+        )
 
         with _integrations_lock:
             _integrations_state.update(tautulli_data)

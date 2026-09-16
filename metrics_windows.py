@@ -305,19 +305,29 @@ class TopProcessMonitor:
     # Минимальный процент загрузки CPU, ниже которого top_process_name
     # считается "нет активности, достойной показа" (см. обсуждение в
     # чате - хотим видеть значение только во время игры/работы, не любой
-    # фоновый процесс на доли процента). Не настройка в /settings - тот же
-    # принцип, что и у ledbar.PEAK_HOLD_SECONDS и т.п. - фиксированная
-    # константа, правится тут же при необходимости.
+    # фоновый процесс на доли процента). ЖИВАЯ настройка в /settings
+    # (cfg["top_process_min_cpu_pct"], см. DEFAULT_SETTINGS в pc_hud.py) -
+    # это значение тут только ДЕФОЛТ, используемый read(), если
+    # min_cpu_pct не передан явно (старый settings.json без ключа, прямой
+    # вызов из самотеста модуля и т.п.). Разумный дефолт по-прежнему нужен
+    # тут же, т.к. верный порог сильно зависит от железа конкретной машины
+    # (см. обоснование 25% для 20-поточного CPU в докстринге модуля выше) -
+    # именно поэтому это слайдер в /settings, а не общая для всех константа.
     MIN_CPU_PCT = 25.0
 
     def __init__(self):
         self._procs = {}  # pid -> psutil.Process
 
-    def read(self):
-        """dict: top_process_name (str|None - None, если ни один процесс не
-        удалось прочитать ЛИБО ни один реальный процесс не превысил
-        MIN_CPU_PCT прямо сейчас), top_process_cpu_pct, top_process_ram_pct
-        (0.0, если name is None)."""
+    def read(self, min_cpu_pct=None):
+        """min_cpu_pct - живой порог из /settings (см. MIN_CPU_PCT выше за
+        обоснованием дефолта) - None означает "использовать дефолт класса".
+
+        Возвращает dict: top_process_name (str|None - None, если ни один
+        процесс не удалось прочитать ЛИБО ни один реальный процесс не
+        превысил min_cpu_pct прямо сейчас), top_process_cpu_pct,
+        top_process_ram_pct (0.0, если name is None)."""
+        if min_cpu_pct is None:
+            min_cpu_pct = self.MIN_CPU_PCT
         current_pids = set()
         try:
             for p in psutil.process_iter(["pid"]):
@@ -351,12 +361,12 @@ class TopProcessMonitor:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        # Ниже порога MIN_CPU_PCT - считаем, что "ничего особо тяжёлого не
+        # Ниже порога min_cpu_pct - считаем, что "ничего особо тяжёлого не
         # происходит" и не показываем top_process вовсе (см. докстринг
         # класса выше) - тот же смысл, что и у best_name is None ниже,
         # просто по другой причине (не "не удалось прочитать", а "все
         # найденные процессы слишком лёгкие").
-        if best_name is None or best_cpu < self.MIN_CPU_PCT:
+        if best_name is None or best_cpu < min_cpu_pct:
             return {"top_process_name": None, "top_process_cpu_pct": 0.0, "top_process_ram_pct": 0.0}
 
         return {
