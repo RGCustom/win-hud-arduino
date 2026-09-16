@@ -5,16 +5,18 @@ screens.py  (win-hud-arduino)
 (CRUD/build_active_screens/RotationState) в основе не менялся - он уже был
 написан общим - опирается на templates.template_group() и
 variables.group_count(), а не на конкретные переменные проекта. Repeating-
-группы (stream/recent/qbt, см. variables.REPEATING_GROUPS) в этом проекте
-НЕ пусты (Plex/qBittorrent были возвращены - см. докстринг variables.py) -
-ветка "экран в N копий" В ROTATION.PY ДОСТИЖИМА, если пользователь вручную
-добавит на /screens экран, использующий stream_*/recent_*/qbt_* переменную
-(см. README - по умолчанию таких экранов нет, DEFAULT_SCREENS ниже их не
-содержит, но интеграции для этого предусмотрены).
+группы (stream/recent/qbt/mon, см. variables.REPEATING_GROUPS) в этом
+проекте НЕ пусты (Plex/qBittorrent были возвращены, позже добавился
+мониторинг произвольных ресурсов - см. докстринг variables.py) - ветка
+"экран в N копий" В ROTATION.PY ДОСТИЖИМА, если пользователь вручную
+добавит на /screens экран, использующий stream_*/recent_*/qbt_*-переменную,
+а для мониторинга (mon_*) она достижима СРАЗУ ИЗ КОРОБКИ - см.
+DEFAULT_SCREENS ниже, "default-monitoring"/"default-alert".
 
 Изменилось только:
   - DEFAULT_SCREENS - под новые переменные (CPU/RAM/GPU/диски/сеть/звук/
-    раскладка вместо Cache/Array/Plex/qBittorrent)
+    раскладка вместо Cache/Array/Plex/qBittorrent), плюс два экрана
+    мониторинга ресурсов (см. ниже)
   - CONFIG_DIR - дефолт под Windows (%APPDATA%\\win-hud-arduino), не /config
     докер-тома
   - НОВОЕ: приоритетная ротация (см. обсуждение в чате про личные/фоновые
@@ -56,6 +58,17 @@ variables.group_count(), а не на конкретные переменные 
     активных экранов, так и строит, теперь ещё и с point-override tier для
     "stream" - разбивка на "дорожки" per-tier - уже ответственность
     RotationState, ей достаточно готового поля tier на каждом элементе active).
+  - НОВОЕ: два дефолтных экрана мониторинга ресурсов (см. metrics_ping.py) -
+    "default-monitoring" (tier="ambient", крутит статус каждой настроенной
+    цели по очереди - repeating-группа "mon", 0 копий = экран просто
+    отсутствует, пока в /settings не заведена ни одна цель) и "default-alert"
+    (tier="personal", trigger_vars=["mon_down_names"]) - ЖИВАЯ ИЛЛЮСТРАЦИЯ
+    того же приёма, что уже используется у "default-nowplaying" ниже: экран
+    невидим, пока mon_down_names резолвится в None (всё живо, см.
+    metrics_ping.PingMonitor.read()), и мгновенно всплывает поверх текущей
+    ротации, как только что-то падает - никакой новой логики в screens.py
+    ради этого не понадобилось, тот же общий механизм build_active_screens()/
+    RotationState, что и для Now Playing.
 """
 
 import json
@@ -171,6 +184,69 @@ DEFAULT_SCREENS = [
         "tier": "normal",
         "trigger_vars": [],
     },
+    {
+        # Мониторинг ресурсов (см. metrics_ping.py) - repeating-группа "mon",
+        # экран сам размножается по числу целей, настроенных в /settings
+        # (0 целей = экран просто отсутствует в ротации, тот же общий
+        # механизм group_count()==0 -> цикл рендера ни разу не выполнился,
+        # что и у stream_*/qbt_* экранов без настроенной интеграции).
+        #
+        # НАМЕРЕННО не используется mon_latency_ms в шаблоне ниже - это поле
+        # резолвится в None для offline-целей (см. metrics_ping.PingMonitor.read()
+        # - задержку мёртвого ресурса показывать нечего), а ЛЮБАЯ None-
+        # переменная в l1/l2/l3 гасит именно ЭТУ копию экрана (см. докстринг
+        # build_active_screens() ниже) - то есть упавший ресурс перестал бы
+        # попадать в "спокойную" ротацию статуса ровно тогда, когда его
+        # статус нужнее всего показать. mon_label/mon_status/mon_since
+        # никогда не резолвятся в None, пока цель вообще существует в
+        # /settings - см. metrics_ping.py, поэтому безопасны для дефолтного
+        # шаблона; кто хочет видеть latency - может сделать свой экран.
+        #
+        # tier="ambient" - показывается чаще обычных (cfg["priority_boost_ambient"]),
+        # без права прерывания - та же рекомендованная настройка, что и для
+        # экранов на Plex/qBittorrent-переменных (см. подсказку на /screens).
+        "id": "default-monitoring",
+        "name": "Мониторинг",
+        "l1": "{mon_label:16}",
+        "l2": "{mon_status:16}",
+        "l3": "{mon_since:16}",
+        "duration": 4.0,
+        "enabled": True,
+        "tier": "ambient",
+        "trigger_vars": [],
+    },
+    {
+        # Алерт мониторинга - НЕВИДИМ, пока mon_down_names резолвится в None
+        # (все настроенные ресурсы живы, см. metrics_ping.PingMonitor.read()) -
+        # тот же общий механизм build_active_screens(), что и у
+        # "default-nowplaying" выше (любая None-переменная в шаблоне гасит
+        # экран целиком). mon_down_names - СКАЛЯР (не часть repeating-группы
+        # "mon"), поэтому у этого экрана ровно ОДНА копия, а не по числу
+        # упавших целей - сразу все имена через запятую на одной строке.
+        #
+        # tier="personal" + trigger_vars=["mon_down_names"] - ключевая часть
+        # задумки (см. обсуждение в чате): как только ХОТЬ ОДИН ресурс падает,
+        # mon_down_names становится непустой строкой - экран "появляется в
+        # active", которого не было на прошлом тике, и RotationState
+        # ПРИНУДИТЕЛЬНО прерывает текущий показ (см. "newly_active_personal"
+        # в RotationState.current_lines() ниже) - алерт всплывает мгновенно,
+        # а не ждёт своей очереди. Если СПИСОК упавших изменится ПРЯМО во
+        # время показа алерта (упал ещё один, либо один из упавших ожил, но
+        # остальные ещё нет) - trigger_vars заметит, что mon_down_names стал
+        # другой строкой, и продлит показ с обновлённым содержимым, как
+        # будто экран показался заново (та же механика, что у смены трека на
+        # Now Playing). Как только ПОСЛЕДНИЙ упавший ресурс восстановится -
+        # mon_down_names снова None, и экран сам пропадает из ротации.
+        "id": "default-monitoring-alert",
+        "name": "Алерт мониторинга",
+        "l1": "\u26a0 Недоступно:",
+        "l2": "{mon_down_names:16}",
+        "l3": "",
+        "duration": 5.0,
+        "enabled": True,
+        "tier": "personal",
+        "trigger_vars": ["mon_down_names"],
+    },
 ]
 
 
@@ -204,7 +280,7 @@ def save_screens(screens):
         json.dump(screens, f)
 
 
-# ---------------- CRUD (portировано из shkaf-hud + tier/trigger_vars - НОВОЕ, см. докстринг модуля) ----------------
+# ---------------- CRUD (портировано из shkaf-hud + tier/trigger_vars - НОВОЕ, см. докстринг модуля) ----------------
 
 def _sanitize_tier(value, fallback="normal"):
     """Валидирует tier против SCREEN_TIERS - невалидное/отсутствующее
@@ -293,27 +369,27 @@ def build_active_screens(screens, context):
     загрузке/сохранении - см. _backfill_tier_fields()/_sanitize_tier()), тут
     только подстраховка на случай мусора (см. tier not in SCREEN_TIERS ниже).
 
-    В win-hud-arduino повторяющихся групп нет (см. шапку файла) - в
-    результате templates.template_group() всегда возвращает пустой set(),
-    и каждый экран идёт по ветке "обычный (нерепитящийся)". Ветка с
-    разворачиванием в N копий оставлена нетронутой ради совместимости
-    (общий код с shkaf-hud) - она просто никогда не выполнится, пока в
-    variables.py не появится хотя бы одна group != "scalar" переменная.
+    В win-hud-arduino репитящихся групп несколько (stream/recent/qbt/mon,
+    см. variables.REPEATING_GROUPS) - для каждого КОНКРЕТНОГО экрана
+    используется не более одной из них за раз (см. len(groups) > 1 ниже -
+    смешивать переменные из разных групп в одном шаблоне не поддерживается,
+    непонятно было бы, по какому из счётчиков размножать копии).
 
     ВАЖНО - как правильно делать "экран не включается, если ..." (портировано
     из shkaf-hud, см. пример disk1/disk2/net1/net2 - экран гаснет, если буква
-    диска/интерфейс не выбраны в /settings; и media - экран гаснет, если
-    сейчас ничего не играет, см. metrics_windows.MediaMonitor):
+    диска/интерфейс не выбраны в /settings; media - экран гаснет, если сейчас
+    ничего не играет; mon_down_names - алерт-экран гаснет, если всё живо, см.
+    metrics_windows.MediaMonitor/metrics_ping.PingMonitor соответственно):
 
     Экран автоматически выпадает из ротации, если ХОТЯ БЫ ОДНА переменная в
     его l1/l2/l3 резолвится в None (см. ok1/ok2/ok3 ниже - all_resolved из
     templates.render()). НЕ пишите условие видимости экрана здесь, в
     screens.py - вместо этого resolver соответствующей переменной (в
     variables.py) или, чаще, источник данных в context (metrics_windows.py/
-    pc_hud.py) должен класть None именно в тот момент, когда данных "нет по
-    смыслу" (а не только когда их технически не удалось прочитать). Дальше
-    этот же общий механизм сработает сам - для ЛЮБОГО будущего экрана,
-    условного или нет, без специального кода тут.
+    metrics_ping.py/pc_hud.py) должен класть None именно в тот момент, когда
+    данных "нет по смыслу" (а не только когда их технически не удалось
+    прочитать). Дальше этот же общий механизм сработает сам - для ЛЮБОГО
+    будущего экрана, условного или нет, без специального кода тут.
     """
     active = []
 
@@ -348,11 +424,13 @@ def build_active_screens(screens, context):
         # Достижимая ветка (несмотря на комментарий "недостижимая" в
         # некоторых старых заметках проекта) - пользователь МОЖЕТ вручную
         # добавить экран на переменных repeating-группы (stream_*/recent_*/
-        # qbt_*, см. README) через /screens, интеграции для этого
-        # предусмотрены (metrics_tautulli.py/metrics_qbittorrent.py). tier/
-        # trigger_vars относятся к ЭКРАНУ целиком - у всех N копий одно и то
-        # же БАЗОВОЕ значение, ЗА ИСКЛЮЧЕНИЕМ point-override ниже для
-        # group_name == "stream" (см. _stream_copy_tier()).
+        # qbt_*/mon_*, см. README) через /screens, интеграции для этого
+        # предусмотрены (metrics_tautulli.py/metrics_qbittorrent.py/
+        # metrics_ping.py); для "mon" это ДОСТИЖИМО СРАЗУ из коробки - см.
+        # default-monitoring в DEFAULT_SCREENS выше. tier/trigger_vars
+        # относятся к ЭКРАНУ целиком - у всех N копий одно и то же БАЗОВОЕ
+        # значение, ЗА ИСКЛЮЧЕНИЕМ point-override ниже для group_name ==
+        # "stream" (см. _stream_copy_tier()).
         group_name = next(iter(groups))
         count = variables.group_count(group_name, context)
         for idx in range(count):
@@ -548,9 +626,10 @@ class RotationState:
                 if cur_tier == "personal":
                     fp = self._fingerprint(cur_id, trigger_vars_by_id, context)
                     if fp is not None and self.trigger_fingerprints.get(cur_id) != fp:
-                        # это другое событие (например, сменился трек), а не
-                        # то же самое - форсируем полное продление duration,
-                        # как будто экран показался заново
+                        # это другое событие (например, сменился трек, либо
+                        # изменился список упавших ресурсов на алерт-экране),
+                        # а не то же самое - форсируем полное продление
+                        # duration, как будто экран показался заново
                         self.trigger_fingerprints[cur_id] = fp
                         self.current["started_at"] = now
 

@@ -58,8 +58,20 @@ pc_hud.py  (win-hud-arduino)
      чтобы Flask вообще не форматировал и не печатал такие строки (дешевле,
      чем текстовый фильтр по паттерну "GET ... HTTP/1.1").
 
+  6. Мониторинг произвольных ресурсов (ping/TCP-порт, см. metrics_ping.py) -
+     ЧЕТВЁРТЫЙ фоновый поток (monitor_loop) - тот же принцип обособления от
+     главного цикла, что и у integrations_loop (см. п.3 выше): проверка
+     доступности с таймаутом не должна блокировать VU/BAR. Интервал у
+     мониторинга концептуально другой (минуты, не секунды - живая настройка
+     cfg["ping_interval_seconds"], см. DEFAULT_SETTINGS), поэтому это
+     ОТДЕЛЬНЫЙ поток, не смешанный с Tautulli/qBittorrent (там ритм секундный).
+     Число целей заранее неизвестно и задаётся пользователем в /settings
+     (cfg["mon_targets"]) - см. variables.py, repeating-группа "mon".
+
 Зависимости (requirements.txt):
     pyserial, flask, psutil, pynvml, pycaw, comtypes, pywin32, pystray, pillow
+    (metrics_ping.py новых зависимостей не добавляет - subprocess/socket
+    только из стандартной библиотеки)
 """
 
 import copy
@@ -69,6 +81,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from collections import deque
 
@@ -86,10 +99,11 @@ import osd
 import metrics_windows
 import metrics_tautulli
 import metrics_qbittorrent
+import metrics_ping
 import flash
 import flash_webui
 
-SCRIPT_VERSION = "2026-09-13-2"
+SCRIPT_VERSION = "2026-09-15-1"
 
 CONTAINER_START_TIME = time.time()
 
@@ -126,6 +140,21 @@ FULL_RESYNC_SECONDS = float(os.environ.get("FULL_RESYNC_SECONDS", "30"))
 # REQUEST_TIMEOUT в metrics_tautulli.py/metrics_qbittorrent.py - до
 # нескольких секунд на один недоступный сервис).
 INTEGRATIONS_POLL_INTERVAL = float(os.environ.get("INTEGRATIONS_POLL_INTERVAL", "5.0"))
+
+# Мониторинг ресурсов (ping/TCP, см. metrics_ping.py) - ЖИВАЯ настройка в
+# /settings (cfg["ping_interval_seconds"]), а не переменная окружения, как и
+# serial_port/tautulli_url и т.п. ниже - см. обсуждение в чате: пользователю
+# явно хотелось крутить интервал через веб, не через env var. Константы ниже -
+# только ДЕФОЛТЫ для DEFAULT_SETTINGS при самом первом запуске (см. там же),
+# дальше живут в settings.json, как и tick_interval.
+DEFAULT_PING_INTERVAL_SECONDS = 120.0   # 2 минуты - цели мониторинга не
+                                          # нуждаются в секундной свежести,
+                                          # в отличие от Tautulli/qBittorrent
+DEFAULT_PING_TIMEOUT_MS = 800
+DEFAULT_PING_FAIL_THRESHOLD = 2     # столько провалов подряд, прежде чем
+                                      # реально признать offline (см.
+                                      # гистерезис в metrics_ping.PingMonitor)
+DEFAULT_PING_RECOVER_THRESHOLD = 1  # столько успехов подряд для возврата в online
 
 WEB_PORT = int(os.environ.get("WEB_PORT", "8189"))
 
@@ -300,6 +329,18 @@ DEFAULT_SETTINGS = {
     "qbt1_api_key": "",
     "qbt2_url": "",
     "qbt2_api_key": "",
+    # Мониторинг ресурсов (см. metrics_ping.py/monitor_loop ниже) -
+    # mon_targets - список целей [{"id","label","host","port"}, ...],
+    # задаётся и меняется ЦЕЛИКОМ через /api/monitor_targets (см.
+    # _sanitize_mon_targets() ниже) - пустой список по умолчанию, ни одной
+    # цели не заведено (та же логика, что qbt1_url="" - интеграция просто
+    # выключена, пока пользователь ничего не настроил). Остальные три ключа -
+    # тайминги проверки, см. DEFAULT_PING_* выше за обоснованием дефолтов.
+    "mon_targets": [],
+    "ping_interval_seconds": DEFAULT_PING_INTERVAL_SECONDS,
+    "ping_timeout_ms": DEFAULT_PING_TIMEOUT_MS,
+    "ping_fail_threshold": DEFAULT_PING_FAIL_THRESHOLD,
+    "ping_recover_threshold": DEFAULT_PING_RECOVER_THRESHOLD,
     # avrdude - путь к папке (или сразу к avrdude.exe), если он не в PATH -
     # см. flash.resolve_avrdude_exe(). Живая настройка со страницы /flash,
     # тот же принцип, что serial_port/tautulli_url и т.п. выше. Пусто -
@@ -313,7 +354,11 @@ def load_settings():
     """Рекурсивный merge с дефолтами - без изменений логики относительно
     shkaf-hud (двухуровневый merge для dict-of-dict уже покрывает и
     encoder.volume_colors, т.к. это тоже плоский dict на верхнем уровне
-    вложенности - см. DEFAULT_ENCODER)."""
+    вложенности - см. DEFAULT_ENCODER). mon_targets - СПИСОК, не dict, поэтому
+    под dict-ветку merge не попадает и просто целиком берётся из saved
+    (см. else-ветку ниже) - ровно то поведение, которое нужно: список целей
+    сохраняется/загружается атомарно, без попытки "слить" элементы с дефолтом
+    (дефолт для него и так всегда пустой []."""
     try:
         with open(SETTINGS_FILE) as f:
             saved = json.load(f)
@@ -341,6 +386,36 @@ def save_settings(cfg):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(SETTINGS_FILE, "w") as f:
         json.dump(cfg, f)
+
+
+def _sanitize_mon_targets(raw):
+    """Валидирует список целей мониторинга, пришедший из /api/monitor_targets
+    (см. metrics_ping.PingMonitor.read() за тем, как именно потребляется
+    каждое поле дальше). Записи без host отбрасываются молча (пустая строка
+    "ничего не мониторит", тот же принцип, что у net2_iface=""); id
+    генерируется, если его нет (новая строка, добавленная в редакторе на
+    /settings) - список целей сохраняется целиком одним POST (не через
+    отдельный CRUD по id, как /api/screens/*, см. api_monitor_targets() ниже),
+    поэтому фронтенду не нужно самому изобретать уникальный id для новой
+    строки - достаточно прислать её без id вовсе."""
+    out = []
+    for t in (raw or []):
+        if not isinstance(t, dict):
+            continue
+        host = (t.get("host") or "").strip()
+        if not host:
+            continue
+        label = (t.get("label") or "").strip() or host
+        tid = t.get("id") or uuid.uuid4().hex[:12]
+        port = t.get("port")
+        try:
+            port = int(port) if port not in (None, "") else None
+        except (TypeError, ValueError):
+            port = None
+        if port is not None:
+            port = max(1, min(65535, port))
+        out.append({"id": tid, "label": label, "host": host, "port": port})
+    return out
 
 
 state_lock = threading.Lock()
@@ -380,6 +455,20 @@ _integrations_state = {
     # к тому, что VU/BAR/serial обновлялись гораздо реже tick_interval,
     # независимо от значения слайдера в /settings.
     "top_process_name": None, "top_process_cpu_pct": 0.0, "top_process_ram_pct": 0.0,
+}
+
+# Мониторинг ресурсов (см. monitor_loop() ниже и metrics_ping.py) - ОТДЕЛЬНЫЙ
+# от _integrations_state буфер (свой лок, свой поток-писатель) - не смешан с
+# Tautulli/qBittorrent ВЫШЕ намеренно: у мониторинга свой, гораздо более
+# редкий интервал (минуты, см. cfg["ping_interval_seconds"]), общий буфер с
+# integrations_loop заставил бы их либо делить один интервал (потеряв смысл
+# отдельной настройки), либо городить в одном потоке два независимых
+# таймера - вместо этого проще и понятнее держать полностью отдельный поток.
+_monitor_lock = threading.Lock()
+_monitor_state = {
+    "mon": [],
+    "mon_down_count": 0,
+    "mon_down_names": None,
 }
 
 # ---------------- лог serial-обмена (для терминала на /) ----------------
@@ -508,6 +597,11 @@ def get_context():
 def get_integrations_state():
     with _integrations_lock:
         return dict(_integrations_state)
+
+
+def get_monitor_state():
+    with _monitor_lock:
+        return dict(_monitor_state)
 
 
 # ---------------- форматтеры (аналог shkaf-hud) ----------------
@@ -841,6 +935,20 @@ function wireLogToggle(enabledEl, boxEl) {
   apply();
 }
 
+// Сохраняет/восстанавливает состояние чекбокса в localStorage - без этого
+// чекбоксы терминалов (включено/автопрокрутка/скрыть BAR:) сбрасывались на
+// хардкод из HTML (checked/без checked в SENSORS_PAGE_HTML) при КАЖДОЙ
+// перезагрузке страницы, т.к. их состояние нигде не сохранялось. key -
+// уникальный ключ в localStorage; defaultChecked - что использовать, если
+// сохранённого значения ещё нет (первый запуск в этом браузере) - берётся
+// из ТЕКУЩЕГО el.checked, т.е. из хардкода в HTML, чтобы поведение "из
+// коробки" (до первого изменения пользователем) не поменялось.
+function persistCheckbox(el, key) {
+  const saved = localStorage.getItem(key);
+  el.checked = saved !== null ? saved === "1" : el.checked;
+  el.addEventListener("change", () => localStorage.setItem(key, el.checked ? "1" : "0"));
+}
+
 // ---- Терминал serial-обмена (см. _log_serial()/api_serial_log() в pc_hud.py) ----
 let serialLogAfter = 0;
 const terminalEl = document.getElementById("serial-terminal");
@@ -848,6 +956,9 @@ const terminalEnabledEl = document.getElementById("terminal-enabled");
 const autoscrollEl = document.getElementById("terminal-autoscroll");
 const hideBarEl = document.getElementById("terminal-hide-bar");
 const clearBtnEl = document.getElementById("terminal-clear");
+persistCheckbox(terminalEnabledEl, "winhud_terminal_enabled");
+persistCheckbox(autoscrollEl, "winhud_terminal_autoscroll");
+persistCheckbox(hideBarEl, "winhud_terminal_hide_bar");
 wireLogToggle(terminalEnabledEl, terminalEl);
 
 // "Скрыть BAR:" - протокол пайп-разделённый (см. protocol.ProtocolState.build()/
@@ -906,6 +1017,8 @@ const appTerminalEl = document.getElementById("app-terminal");
 const appLogEnabledEl = document.getElementById("applog-enabled");
 const appLogAutoscrollEl = document.getElementById("applog-autoscroll");
 const appLogClearBtnEl = document.getElementById("applog-clear");
+persistCheckbox(appLogEnabledEl, "winhud_applog_enabled");
+persistCheckbox(appLogAutoscrollEl, "winhud_applog_autoscroll");
 wireLogToggle(appLogEnabledEl, appTerminalEl);
 
 const APP_LOG_ERROR_HINTS = ["ошиб", "failed", "error", "traceback", "exception"];
@@ -1302,6 +1415,51 @@ def api_qbittorrent():
     return jsonify({"ok": True})
 
 
+@app.route("/api/monitor_targets", methods=["POST"])
+def api_monitor_targets():
+    """Полная замена списка целей мониторинга (см. metrics_ping.py) - body:
+    {"targets": [{"id":.., "label":.., "host":.., "port":..}, ...]}. В
+    отличие от /api/screens/* тут НЕТ отдельного CRUD по id (POST create/
+    PUT update/DELETE) - список целей маленький и правится в /settings
+    целиком за один запрос, тот же принцип, что у layout_colors/карточки OSD:
+    фронтенд держит полный список в памяти (как screensCache на /screens) и
+    шлёт его целиком при любом изменении строки. _sanitize_mon_targets()
+    сама генерирует id для новых строк (см. её докстринг) - фронтенду не
+    нужно самому изобретать уникальный id.
+
+    Опрашивается фоновым потоком (monitor_loop, см. ниже), поэтому
+    сохранение тут не требует немедленного переподключения - новый список
+    целей подхватится на следующем тике monitor_loop (cfg["ping_interval_seconds"])."""
+    body = request.get_json(force=True)
+    with state_lock:
+        state["cfg"]["mon_targets"] = _sanitize_mon_targets(body.get("targets"))
+        save_settings(state["cfg"])
+        return jsonify({"targets": state["cfg"]["mon_targets"]})
+
+
+@app.route("/api/ping_settings", methods=["POST"])
+def api_ping_settings():
+    """Интервал/таймаут/гистерезис проверки ресурсов (см. monitor_loop() и
+    metrics_ping.PingMonitor.read()) - тот же принцип, что /api/priority_boost:
+    несколько связанных числовых настроек одним эндпоинтом. Границы интервала
+    5с-3600с - нижняя защищает от случайного "пинговать каждую секунду"
+    (для внешних/множества ресурсов это лишняя нагрузка на сеть без всякой
+    пользы - мониторинг доступности не нуждается в секундной свежести, см.
+    обсуждение в чате), верхняя - час, разумный потолок для UI."""
+    body = request.get_json(force=True)
+    with state_lock:
+        if "ping_interval_seconds" in body:
+            state["cfg"]["ping_interval_seconds"] = round(max(5.0, min(3600.0, float(body["ping_interval_seconds"]))), 1)
+        if "ping_timeout_ms" in body:
+            state["cfg"]["ping_timeout_ms"] = max(50, min(10000, int(body["ping_timeout_ms"])))
+        if "ping_fail_threshold" in body:
+            state["cfg"]["ping_fail_threshold"] = max(1, min(10, int(body["ping_fail_threshold"])))
+        if "ping_recover_threshold" in body:
+            state["cfg"]["ping_recover_threshold"] = max(1, min(10, int(body["ping_recover_threshold"])))
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
 @app.route("/api/encoder", methods=["POST"])
 def api_encoder():
     body = request.get_json(force=True)
@@ -1600,11 +1758,13 @@ def metrics_main_loop(stop_event):
                 osd_manager.push("device", {"device_name": audio_state["audio_device_name"]}, now, cfg)
             watched_device_name = audio_state["audio_device_name"]
 
-            # ---- Tautulli (Plex) / qBittorrent - ТОЛЬКО чтение уже готового
-            # результата фонового потока (integrations_loop), никаких
-            # сетевых вызовов прямо тут - см. обоснование у
-            # INTEGRATIONS_POLL_INTERVAL в шапке файла.
+            # ---- Tautulli (Plex) / qBittorrent / мониторинг ресурсов -
+            # ТОЛЬКО чтение уже готового результата фоновых потоков
+            # (integrations_loop/monitor_loop), никаких сетевых вызовов
+            # прямо тут - см. обоснование у INTEGRATIONS_POLL_INTERVAL/
+            # DEFAULT_PING_INTERVAL_SECONDS в шапке файла.
             integrations = get_integrations_state()
+            monitor_state = get_monitor_state()
 
             common_metrics = {
                 "cpu": cpu_pct, "ram": ram_pct,
@@ -1663,6 +1823,11 @@ def metrics_main_loop(stop_event):
                 # (plex_*/streams/recent/qbt_*/torrents) - см.
                 # get_integrations_state()/integrations_loop() ниже.
                 **integrations,
+                # Мониторинг ресурсов (ping/TCP, см. metrics_ping.py) -
+                # monitor_state уже содержит РОВНО те ключи, что ожидают
+                # резолверы variables.py (mon/mon_down_count/mon_down_names) -
+                # см. get_monitor_state()/monitor_loop() ниже.
+                **monitor_state,
             }
             with _context_lock:
                 _last_context.clear()
@@ -1932,6 +2097,53 @@ def integrations_loop(stop_event):
         stop_event.wait(timeout=INTEGRATIONS_POLL_INTERVAL)
 
 
+def monitor_loop(stop_event):
+    """
+    Опрашивает произвольные ресурсы (ping/TCP-порт, см. metrics_ping.py) -
+    ОТДЕЛЬНЫЙ от integrations_loop фоновый поток, СВОИМ интервалом
+    (cfg["ping_interval_seconds"], минуты, а не секунды - живая настройка в
+    /settings, см. DEFAULT_PING_INTERVAL_SECONDS в шапке файла). Не смешан с
+    Tautulli/qBittorrent намеренно - см. обсуждение в чате: у мониторинга
+    ресурсов принципиально другой, гораздо более редкий ритм, общий поток с
+    integrations_loop заставил бы либо делить один интервал на всех, либо
+    городить второй таймер внутри одного потока - отдельный поток проще.
+
+    PingMonitor создаётся ЗДЕСЬ, а не на уровне модуля - как и
+    TautulliClient/QbittorrentClient в integrations_loop выше, у него есть
+    внутреннее состояние МЕЖДУ вызовами (гистерезис по каждой цели, см.
+    metrics_ping._TargetState) - оно должно обновляться последовательно
+    ОДНИМ потоком, а не делиться с чем-либо ещё.
+
+    Результат кладётся в _monitor_state под _monitor_lock; metrics_main_loop
+    только читает его (get_monitor_state()) - ни одного subprocess/socket-
+    вызова в главном цикле.
+    """
+    ping_monitor = metrics_ping.PingMonitor()
+
+    while not stop_event.is_set():
+        with state_lock:
+            cfg = copy.deepcopy(state["cfg"])
+
+        result = ping_monitor.read(
+            cfg.get("mon_targets", []),
+            timeout_ms=cfg.get("ping_timeout_ms", DEFAULT_PING_TIMEOUT_MS),
+            fail_threshold=cfg.get("ping_fail_threshold", DEFAULT_PING_FAIL_THRESHOLD),
+            recover_threshold=cfg.get("ping_recover_threshold", DEFAULT_PING_RECOVER_THRESHOLD),
+        )
+
+        with _monitor_lock:
+            _monitor_state.update(result)
+
+        # Интервал - живая настройка, перечитывается из cfg КАЖДЫЙ виток (та
+        # же логика, что у tick_interval в metrics_main_loop) - смена
+        # значения в /settings подхватывается на следующем цикле опроса, без
+        # перезапуска потока. Не вычитаем время, потраченное на сам read()
+        # (может занять заметную долю секунды при многих целях и таймаутах) -
+        # тот же осознанно простой подход, что и у integrations_loop выше.
+        interval = max(5.0, float(cfg.get("ping_interval_seconds", DEFAULT_PING_INTERVAL_SECONDS)))
+        stop_event.wait(timeout=interval)
+
+
 def _boot_time():
     import psutil
     return psutil.boot_time()
@@ -1978,6 +2190,7 @@ def main():
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=metrics_main_loop, args=(stop_event,), daemon=True).start()
     threading.Thread(target=integrations_loop, args=(stop_event,), daemon=True).start()
+    threading.Thread(target=monitor_loop, args=(stop_event,), daemon=True).start()
 
     icon = build_tray_icon(stop_event)
     icon.run()  # блокирует главный поток, пока не нажмут "Выход"

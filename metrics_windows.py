@@ -286,20 +286,45 @@ class TopProcessMonitor:
     осмысленное значение появляется со второго вызова. Поэтому Process-
     объекты кэшируются между тиками в self._procs по pid, а не создаются
     заново на каждый read() - иначе top_process_cpu_pct был бы всегда 0.
+
+    ИСКЛЮЧЕНИЯ (см. обсуждение в чате - "постоянно показывает System Idle
+    Process"): System Idle Process (PID 0 на Windows) - это НЕ реальный
+    процесс, а бухгалтерская запись psutil/ОС для "незанятого" времени CPU -
+    на многоядерных машинах Windows отдаёт его cpu_percent() в величинах,
+    которые из-за способа расчёта (сумма по ядрам, не среднее) часто
+    оказываются ВЫШЕ, чем у любого реально нагруженного процесса, поэтому
+    Idle почти всегда "побеждал" в сравнении best_cpu выше, даже когда
+    машина занята чем-то конкретным. PID 4 ("System") - тоже служебная
+    запись ядра Windows (не то, что пользователь хочет увидеть как "топ-
+    процесс") - исключается по той же причине. _IGNORED_PIDS ниже - не
+    константа модуля, а атрибут класса, т.к. используется только здесь.
     """
+
+    _IGNORED_PIDS = (0, 4)  # System Idle Process, System
+
+    # Минимальный процент загрузки CPU, ниже которого top_process_name
+    # считается "нет активности, достойной показа" (см. обсуждение в
+    # чате - хотим видеть значение только во время игры/работы, не любой
+    # фоновый процесс на доли процента). Не настройка в /settings - тот же
+    # принцип, что и у ledbar.PEAK_HOLD_SECONDS и т.п. - фиксированная
+    # константа, правится тут же при необходимости.
+    MIN_CPU_PCT = 25.0
 
     def __init__(self):
         self._procs = {}  # pid -> psutil.Process
 
     def read(self):
         """dict: top_process_name (str|None - None, если ни один процесс не
-        удалось прочитать), top_process_cpu_pct, top_process_ram_pct (0.0,
-        если name is None)."""
+        удалось прочитать ЛИБО ни один реальный процесс не превысил
+        MIN_CPU_PCT прямо сейчас), top_process_cpu_pct, top_process_ram_pct
+        (0.0, если name is None)."""
         current_pids = set()
         try:
             for p in psutil.process_iter(["pid"]):
                 pid = p.info["pid"]
                 current_pids.add(pid)
+                if pid in self._IGNORED_PIDS:
+                    continue
                 if pid not in self._procs:
                     self._procs[pid] = p
                     try:
@@ -326,7 +351,12 @@ class TopProcessMonitor:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        if best_name is None:
+        # Ниже порога MIN_CPU_PCT - считаем, что "ничего особо тяжёлого не
+        # происходит" и не показываем top_process вовсе (см. докстринг
+        # класса выше) - тот же смысл, что и у best_name is None ниже,
+        # просто по другой причине (не "не удалось прочитать", а "все
+        # найденные процессы слишком лёгкие").
+        if best_name is None or best_cpu < self.MIN_CPU_PCT:
             return {"top_process_name": None, "top_process_cpu_pct": 0.0, "top_process_ram_pct": 0.0}
 
         return {

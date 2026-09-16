@@ -9,7 +9,12 @@ settings_webui.py  (win-hud-arduino)
 НОВЫЕ блоки - подключение к Tautulli (Plex) и к двум серверам qBittorrent
 (см. metrics_tautulli.py/metrics_qbittorrent.py) - просто адрес/API-ключ(и),
 опрашиваются отдельным фоновым потоком (integrations_loop в pc_hud.py), не
-главным циклом.
+главным циклом. И ЕЩЁ ОДИН НОВЫЙ блок - мониторинг произвольных ресурсов
+(ping/TCP-порт, см. metrics_ping.py) - список целей неизвестной заранее
+длины (см. обсуждение в чате: "не знаю сколько ресурсов буду мониторить"),
+поэтому это динамический список строк (добавить/удалить), а не фиксированные
+поля - опрашивается ещё одним отдельным фоновым потоком (monitor_loop в
+pc_hud.py) со своим, гораздо более редким интервалом (минуты, не секунды).
 
 ПЕРЕЕХАЛО СЮДА С /  (см. обсуждение в чате): выбор COM-порта платы, дисков
 (disk1_letter/disk2_letter) и сетевых интерфейсов (net1_iface/net2_iface) -
@@ -22,8 +27,9 @@ settings_webui.py  (win-hud-arduino)
 Как и в shkaf-hud, вся серверная логика/состояние - в pc_hud.py (эндпойнты
 /api/state, /api/mode, /api/assignment(_top), /api/colors(_top), /api/solid(_top),
 /api/peak, /api/leds_count, /api/encoder, /api/tautulli, /api/qbittorrent,
-/api/serial_port, /api/disks, /api/net-ifaces - этот файл только читает/пишет
-через них). Этот файл - чистая разметка + JS.
+/api/monitor_targets, /api/ping_settings, /api/serial_port, /api/disks,
+/api/net-ifaces - этот файл только читает/пишет через них). Этот файл -
+чистая разметка + JS.
 """
 
 from flask import Response
@@ -77,6 +83,17 @@ SETTINGS_PAGE_HTML = """<!doctype html>
   .slider-row .val { min-width:52px; text-align:right; color:var(--text); font-variant-numeric:tabular-nums; }
 
   .note { font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5; }
+
+  /* ---- Мониторинг ресурсов: динамический список целей (см. metrics_ping.py) ---- */
+  .mon-row { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .mon-row input[type=text] { flex:2; min-width:0; }
+  .mon-row input[type=text].mon-host { flex:3; }
+  .mon-row input[type=number] { flex:none; width:110px; min-width:0; }
+  .mon-del-btn { background:none; border:1px solid var(--border); color:var(--muted); border-radius:6px;
+                 padding:6px 10px; cursor:pointer; font-size:13px; flex:none; }
+  .mon-del-btn:hover { color:var(--danger); border-color:var(--danger); }
+  #mon-target-add { background:var(--accent); color:#151515; border:none; border-radius:8px;
+                    padding:8px 16px; font-weight:600; cursor:pointer; font-size:13px; margin-top:4px; }
 
   footer { text-align:center; color:var(--border); font-size:11px; margin-top:20px; }
 </style></head>
@@ -226,7 +243,7 @@ SETTINGS_PAGE_HTML = """<!doctype html>
       показывают чаще обычных и могут прервать текущий показ, если появились или сменился
       их контент (например трек). "Фоновые" (Plex/qBittorrent) показываются чаще обычных,
       но без права прерывания - просто получают более частые слоты. Число ниже - "каждый
-      N-й слот ротации" достаётся этой дорожке, если на неё сейчас есть что показать.</div>
+      N-й слот" ротации достаётся этой дорожке, если на неё сейчас есть что показать.</div>
     <div class="row">
       <label>Личные - каждый N-й слот</label>
       <input type="number" id="priority-boost-personal" min="1" max="20" value="2">
@@ -302,6 +319,42 @@ SETTINGS_PAGE_HTML = """<!doctype html>
     </div>
   </div>
 
+  <!-- ---- Мониторинг ресурсов (ping/TCP, НОВОЕ) ---- -->
+  <div class="global-card">
+    <h2>Мониторинг ресурсов</h2>
+    <div class="hint">Произвольные ресурсы (роутер, NAS, VPN, сайт - что угодно с IP или
+      доменным именем) - раз в заданный интервал проверяются на доступность: обычный ICMP
+      ping, если порт не указан, либо TCP-подключение к порту, если он задан (полезно для
+      ресурсов, которые сами блокируют ICMP). Доступны на /screens как {mon_label}/{mon_status}/
+      {mon_latency_ms}/{mon_since} - экран с ними сам размножается по числу целей ниже, плюс
+      готовые экраны "Мониторинг" (по очереди) и "Алерт" (мгновенно всплывает при падении)
+      уже есть среди дефолтных на /screens.</div>
+
+    <div id="mon-targets-rows"></div>
+    <button id="mon-target-add">+ Добавить ресурс</button>
+
+    <div class="slider-row" style="margin-top:18px">
+      <label>Интервал проверки, сек</label>
+      <input type="range" id="ping-interval" min="5" max="600" step="5" value="120">
+      <span class="val" id="ping-interval-val">120с</span>
+    </div>
+    <div class="row">
+      <label>Таймаут проверки, мс</label>
+      <input type="number" id="ping-timeout" min="50" max="10000" step="50" value="800">
+    </div>
+    <div class="row">
+      <label>Провалов подряд -> offline</label>
+      <input type="number" id="ping-fail-threshold" min="1" max="10" value="2">
+    </div>
+    <div class="row">
+      <label>Успехов подряд -> online</label>
+      <input type="number" id="ping-recover-threshold" min="1" max="10" value="1">
+    </div>
+    <div class="note">Гистерезис защищает от ложных срабатываний на один потерянный пакет -
+      статус ресурса меняется, только когда указанное число проверок подряд дало одинаковый
+      результат (при "1" смена происходит по первой же проверке).</div>
+  </div>
+
   <footer>win-hud-arduino</footer>
 </div>
 
@@ -314,6 +367,7 @@ let editingTautulliUrl = false, editingTautulliApiKey = false, editingMyPlexUser
 let editingQbt1Url = false, editingQbt1ApiKey = false, editingQbt2Url = false, editingQbt2ApiKey = false;
 let editingLayoutHold = false, editingDeviceHold = false, editingOsdCooldown = false;
 let editingPriorityPersonal = false, editingPriorityAmbient = false;
+let editingPingInterval = false, editingPingTimeout = false, editingPingFail = false, editingPingRecover = false;
 let layoutColorsBuilt = false;
 
 // ---- Подключение / диски / сеть (ПЕРЕЕХАЛО с Sensors, см. докстринг модуля) ----
@@ -538,6 +592,114 @@ debounceSave(qbt1UrlEl, v => editingQbt1Url = v, () => sendQbt({ qbt1_url: qbt1U
 debounceSave(qbt1ApiKeyEl, v => editingQbt1ApiKey = v, () => sendQbt({ qbt1_api_key: qbt1ApiKeyEl.value }));
 debounceSave(qbt2UrlEl, v => editingQbt2Url = v, () => sendQbt({ qbt2_url: qbt2UrlEl.value }));
 debounceSave(qbt2ApiKeyEl, v => editingQbt2ApiKey = v, () => sendQbt({ qbt2_api_key: qbt2ApiKeyEl.value }));
+
+// ---- Мониторинг ресурсов (ping/TCP, НОВОЕ - см. metrics_ping.py) ----
+// monTargets - ЕДИНСТВЕННЫЙ источник правды в браузере на время сессии этой
+// страницы (в отличие от полей выше, тут НЕТ отдельного editing-флага на
+// каждую строку - settings_webui.py вообще не переопрашивает /api/state
+// периодически, см. единственный fetch() в самом низу файла, поэтому нет
+// риска, что сервер "перезатрёт" то, что человек как раз печатает). id
+// генерируется КЛИЕНТСКИ при добавлении новой строки (genMonId()) - тот же
+// id уходит на сервер и там же сохраняется (see _sanitize_mon_targets() в
+// pc_hud.py - принимает готовый id, если он есть) - это позволяет НЕ
+// синхронизировать локальный список с ответом сервера после каждого
+// сохранения: ответ игнорируется, локальный monTargets всегда авторитетен,
+// а id остаётся стабильным между сохранениями (важно - от него зависит
+// состояние гистерезиса на бэкенде, см. metrics_ping.PingMonitor._states).
+let monTargets = [];
+let monTargetsLoaded = false;
+
+function genMonId() {
+  return "m" + Math.random().toString(36).slice(2, 10);
+}
+
+function saveMonTargets() {
+  fetch("/api/monitor_targets", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ targets: monTargets }) });
+  // Ответ намеренно игнорируется - см. комментарий у monTargets выше.
+  // Сервер сам отбросит строки с пустым host (см. _sanitize_mon_targets()) -
+  // это нормально, пока пользователь ещё не дописал адрес: локальная копия
+  // при этом не меняется, недописанная строка не исчезает из-под курсора.
+}
+
+function renderMonTargets() {
+  const wrap = document.getElementById("mon-targets-rows");
+  wrap.innerHTML = "";
+  monTargets.forEach((t, idx) => {
+    const row = document.createElement("div");
+    row.className = "mon-row";
+
+    const labelInput = document.createElement("input");
+    labelInput.type = "text";
+    labelInput.placeholder = "Название (Роутер, NAS...)";
+    labelInput.value = t.label || "";
+    labelInput.addEventListener("change", () => { t.label = labelInput.value; saveMonTargets(); });
+
+    const hostInput = document.createElement("input");
+    hostInput.type = "text";
+    hostInput.className = "mon-host";
+    hostInput.placeholder = "IP или домен";
+    hostInput.value = t.host || "";
+    hostInput.addEventListener("change", () => { t.host = hostInput.value; saveMonTargets(); });
+
+    const portInput = document.createElement("input");
+    portInput.type = "number";
+    portInput.placeholder = "порт (необяз.)";
+    portInput.min = 1; portInput.max = 65535;
+    portInput.value = t.port || "";
+    portInput.addEventListener("change", () => {
+      t.port = portInput.value ? parseInt(portInput.value) : null;
+      saveMonTargets();
+    });
+
+    const delBtn = document.createElement("button");
+    delBtn.className = "mon-del-btn";
+    delBtn.textContent = "\u2715";
+    delBtn.title = "Удалить";
+    delBtn.addEventListener("click", () => {
+      monTargets.splice(idx, 1);
+      renderMonTargets();
+      saveMonTargets();
+    });
+
+    row.appendChild(labelInput);
+    row.appendChild(hostInput);
+    row.appendChild(portInput);
+    row.appendChild(delBtn);
+    wrap.appendChild(row);
+  });
+}
+
+document.getElementById("mon-target-add").addEventListener("click", () => {
+  // Новая строка ещё БЕЗ host - saveMonTargets() тут не вызывается (нечего
+  // сохранять, сервер бы всё равно её отбросил, см. _sanitize_mon_targets()) -
+  // сохранение случится само на первое реальное изменение любого поля этой
+  // строки (см. addEventListener("change", ...) выше).
+  monTargets.push({ id: genMonId(), label: "", host: "", port: null });
+  renderMonTargets();
+});
+
+function sendPingSettings(partial) {
+  fetch("/api/ping_settings", { method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify(partial) });
+}
+const pingIntervalEl = document.getElementById("ping-interval");
+const pingIntervalValEl = document.getElementById("ping-interval-val");
+const pingTimeoutEl = document.getElementById("ping-timeout");
+const pingFailEl = document.getElementById("ping-fail-threshold");
+const pingRecoverEl = document.getElementById("ping-recover-threshold");
+
+pingIntervalEl.addEventListener("input", () => {
+  editingPingInterval = true;
+  pingIntervalValEl.textContent = pingIntervalEl.value + "с";
+});
+pingIntervalEl.addEventListener("change", () => {
+  sendPingSettings({ ping_interval_seconds: parseFloat(pingIntervalEl.value) });
+  editingPingInterval = false;
+});
+debounceSave(pingTimeoutEl, v => editingPingTimeout = v, () => sendPingSettings({ ping_timeout_ms: parseInt(pingTimeoutEl.value) }));
+debounceSave(pingFailEl, v => editingPingFail = v, () => sendPingSettings({ ping_fail_threshold: parseInt(pingFailEl.value) }));
+debounceSave(pingRecoverEl, v => editingPingRecover = v, () => sendPingSettings({ ping_recover_threshold: parseInt(pingRecoverEl.value) }));
 
 function renderVolumeColors(colors) {
   const wrap = document.getElementById("volume-colors");
@@ -788,6 +950,22 @@ function render(state) {
   if (!editingQbt1ApiKey) qbt1ApiKeyEl.value = state.cfg.qbt1_api_key;
   if (!editingQbt2Url) qbt2UrlEl.value = state.cfg.qbt2_url;
   if (!editingQbt2ApiKey) qbt2ApiKeyEl.value = state.cfg.qbt2_api_key;
+
+  if (!monTargetsLoaded) {
+    // Загружается ОДИН РАЗ на старте страницы - дальше monTargets живёт
+    // только в браузере (см. подробный комментарий у объявления monTargets
+    // выше про то, почему ответ /api/monitor_targets потом игнорируется).
+    monTargets = (state.cfg.mon_targets || []).map(t => ({ ...t }));
+    renderMonTargets();
+    monTargetsLoaded = true;
+  }
+  if (!editingPingInterval) {
+    pingIntervalEl.value = state.cfg.ping_interval_seconds;
+    pingIntervalValEl.textContent = Math.round(state.cfg.ping_interval_seconds) + "с";
+  }
+  if (!editingPingTimeout) pingTimeoutEl.value = state.cfg.ping_timeout_ms;
+  if (!editingPingFail) pingFailEl.value = state.cfg.ping_fail_threshold;
+  if (!editingPingRecover) pingRecoverEl.value = state.cfg.ping_recover_threshold;
 
   if (!editingLayoutHold) {
     layoutHoldEl.value = state.cfg.layout_hold_seconds;

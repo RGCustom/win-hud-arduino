@@ -13,7 +13,7 @@ shkaf-hud, но под метрики Windows-PC вместо Unraid/Tautulli/qB
 context", плюс легенда для веб-интерфейса (те же /api/variables, /screens,
 что и в shkaf-hud - код screens_webui.py/templates.py переехал без правок).
 
-Два вида переменных:
+Три вида переменных:
   - "scalar" - одно значение, всегда одно и то же (cpu_pct, gpu_temp_c и т.п.)
   - "stream"/"recent"/"qbt" - REPEATING-группы: экран, использующий
     переменную такой группы, автоматически размножается ротацией на N копий
@@ -25,12 +25,23 @@ context", плюс легенда для веб-интерфейса (те же 
     metrics_qbittorrent.QbittorrentClient (qbt); pc_hud.py раз в тик кладёт
     их списки в context как context["streams"] / context["recent"] /
     context["torrents"].
+  - "mon" - ЕЩЁ ОДНА repeating-группа (см. обсуждение в чате про мониторинг
+    произвольных ресурсов) - число целей заранее неизвестно и задаётся
+    пользователем в /settings (cfg["mon_targets"]), поэтому это repeating-,
+    а не фиксированные слоты типа disk1/disk2 - экран с {mon_label}/
+    {mon_status}/... сам размножается по текущему числу настроенных целей,
+    ТЕМ ЖЕ УЖЕ ГОТОВЫМ механизмом, что и Plex/qBittorrent выше - см.
+    metrics_ping.PingMonitor.read(), pc_hud.py кладёт результат в
+    context["mon"] (список) + context["mon_down_count"]/["mon_down_names"]
+    (скалярные агрегаты, НЕ часть repeating-группы - см. mon_down_names
+    ниже за тем, как именно на нём построен авто-показ алерт-экрана).
 
 Изначально (первая версия win-hud-arduino) повторяющихся групп тут не было
 вовсе - Media/qBittorrent пласт с shkaf-hud сюда не переезжал. Позже решили
 всё же вернуть Plex (через Tautulli, а не напрямую через Plex API - готовая
 статистика по библиотекам/сеансам/недавнему это сильно упрощает) и
-qBittorrent - под них и появились "stream"/"recent"/"qbt" ниже.
+qBittorrent - под них и появились "stream"/"recent"/"qbt" ниже. Ещё позже
+добавился мониторинг произвольных ресурсов (ping/TCP-порт) - группа "mon".
 """
 
 # ---------------- структура context (для справки) ----------------
@@ -103,6 +114,17 @@ qBittorrent - под них и появились "stream"/"recent"/"qbt" ниж
 #         {"name": str, "speed": str, "eta": str},
 #         ...
 #     ],
+#
+#     # --- Мониторинг ресурсов (см. metrics_ping.PingMonitor) ---
+#     "mon_down_count": int,                # сколько целей сейчас offline (0 = все живы/целей нет)
+#     "mon_down_names": str|None,           # имена упавших через ", " - None, если всё живо
+#                                            # (на этом None построен авто-показ/скрытие
+#                                            # алерт-экрана, см. screens.py DEFAULT_SCREENS)
+#     "mon": [                              # repeating-группа "mon"
+#         {"label": str, "host": str, "status": str,  # "online"/"offline"
+#          "latency_ms": int|None, "since": str},
+#         ...
+#     ],
 # }
 
 
@@ -158,13 +180,13 @@ def _disk_field(letter_key, field):
 
 def _group_field(list_key, field):
     """
-    Универсальный резолвер для REPEATING-групп (stream/recent/qbt).
+    Универсальный резолвер для REPEATING-групп (stream/recent/qbt/mon).
     list_key - имя списка в context (context['streams']/['recent']/
-    ['torrents']), field - какое поле взять из элемента списка ПО ИНДЕКСУ
-    index. index сюда приходит от движка рендера (см. templates.render() ->
-    screens.build_active_screens(), где index пробегает 0..group_count()-1) -
-    именно index, а не сам резолвер, определяет, "какая копия" экрана сейчас
-    рендерится.
+    ['torrents']/['mon']), field - какое поле взять из элемента списка ПО
+    ИНДЕКСУ index. index сюда приходит от движка рендера (см.
+    templates.render() -> screens.build_active_screens(), где index
+    пробегает 0..group_count()-1) - именно index, а не сам резолвер,
+    определяет, "какая копия" экрана сейчас рендерится.
 
     None, если index не передан (сюда не должно доходить для repeating-
     переменной при нормальной работе screens.py, но резолверы обязаны
@@ -185,8 +207,8 @@ def _group_field(list_key, field):
 
 def _group_pos(list_key):
     """1-based позиция элемента внутри repeating-группы (stream_pos/
-    recent_pos/qbt_pos) - вызывающему код на экране обычно нужен человеческий
-    номер "2 из 3", а не 0-based index."""
+    recent_pos/qbt_pos/mon_pos) - вызывающему код на экране обычно нужен
+    человеческий номер "2 из 3", а не 0-based index."""
 
     def resolver(context, index=None):
         items = context.get(list_key) or []
@@ -199,9 +221,9 @@ def _group_pos(list_key):
 
 def _group_total(list_key):
     """Общее число элементов repeating-группы (stream_count/recent_count/
-    qbt_count) - ОДНО И ТО ЖЕ значение на каждой копии экрана, не зависит от
-    index. None при пустом списке - но практического значения это не имеет:
-    если список пуст, group_count() вернёт 0, цикл рендера в
+    qbt_count/mon_count) - ОДНО И ТО ЖЕ значение на каждой копии экрана, не
+    зависит от index. None при пустом списке - но практического значения это
+    не имеет: если список пуст, group_count() вернёт 0, цикл рендера в
     screens.build_active_screens() не выполнится ни разу, и эта ветка
     попросту не будет вызвана ни для одной копии экрана."""
 
@@ -216,7 +238,7 @@ def _group_total(list_key):
 
 # ---------------- реестр ----------------
 #
-# group: "scalar" для обычных переменных; "stream"/"recent"/"qbt" - см.
+# group: "scalar" для обычных переменных; "stream"/"recent"/"qbt"/"mon" - см.
 #         REPEATING_GROUPS/_GROUP_LIST_KEYS ниже
 # category: только для группировки легенды на /screens (buildLegend() в
 #         screens_webui.py) - общий с shkaf-hud код, категории свои
@@ -350,30 +372,61 @@ VARIABLES = {
     "qbt_eta":   {"label": "Торрент: ETA",                         "group": "qbt", "category": "qBittorrent", "resolver": _group_field("torrents", "eta")},
     "qbt_pos":   {"label": "Торрент: номер по порядку",            "group": "qbt", "category": "qBittorrent", "resolver": _group_pos("torrents")},
     "qbt_count": {"label": "Торрент: всего активных закачек сейчас","group": "qbt", "category": "qBittorrent", "resolver": _group_total("torrents")},
+
+    # --- Мониторинг ресурсов (см. metrics_ping.PingMonitor) - произвольные
+    # цели (IP/домен, опционально порт), список задаётся в /settings
+    # (cfg["mon_targets"]), число целей заранее неизвестно - поэтому
+    # REPEATING-группа "mon" по тому же принципу, что stream/recent/qbt выше,
+    # а не фиксированные слоты disk1/disk2. mon_down_count/mon_down_names -
+    # СКАЛЯРНЫЕ агрегаты (НЕ часть группы "mon", не размножают экран) -
+    # mon_down_names специально резолвится в None, когда всё живо, на этом
+    # построен авто-показ/скрытие алерт-экрана в DEFAULT_SCREENS (screens.py) -
+    # тот же общий механизм build_active_screens(), что у disk2/media Now
+    # Playing (любая None-переменная в шаблоне гасит экран) ---
+    "mon_down_count": {"label": "Мониторинг: сколько ресурсов сейчас недоступно", "group": "scalar", "category": "Мониторинг", "resolver": _scalar("mon_down_count")},
+    "mon_down_names": {"label": "Мониторинг: имена недоступных ресурсов (через запятую)", "group": "scalar", "category": "Мониторинг", "resolver": _scalar("mon_down_names")},
+
+    # --- Мониторинг: сами цели (REPEATING-группа "mon") - экран с этими
+    # переменными автоматически размножается по числу НАСТРОЕННЫХ в /settings
+    # целей (не по числу упавших - живые и упавшие ресурсы оба попадают в
+    # копии экрана, статус различает mon_status) ---
+    "mon_label":      {"label": "Ресурс: название",                  "group": "mon", "category": "Мониторинг", "resolver": _group_field("mon", "label")},
+    "mon_host":       {"label": "Ресурс: адрес (IP/домен)",           "group": "mon", "category": "Мониторинг", "resolver": _group_field("mon", "host")},
+    "mon_status":     {"label": "Ресурс: статус (online/offline)",    "group": "mon", "category": "Мониторинг", "resolver": _group_field("mon", "status")},
+    "mon_latency_ms": {"label": "Ресурс: задержка, мс (пусто, если offline)", "group": "mon", "category": "Мониторинг", "resolver": _group_field("mon", "latency_ms")},
+    "mon_since":      {"label": "Ресурс: сколько времени в текущем статусе", "group": "mon", "category": "Мониторинг", "resolver": _group_field("mon", "since")},
+    "mon_pos":        {"label": "Ресурс: номер по порядку",           "group": "mon", "category": "Мониторинг", "resolver": _group_pos("mon")},
+    "mon_count":      {"label": "Ресурс: всего настроено целей мониторинга", "group": "mon", "category": "Мониторинг", "resolver": _group_total("mon")},
 }
 
 # Порядок категорий в легенде на /screens (buildLegend() в screens_webui.py -
 # общий с shkaf-hud код, сортирует по этому списку, а не по алфавиту).
-CATEGORY_ORDER = ["Система", "GPU", "Диски", "Сеть", "Аудио", "Медиа", "Plex", "qBittorrent"]
+CATEGORY_ORDER = ["Система", "GPU", "Диски", "Сеть", "Аудио", "Медиа", "Plex", "qBittorrent", "Мониторинг"]
 
 # Repeating-группы - экран, использующий переменную такой группы,
 # автоматически размножается на N копий (см. group_count() ниже и докстринг
 # модуля выше). _GROUP_LIST_KEYS сопоставляет имя группы с ключом списка в
 # context - тот же список, что используют резолверы _group_field/_group_pos/
 # _group_total выше, просто с явным именем на стороне group_count().
-REPEATING_GROUPS = ("stream", "recent", "qbt")
+REPEATING_GROUPS = ("stream", "recent", "qbt", "mon")
 
 _GROUP_LIST_KEYS = {
     "stream": "streams",
     "recent": "recent",
     "qbt": "torrents",
+    "mon": "mon",
 }
 
 # Информационный потолок числа элементов на группу - фактическое ограничение
 # применяется на стороне источника данных (TautulliClient.ACTIVE_STREAMS_MAX/
 # RECENT_ADDED_COUNT, QbittorrentClient.ACTIVE_TORRENTS_MAX) - тут только для
 # случаев, когда потолок нужно показать/учесть на стороне веб-интерфейса.
-REPEATING_GROUP_MAX = {"stream": 6, "recent": 5, "qbt": 6}
+# У "mon" фактического потолка НЕТ (см. обсуждение в чате - "не знаю сколько
+# ресурсов буду мониторить") - число копий равно числу целей, которые
+# пользователь сам завёл в /settings, значение ниже чисто информационное
+# (на случай, если веб-интерфейсу когда-нибудь понадобится разумный дефолт
+# для UI, а не жёсткое ограничение).
+REPEATING_GROUP_MAX = {"stream": 6, "recent": 5, "qbt": 6, "mon": 20}
 
 
 def group_count(group_name, context):
@@ -382,8 +435,8 @@ def group_count(group_name, context):
     используется screens.build_active_screens() для развёртывания экрана в
     N копий (см. докстринг screens.py). 0, если group_name не repeating-
     группа (по историческим причинам - совместимость с общим screens.py) или
-    в context ещё нет соответствующего списка (Tautulli/qBittorrent ещё не
-    опрашивались ни разу - список просто отсутствует/пуст)."""
+    в context ещё нет соответствующего списка (Tautulli/qBittorrent/монитор
+    ресурсов ещё не опрашивались ни разу - список просто отсутствует/пуст)."""
     list_key = _GROUP_LIST_KEYS.get(group_name)
     if not list_key:
         return 0
@@ -404,7 +457,7 @@ def resolve(var_name, context, index=None):
 
 def legend():
     """Для веб-интерфейса: список переменных с категорией (для группировки на
-    /screens) и признаком repeating (True для stream/recent/qbt - см.
+    /screens) и признаком repeating (True для stream/recent/qbt/mon - см.
     REPEATING_GROUPS выше; на фронтенде отмечается отдельным бейджем, см.
     screens_webui.py buildLegend())."""
     return [
