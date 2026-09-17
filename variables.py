@@ -251,17 +251,20 @@ VARIABLES = {
     "ram_pct":           {"label": "Загрузка RAM, %",                      "group": "scalar", "category": "Система", "resolver": _scalar("ram_pct")},
     "ram_used_gb":       {"label": "RAM занято, GB",                       "group": "scalar", "category": "Система", "resolver": _scalar("ram_used_gb")},
     "ram_total_gb":      {"label": "RAM всего, GB",                        "group": "scalar", "category": "Система", "resolver": _scalar("ram_total_gb")},
-    "uptime":            {"label": "Аптайм Windows",                       "group": "scalar", "category": "Система", "resolver": _scalar("uptime")},
-    "container_uptime":  {"label": "Аптайм win-hud-arduino",               "group": "scalar", "category": "Система", "resolver": _scalar("container_uptime")},
-    "time_now":          {"label": "Текущее время (ЧЧ:ММ)",                "group": "scalar", "category": "Система", "resolver": _scalar("time_now")},
-    "weekday_name":      {"label": "День недели (Пн/Вт/...)",              "group": "scalar", "category": "Система", "resolver": _scalar("weekday_name")},
-    "date_now":          {"label": "Дата (ДД.ММ)",                          "group": "scalar", "category": "Система", "resolver": _scalar("date_now")},
-    "year_now":          {"label": "Год (ГГГГ)",                           "group": "scalar", "category": "Система", "resolver": _scalar("year_now")},
     "top_process_name":     {"label": "Топ-процесс: имя",             "group": "scalar", "category": "Система", "resolver": _scalar("top_process_name")},
     "top_process_cpu_pct":  {"label": "Топ-процесс: CPU, %",          "group": "scalar", "category": "Система", "resolver": _scalar("top_process_cpu_pct")},
     "top_process_ram_pct":  {"label": "Топ-процесс: RAM, %",          "group": "scalar", "category": "Система", "resolver": _scalar("top_process_ram_pct")},
-    "disk_io_read_mbps":    {"label": "Диски: чтение, MB/s",          "group": "scalar", "category": "Система", "resolver": _scalar("disk_io_read_mbps")},
-    "disk_io_write_mbps":   {"label": "Диски: запись, MB/s",          "group": "scalar", "category": "Система", "resolver": _scalar("disk_io_write_mbps")},
+
+    # --- Время и раскладка клавиатуры (вынесено из "Система" - время/дата и
+    # аптайм концептуально не про загрузку CPU/RAM, а раскладка клавиатуры
+    # сюда же просто потому, что больше ей отдельной категории не нашлось) ---
+    "uptime":            {"label": "Аптайм Windows",                       "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("uptime")},
+    "container_uptime":  {"label": "Аптайм win-hud-arduino",               "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("container_uptime")},
+    "time_now":          {"label": "Текущее время (ЧЧ:ММ)",                "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("time_now")},
+    "weekday_name":      {"label": "День недели (Пн/Вт/...)",              "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("weekday_name")},
+    "date_now":          {"label": "Дата (ДД.ММ)",                          "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("date_now")},
+    "year_now":          {"label": "Год (ГГГГ)",                           "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("year_now")},
+    "keyboard_layout":   {"label": "Раскладка клавиатуры (RU/EN и т.п.)",  "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("keyboard_layout")},
 
     # --- GPU (NVIDIA, через pynvml) ---
     "gpu_name":          {"label": "GPU: модель",                  "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_name")},
@@ -282,6 +285,8 @@ VARIABLES = {
     "disk2_used_pct":  {"label": "Диск 2: занято, %",       "group": "scalar", "category": "Диски", "resolver": _disk_field("disk2_letter", "used_pct")},
     "disk2_free_gb":   {"label": "Диск 2: свободно, GB",    "group": "scalar", "category": "Диски", "resolver": _disk_field("disk2_letter", "free_gb")},
     "disk2_total_gb":  {"label": "Диск 2: всего, GB",       "group": "scalar", "category": "Диски", "resolver": _disk_field("disk2_letter", "total_gb")},
+    "disk_io_read_mbps":    {"label": "Диски: чтение, MB/s (суммарно по всем)",  "group": "scalar", "category": "Диски", "resolver": _scalar("disk_io_read_mbps")},
+    "disk_io_write_mbps":   {"label": "Диски: запись, MB/s (суммарно по всем)",  "group": "scalar", "category": "Диски", "resolver": _scalar("disk_io_write_mbps")},
 
     # --- Сеть, слот 1 ---
     "net1_name":       {"label": "Net1: имя интерфейса",     "group": "scalar", "category": "Сеть", "resolver": _net_field("net1", "name")},
@@ -299,9 +304,6 @@ VARIABLES = {
     "vu_peak_pct":       {"label": "VU: пик громкости (звук), %",  "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_peak_pct")},
     "vu_left_pct":       {"label": "VU: левый канал, %",           "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_left_pct")},
     "vu_right_pct":      {"label": "VU: правый канал, %",          "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_right_pct")},
-
-    # --- Клавиатура ---
-    "keyboard_layout":  {"label": "Раскладка клавиатуры (RU/EN и т.п.)", "group": "scalar", "category": "Система", "resolver": _scalar("keyboard_layout")},
 
     # --- Now Playing (SMTC) - media_title/media_artist резолвятся в None,
     # если сейчас ничего не играет (включая паузу) - см. metrics_windows.MediaMonitor
@@ -401,7 +403,7 @@ VARIABLES = {
 
 # Порядок категорий в легенде на /screens (buildLegend() в screens_webui.py -
 # общий с shkaf-hud код, сортирует по этому списку, а не по алфавиту).
-CATEGORY_ORDER = ["Система", "GPU", "Диски", "Сеть", "Аудио", "Медиа", "Plex", "qBittorrent", "Мониторинг"]
+CATEGORY_ORDER = ["Система", "Время и раскладка", "GPU", "Диски", "Сеть", "Аудио", "Медиа", "Plex", "qBittorrent", "Мониторинг"]
 
 # Repeating-группы - экран, использующий переменную такой группы,
 # автоматически размножается на N копий (см. group_count() ниже и докстринг
