@@ -44,6 +44,8 @@ qBittorrent - под них и появились "stream"/"recent"/"qbt" ниж
 добавился мониторинг произвольных ресурсов (ping/TCP-порт) - группа "mon".
 """
 
+import history
+
 # ---------------- структура context (для справки) ----------------
 #
 # context = {
@@ -130,10 +132,18 @@ qBittorrent - под них и появились "stream"/"recent"/"qbt" ниж
 
 def _scalar(path):
     """path вида 'gpu_vram_used_gb' или 'net.net1.rx' - достаёт значение из
-    context по цепочке ключей (разделитель '.')."""
+    context по цепочке ключей (разделитель '.').
+
+    Третий параметр resolver'а - spec (то, что после ':' в шаблоне, см.
+    templates.render()/format_value()) - обычным скалярным переменным не
+    нужен (форматирование по spec делает format_value() ПОСЛЕ resolve(),
+    как и раньше), но сигнатура должна принимать его у ВСЕХ резолверов
+    одинаково - см. resolve() ниже, который зовёт resolver(context, index,
+    spec) без разбора, какой это резолвер. Только _graph() ниже реально
+    его использует (spec там - ширина графика, а не формат числа)."""
     keys = path.split(".")
 
-    def resolver(context, index=None):
+    def resolver(context, index=None, spec=None):
         val = context
         for k in keys:
             if val is None:
@@ -148,7 +158,7 @@ def _net_field(slot, field):
     """slot='net1'|'net2' - context['net'][slot][field], None если интерфейс
     не выбран/недоступен (аналогично shkaf-hud)."""
 
-    def resolver(context, index=None):
+    def resolver(context, index=None, spec=None):
         net = context.get("net") or {}
         entry = net.get(slot)
         if not entry:
@@ -164,7 +174,7 @@ def _disk_field(letter_key, field):
     Буква диска настраивается в веб-интерфейсе (аналог net1_iface/net2_iface),
     поэтому резолвер сам берёт актуальную букву из context['disk_slots']."""
 
-    def resolver(context, index=None):
+    def resolver(context, index=None, spec=None):
         slots = context.get("disk_slots") or {}
         letter = slots.get(letter_key)
         if not letter:
@@ -196,7 +206,7 @@ def _group_field(list_key, field):
     падать).
     """
 
-    def resolver(context, index=None):
+    def resolver(context, index=None, spec=None):
         items = context.get(list_key) or []
         if index is None or index >= len(items):
             return None
@@ -210,7 +220,7 @@ def _group_pos(list_key):
     recent_pos/qbt_pos/mon_pos) - вызывающему код на экране обычно нужен
     человеческий номер "2 из 3", а не 0-based index."""
 
-    def resolver(context, index=None):
+    def resolver(context, index=None, spec=None):
         items = context.get(list_key) or []
         if index is None or index >= len(items):
             return None
@@ -227,11 +237,54 @@ def _group_total(list_key):
     screens.build_active_screens() не выполнится ни разу, и эта ветка
     попросту не будет вызвана ни для одной копии экрана."""
 
-    def resolver(context, index=None):
+    def resolver(context, index=None, spec=None):
         items = context.get(list_key) or []
         if not items:
             return None
         return len(items)
+
+    return resolver
+
+
+def _graph(metric_key):
+    """
+    Резолвер для мини-графика (спарклайна) одной метрики за последние
+    history.DEFAULT_WINDOW_SECONDS секунд - см. history.py за тем, как
+    именно строится строка (control-байты 1-8, не печатные символы - см.
+    докстринг history.py про drawLineWithBars() на стороне прошивки).
+
+    metric_key - ключ, под которым pc_hud.py пишет сэмплы в общий
+    history.MetricHistory (см. metrics_main_loop там же) - ОДИН И ТОТ ЖЕ
+    набор ключей, что уже используется в common_metrics для ленты
+    (cpu/ram/gpu/gpu_vram/disk1/disk2/net/vu_peak), поэтому здесь не нужно
+    заново решать, как получить значение - просто спрашиваем готовую
+    историю по тому же ключу.
+
+    В отличие от остальных резолверов в этом файле, _graph() РЕАЛЬНО
+    использует третий параметр (spec) - это то, что стоит после ':' в
+    шаблоне ({cpu_graph:8} -> spec="8") и здесь означает ШИРИНУ графика в
+    символах, а НЕ формат числа, как обычно для скалярных переменных. Раз
+    _graph() сам возвращает строку уже ровно нужной длины, последующий
+    format_value() в templates.py (который тоже смотрит на тот же spec)
+    не меняет результат - его обычная ветка "обрезать/дополнить до N
+    символов" получает строку, которая уже равна N, и просто возвращает её
+    как есть. {cpu_graph} без spec - ширина history.DEFAULT_WIDTH.
+
+    instance MetricHistory лежит в context["metric_history"] - пишет его
+    туда pc_hud.py (см. metrics_main_loop) один раз на тик, как и
+    "disk_slots"/"my_plex_user" - служебные, не-переменные ключи context,
+    нужные только избранным резолверам, а не переменная шаблона сама по
+    себе."""
+
+    def resolver(context, index=None, spec=None):
+        hist = context.get("metric_history")
+        if hist is None:
+            return None
+        if spec is not None and spec.isdigit():
+            width = int(spec)
+        else:
+            width = history.DEFAULT_WIDTH
+        return hist.sparkline(metric_key, width=width)
 
     return resolver
 
@@ -246,47 +299,48 @@ def _group_total(list_key):
 VARIABLES = {
     # --- CPU / RAM ---
     "cpu_pct":          {"label": "Загрузка CPU, %",                       "group": "scalar", "category": "Система", "resolver": _scalar("cpu_pct")},
+    "cpu_graph":        {"label": "Загрузка CPU: мини-график (спарклайн)",  "group": "scalar", "category": "Система", "resolver": _graph("cpu")},
     "cpu_pct_core_max":  {"label": "Загрузка самого нагруженного ядра, %",  "group": "scalar", "category": "Система", "resolver": _scalar("cpu_pct_core_max")},
     "cpu_freq_mhz":      {"label": "Частота CPU, МГц (среднее по ядрам)",   "group": "scalar", "category": "Система", "resolver": _scalar("cpu_freq_mhz")},
     "ram_pct":           {"label": "Загрузка RAM, %",                      "group": "scalar", "category": "Система", "resolver": _scalar("ram_pct")},
+    "ram_graph":         {"label": "Загрузка RAM: мини-график (спарклайн)", "group": "scalar", "category": "Система", "resolver": _graph("ram")},
     "ram_used_gb":       {"label": "RAM занято, GB",                       "group": "scalar", "category": "Система", "resolver": _scalar("ram_used_gb")},
     "ram_total_gb":      {"label": "RAM всего, GB",                        "group": "scalar", "category": "Система", "resolver": _scalar("ram_total_gb")},
+    "uptime":            {"label": "Аптайм Windows",                       "group": "scalar", "category": "Система", "resolver": _scalar("uptime")},
+    "container_uptime":  {"label": "Аптайм win-hud-arduino",               "group": "scalar", "category": "Система", "resolver": _scalar("container_uptime")},
+    "time_now":          {"label": "Текущее время (ЧЧ:ММ)",                "group": "scalar", "category": "Система", "resolver": _scalar("time_now")},
+    "weekday_name":      {"label": "День недели (Пн/Вт/...)",              "group": "scalar", "category": "Система", "resolver": _scalar("weekday_name")},
+    "date_now":          {"label": "Дата (ДД.ММ)",                          "group": "scalar", "category": "Система", "resolver": _scalar("date_now")},
+    "year_now":          {"label": "Год (ГГГГ)",                           "group": "scalar", "category": "Система", "resolver": _scalar("year_now")},
     "top_process_name":     {"label": "Топ-процесс: имя",             "group": "scalar", "category": "Система", "resolver": _scalar("top_process_name")},
     "top_process_cpu_pct":  {"label": "Топ-процесс: CPU, %",          "group": "scalar", "category": "Система", "resolver": _scalar("top_process_cpu_pct")},
     "top_process_ram_pct":  {"label": "Топ-процесс: RAM, %",          "group": "scalar", "category": "Система", "resolver": _scalar("top_process_ram_pct")},
-
-    # --- Время и раскладка клавиатуры (вынесено из "Система" - время/дата и
-    # аптайм концептуально не про загрузку CPU/RAM, а раскладка клавиатуры
-    # сюда же просто потому, что больше ей отдельной категории не нашлось) ---
-    "uptime":            {"label": "Аптайм Windows",                       "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("uptime")},
-    "container_uptime":  {"label": "Аптайм win-hud-arduino",               "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("container_uptime")},
-    "time_now":          {"label": "Текущее время (ЧЧ:ММ)",                "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("time_now")},
-    "weekday_name":      {"label": "День недели (Пн/Вт/...)",              "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("weekday_name")},
-    "date_now":          {"label": "Дата (ДД.ММ)",                          "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("date_now")},
-    "year_now":          {"label": "Год (ГГГГ)",                           "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("year_now")},
-    "keyboard_layout":   {"label": "Раскладка клавиатуры (RU/EN и т.п.)",  "group": "scalar", "category": "Время и раскладка", "resolver": _scalar("keyboard_layout")},
+    "disk_io_read_mbps":    {"label": "Диски: чтение, MB/s",          "group": "scalar", "category": "Система", "resolver": _scalar("disk_io_read_mbps")},
+    "disk_io_write_mbps":   {"label": "Диски: запись, MB/s",          "group": "scalar", "category": "Система", "resolver": _scalar("disk_io_write_mbps")},
 
     # --- GPU (NVIDIA, через pynvml) ---
     "gpu_name":          {"label": "GPU: модель",                  "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_name")},
     "gpu_pct":           {"label": "GPU: загрузка, %",             "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_pct")},
+    "gpu_graph":         {"label": "GPU: мини-график загрузки (спарклайн)", "group": "scalar", "category": "GPU", "resolver": _graph("gpu")},
     "gpu_temp_c":        {"label": "GPU: температура, °C",         "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_temp_c")},
     "gpu_vram_used_gb":  {"label": "GPU: VRAM занято, GB",         "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_vram_used_gb")},
     "gpu_vram_total_gb": {"label": "GPU: VRAM всего, GB",          "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_vram_total_gb")},
     "gpu_vram_pct":      {"label": "GPU: VRAM занято, %",          "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_vram_pct")},
+    "gpu_vram_graph":    {"label": "GPU: мини-график VRAM (спарклайн)",     "group": "scalar", "category": "GPU", "resolver": _graph("gpu_vram")},
     "gpu_power_w":       {"label": "GPU: потребление, Вт",         "group": "scalar", "category": "GPU", "resolver": _scalar("gpu_power_w")},
 
     # --- Диски (буквы дисков настраиваются в веб-интерфейсе, аналог net1/net2) ---
-    "disk1_letter":    {"label": "Диск 1: буква",           "group": "scalar", "category": "Диски", "resolver": lambda ctx, index=None: (ctx.get("disk_slots") or {}).get("disk1_letter")},
+    "disk1_letter":    {"label": "Диск 1: буква",           "group": "scalar", "category": "Диски", "resolver": lambda ctx, index=None, spec=None: (ctx.get("disk_slots") or {}).get("disk1_letter")},
     "disk1_used_pct":  {"label": "Диск 1: занято, %",       "group": "scalar", "category": "Диски", "resolver": _disk_field("disk1_letter", "used_pct")},
+    "disk1_graph":     {"label": "Диск 1: мини-график занятости (спарклайн)", "group": "scalar", "category": "Диски", "resolver": _graph("disk1")},
     "disk1_free_gb":   {"label": "Диск 1: свободно, GB",    "group": "scalar", "category": "Диски", "resolver": _disk_field("disk1_letter", "free_gb")},
     "disk1_total_gb":  {"label": "Диск 1: всего, GB",       "group": "scalar", "category": "Диски", "resolver": _disk_field("disk1_letter", "total_gb")},
 
-    "disk2_letter":    {"label": "Диск 2: буква",           "group": "scalar", "category": "Диски", "resolver": lambda ctx, index=None: (ctx.get("disk_slots") or {}).get("disk2_letter")},
+    "disk2_letter":    {"label": "Диск 2: буква",           "group": "scalar", "category": "Диски", "resolver": lambda ctx, index=None, spec=None: (ctx.get("disk_slots") or {}).get("disk2_letter")},
     "disk2_used_pct":  {"label": "Диск 2: занято, %",       "group": "scalar", "category": "Диски", "resolver": _disk_field("disk2_letter", "used_pct")},
+    "disk2_graph":     {"label": "Диск 2: мини-график занятости (спарклайн)", "group": "scalar", "category": "Диски", "resolver": _graph("disk2")},
     "disk2_free_gb":   {"label": "Диск 2: свободно, GB",    "group": "scalar", "category": "Диски", "resolver": _disk_field("disk2_letter", "free_gb")},
     "disk2_total_gb":  {"label": "Диск 2: всего, GB",       "group": "scalar", "category": "Диски", "resolver": _disk_field("disk2_letter", "total_gb")},
-    "disk_io_read_mbps":    {"label": "Диски: чтение, MB/s (суммарно по всем)",  "group": "scalar", "category": "Диски", "resolver": _scalar("disk_io_read_mbps")},
-    "disk_io_write_mbps":   {"label": "Диски: запись, MB/s (суммарно по всем)",  "group": "scalar", "category": "Диски", "resolver": _scalar("disk_io_write_mbps")},
 
     # --- Сеть, слот 1 ---
     "net1_name":       {"label": "Net1: имя интерфейса",     "group": "scalar", "category": "Сеть", "resolver": _net_field("net1", "name")},
@@ -295,6 +349,10 @@ VARIABLES = {
     "net1_tx":         {"label": "Net1: исходящая скорость", "group": "scalar", "category": "Сеть", "resolver": _net_field("net1", "tx")},
     "net1_total_rx":   {"label": "Net1: накоплено принято (с запуска)", "group": "scalar", "category": "Сеть", "resolver": _net_field("net1", "total_rx")},
     "net1_total_tx":   {"label": "Net1: накоплено отдано (с запуска)",  "group": "scalar", "category": "Сеть", "resolver": _net_field("net1", "total_tx")},
+    # net_graph - та же метрика (% от cfg["NET_MAX_MBPS"]), что использует
+    # LED-полоса "net" (см. BAR_METRICS в pc_hud.py) - НЕ отдельная история
+    # ради этой переменной, тот же ключ "net" в общем MetricHistory.
+    "net_graph":       {"label": "Net1: мини-график загрузки линка (спарклайн)", "group": "scalar", "category": "Сеть", "resolver": _graph("net")},
 
     # --- Аудио (энкодер на плате крутит системную громкость, клик - настраиваемое
     # действие в /settings: mute/unmute, переключение устройства вывода и т.п.) ---
@@ -302,8 +360,12 @@ VARIABLES = {
     "volume_muted":     {"label": "Звук выключен (да/нет)",        "group": "scalar", "category": "Аудио", "resolver": _scalar("volume_muted")},
     "audio_device_name": {"label": "Устройство вывода звука",      "group": "scalar", "category": "Аудио", "resolver": _scalar("audio_device_name")},
     "vu_peak_pct":       {"label": "VU: пик громкости (звук), %",  "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_peak_pct")},
+    "vu_graph":          {"label": "VU: мини-график пика громкости (спарклайн)", "group": "scalar", "category": "Аудио", "resolver": _graph("vu_peak")},
     "vu_left_pct":       {"label": "VU: левый канал, %",           "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_left_pct")},
     "vu_right_pct":      {"label": "VU: правый канал, %",          "group": "scalar", "category": "Аудио", "resolver": _scalar("vu_right_pct")},
+
+    # --- Клавиатура ---
+    "keyboard_layout":  {"label": "Раскладка клавиатуры (RU/EN и т.п.)", "group": "scalar", "category": "Система", "resolver": _scalar("keyboard_layout")},
 
     # --- Now Playing (SMTC) - media_title/media_artist резолвятся в None,
     # если сейчас ничего не играет (включая паузу) - см. metrics_windows.MediaMonitor
@@ -403,7 +465,7 @@ VARIABLES = {
 
 # Порядок категорий в легенде на /screens (buildLegend() в screens_webui.py -
 # общий с shkaf-hud код, сортирует по этому списку, а не по алфавиту).
-CATEGORY_ORDER = ["Система", "Время и раскладка", "GPU", "Диски", "Сеть", "Аудио", "Медиа", "Plex", "qBittorrent", "Мониторинг"]
+CATEGORY_ORDER = ["Система", "GPU", "Диски", "Сеть", "Аудио", "Медиа", "Plex", "qBittorrent", "Мониторинг"]
 
 # Repeating-группы - экран, использующий переменную такой группы,
 # автоматически размножается на N копий (см. group_count() ниже и докстринг
@@ -445,14 +507,25 @@ def group_count(group_name, context):
     return len(context.get(list_key) or [])
 
 
-def resolve(var_name, context, index=None):
+def resolve(var_name, context, index=None, spec=None):
     """Достать значение переменной. Возвращает None, если переменной нет
-    в реестре, либо данных сейчас нет (например net2/диск2 не выбран)."""
-    spec = VARIABLES.get(var_name)
-    if spec is None:
+    в реестре, либо данных сейчас нет (например net2/диск2 не выбран).
+
+    spec - то, что стоит после ':' в шаблоне ({var:spec}, см.
+    templates.parse_template()) - большинству резолверов не нужен вовсе
+    (форматирование по нему делает templates.format_value() ПОСЛЕ
+    resolve(), как и раньше), но с недавних пор ЕСТЬ исключение - _graph()
+    (см. выше) использует его как ширину графика, а не формат числа,
+    поэтому templates.render() теперь передаёт spec сюда всегда, а не
+    только format_value(). Именование параметра spec совпадает с
+    одноимённой переменной в VARIABLES.get() ниже случайно - тут это
+    аргумент функции, там - имя локальной переменной для найденной записи
+    реестра; чтобы не путать, запись реестра переименована в var_spec."""
+    var_spec = VARIABLES.get(var_name)
+    if var_spec is None:
         return None
     try:
-        return spec["resolver"](context, index)
+        return var_spec["resolver"](context, index, spec)
     except Exception:
         return None
 

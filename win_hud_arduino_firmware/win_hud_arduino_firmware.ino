@@ -24,6 +24,17 @@
     (шлётся только то, что изменилось - см. protocol.ProtocolState).
     CAL             - отдельная команда (не key:value) - запускает калибровку.
 
+    Внутри L1/L2/L3 отдельно кодируются мини-графики (спарклайны CPU/RAM/
+    GPU/... - см. history.py/variables.py на хосте): байты со значением
+    0x01-0x08 (8 уровней высоты) - это НЕ текст, а "нарисуй столбик такой-то
+    высоты" - см. drawLineBars() ниже. Эти значения физически не встречаются
+    в обычном ASCII/UTF-8/кириллическом тексте, поэтому отдельный маркер
+    начала/конца не нужен - прошивка сама переключается между "печатать
+    текст" и "рисовать столбик" по диапазону байта, символ за символом.
+    0x00 в этот диапазон НЕ входит НАМЕРЕННО - это terminator C-строки
+    (см. serialBuf/processCommandLine ниже), использовать его как код
+    столбика было бы опасно.
+
   ---- Исходящий протокол (плата -> хост), НОВОЕ относительно shkaf-hud ----
     ENC:<+N|-N>     - энкодер повернули на N "кликов" с прошлой отправки
     BTN:CLICK       - клик кнопки энкодера
@@ -108,6 +119,14 @@
 #define OLED_SCROLL_INTERVAL_MS 60
 #define OLED_SCROLL_GAP_PX      20   // пробел между концом строки и её повтором при скролле
 
+// Высота столбика мини-графика (см. drawLineBars() ниже) в пикселях -
+// растёт вверх ОТ baseline строки (та же Y-координата, что раньше шла
+// напрямую в drawUTF8()), поэтому не должна быть больше межстрочного
+// интервала (OLED_LINE_Y1-OLED_LINE_Y0 = 20px выше) минус запас на нижние
+// выносные элементы соседних глифов (хвостики у "р"/"у" и т.п.) - 10px с
+// таким запасом работает при любом из шрифтов oledFont() ниже.
+#define GRAPH_BAR_MAX_HEIGHT_PX 10
+
 #define ENCODER_FLUSH_INTERVAL_MS 30   // как часто слать накопленный ENC: хосту
 #define BUTTON_DEBOUNCE_MS 40
 
@@ -152,6 +171,26 @@ const uint8_t *oledFont() {
     case 3: return u8g2_font_8x13_t_cyrillic;
     case 4: return u8g2_font_9x15_t_cyrillic;
     default: return u8g2_font_10x20_t_cyrillic;  // case 2 / фолбэк
+  }
+}
+
+// Ширина одной "ячейки" столбика графика (см. drawLineBars() ниже), px -
+// ПЕРВОЕ число в имени шрифта из oledFont() выше (шрифты u8g2 названы как
+// "<ширина>x<высота>", моноширинные для латиницы/цифр) - держим её здесь
+// синхронно с OLED_FONT_SIZE вручную (не читаем из u8g2 программно - метод
+// вроде getMaxCharWidth() существует, но у транспарентных "_t_" шрифтов
+// возвращает не то, что нужно для моноширинной раскладки цифр/латиницы;
+// проще и надёжнее явное соответствие таблице выше). Столбики выравниваются
+// по той же сетке, что и текст - на хосте {cpu_graph:8} и так уже думает в
+// "символах", не пикселях (см. history.py/templates.py), поэтому колонка
+// столбика ДОЛЖНА совпадать по ширине с колонкой обычного символа.
+uint8_t oledCharWidthPx() {
+  switch (OLED_FONT_SIZE) {
+    case 0: return 6;
+    case 1: return 6;
+    case 3: return 8;
+    case 4: return 9;
+    default: return 10;  // case 2
   }
 }
 
@@ -434,6 +473,92 @@ void flushEncoder() {
   }
 }
 
+// ---------------- OLED: столбики графика внутри строки (см. докстринг ----
+// ---------------- модуля "Входящий протокол" за форматом) ----------------
+
+// Замеряет ширину строки в пикселях, УЧИТЫВАЯ столбики графика (control-
+// байты 0x01-0x08) - НЕ рисует ничего, только считает. Нужна отдельно от
+// drawLineBars() ниже (которая и рисует, и попутно тоже могла бы вернуть
+// ширину), потому что updateScroll() должен знать ширину строки КАЖДЫЙ
+// вызов (60мс, см. OLED_SCROLL_INTERVAL_MS), а рисовать в этот момент
+// ничего не нужно - drawOled() и так перерисует буфер отдельно, только
+// когда oledDirty (см. loop() ниже за экономией на этом).
+int16_t lineWidthPx(const char *line) {
+  const uint8_t *p = (const uint8_t *)line;
+  int16_t width = 0;
+  uint8_t cellW = oledCharWidthPx();
+
+  while (*p) {
+    if (*p >= 1 && *p <= 8) {
+      while (*p >= 1 && *p <= 8) {
+        width += cellW;
+        p++;
+      }
+    } else {
+      // Кусок обычного текста между двумя прогонами столбиков (либо вся
+      // строка целиком, если столбиков в ней нет) - до следующего
+      // control-байта 1-8 или конца строки. 40 байт с большим запасом
+      // относительно того, что реально шлёт хост в ОДНОМ текстовом куске
+      // одной OLED-строки (см. _center_line(width=16) в osd.py на хосте -
+      // весь дизайн шаблонов рассчитан на 16-символьную сетку) - НЕ делаем
+      // буфер большим "на всякий случай": это стек ATmega32u4 (2.5KB RAM
+      // всего), а lineWidthPx()/drawLineBars() вызываются из u8g2-цикла
+      // firstPage()/nextPage(), не рекурсивно, но с обычным вызовом на
+      // каждую из 3 строк за кадр - раздувать локальный буфер тут дорого.
+      char buf[40];
+      uint16_t n = 0;
+      while (*p && !(*p >= 1 && *p <= 8) && n < sizeof(buf) - 1) {
+        buf[n++] = *p++;
+      }
+      buf[n] = '\0';
+      width += u8g2.getUTF8Width(buf);
+    }
+  }
+  return width;
+}
+
+// Печатает ОДНУ OLED-строку начиная с колонки x0, поддерживая столбики
+// графика ВНУТРИ текста - см. докстринг модуля "Входящий протокол" за
+// форматом control-байтов. Обычный текст печатается как раньше, через
+// u8g2.drawUTF8() (она уже умеет многобайтовый UTF-8 - см. ⚠/↓/↑ в
+// дефолтных экранах на хосте, кириллицу через шрифты *_cyrillic - здесь
+// ничего не меняется, просто вызывается кусками между столбиками, а не на
+// всю строку разом). baseline_y - та же Y-координата, что раньше шла
+// напрямую в drawUTF8() из drawOled() (см. ниже) - столбик растёт ВВЕРХ от
+// неё на высоту level/8 * GRAPH_BAR_MAX_HEIGHT_PX.
+void drawLineBars(int16_t x0, int16_t baseline_y, const char *line) {
+  const uint8_t *p = (const uint8_t *)line;
+  int16_t x = x0;
+  uint8_t cellW = oledCharWidthPx();
+
+  while (*p) {
+    if (*p >= 1 && *p <= 8) {
+      while (*p >= 1 && *p <= 8) {
+        uint8_t h = ((uint16_t)(*p) * GRAPH_BAR_MAX_HEIGHT_PX) / 8;
+        if (h > 0) {
+          // Столбик по центру своей ячейки (не на всю ширину cellW) -
+          // визуально ближе к классическому спарклайну (тонкие штрихи), чем
+          // сплошная заливка "стена к стене"; drawVLine(x,y,h) рисует ВНИЗ
+          // от y, поэтому верхний край считаем от baseline_y так, чтобы
+          // низ столбика лёг ровно на baseline (как и текст рядом).
+          u8g2.drawVLine(x + cellW / 2, baseline_y - h + 1, h);
+        }
+        x += cellW;
+        p++;
+      }
+    } else {
+      char buf[40];  // см. обоснование размера в lineWidthPx() выше
+      uint16_t n = 0;
+      while (*p && !(*p >= 1 && *p <= 8) && n < sizeof(buf) - 1) {
+        buf[n++] = *p++;
+      }
+      buf[n] = '\0';
+      u8g2.drawUTF8(x, baseline_y, buf);
+      x += u8g2.getUTF8Width(buf);
+    }
+  }
+}
+
 // ---------------- OLED: отрисовка со скроллом длинных строк ----------------
 
 void drawOled() {
@@ -443,15 +568,15 @@ void drawOled() {
     const int16_t yPos[3] = {OLED_LINE_Y0, OLED_LINE_Y1, OLED_LINE_Y2};
     for (uint8_t i = 0; i < 3; i++) {
       if (oledLines[i].length() == 0) continue;
-      int16_t textWidth = u8g2.getUTF8Width(oledLines[i].c_str());
+      int16_t textWidth = lineWidthPx(oledLines[i].c_str());
       if (textWidth <= OLED_WIDTH_PX) {
         // короткая строка - печатаем статично, без скролла
-        u8g2.drawUTF8(0, yPos[i], oledLines[i].c_str());
+        drawLineBars(0, yPos[i], oledLines[i].c_str());
       } else {
         // длинная строка - скроллим влево, зацикливая через OLED_SCROLL_GAP_PX
         int16_t x = -scrollOffset[i];
-        u8g2.drawUTF8(x, yPos[i], oledLines[i].c_str());
-        u8g2.drawUTF8(x + textWidth + OLED_SCROLL_GAP_PX, yPos[i], oledLines[i].c_str());
+        drawLineBars(x, yPos[i], oledLines[i].c_str());
+        drawLineBars(x + textWidth + OLED_SCROLL_GAP_PX, yPos[i], oledLines[i].c_str());
       }
     }
   } while (u8g2.nextPage());
@@ -464,7 +589,7 @@ void updateScroll() {
 
   for (uint8_t i = 0; i < 3; i++) {
     if (oledLines[i].length() == 0) continue;
-    int16_t textWidth = u8g2.getUTF8Width(oledLines[i].c_str());
+    int16_t textWidth = lineWidthPx(oledLines[i].c_str());
     if (textWidth <= OLED_WIDTH_PX) {
       scrollOffset[i] = 0;
       continue;

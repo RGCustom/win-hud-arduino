@@ -23,6 +23,13 @@ variables.py, этот файл её не касается.
     "Vol {volume_pct}% {volume_muted}"
     "{keyboard_layout} {time_now}"
     "{audio_device_name:-16}"   - последние 16 символов имени устройства
+    "{cpu_graph:8}"             - мини-график CPU из 8 столбиков (см.
+                                  variables._graph()/history.py) - для
+                                  *_graph переменных spec означает ШИРИНУ
+                                  графика в символах, а не формат числа,
+                                  это единственное исключение из правил
+                                  выше; без spec - ширина по умолчанию
+                                  (history.DEFAULT_WIDTH)
 
 Если хоть одна переменная в шаблоне не резолвится (None - например net2/диск2
 не выбран) - render() возвращает all_resolved=False, чтобы screens.py мог
@@ -89,7 +96,15 @@ def render(template: str, context: dict, index=None):
             out.append(tok[1])
         else:
             _, name, spec = tok
-            value = variables.resolve(name, context, index)
+            # spec (то, что после ':' в {var:spec}) теперь передаётся и в
+            # resolve(), не только в format_value() ниже - см. variables._graph()
+            # и обсуждение в чате: для обычных скалярных переменных resolve()
+            # его просто игнорирует (форматирование по-прежнему делает
+            # format_value()), но для *_graph переменных spec означает ШИРИНУ
+            # графика в символах, а не формат числа - решать это должен сам
+            # резолвер (variables.py), не templates.py, поэтому spec просто
+            # прокидывается насквозь, без интерпретации тут.
+            value = variables.resolve(name, context, index, spec)
             if value is None:
                 all_resolved = False
                 out.append("")

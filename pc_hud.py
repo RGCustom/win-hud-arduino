@@ -96,6 +96,7 @@ import settings_webui
 import protocol
 import ledbar
 import osd
+import history
 import metrics_windows
 import metrics_tautulli
 import metrics_qbittorrent
@@ -1570,6 +1571,13 @@ def metrics_main_loop(stop_event):
     rotation = screens.RotationState()
     proto = protocol.ProtocolState(full_resync_seconds=FULL_RESYNC_SECONDS)
 
+    # История для мини-графиков (cpu_graph/ram_graph/... на OLED, см.
+    # history.py/variables._graph()) - один инстанс на процесс, живёт тут
+    # же, где peak_trackers/rotation/osd_manager - состояние между тиками
+    # главного цикла, персистентность на диск не нужна (график истории
+    # теряется при перезапуске приложения, как и peak hold).
+    metric_history = history.MetricHistory()
+
     common_metrics = {
         "cpu": 0.0, "ram": 0.0, "gpu": 0.0, "gpu_vram": 0.0, "disk1": 0.0, "disk2": 0.0, "net": 0.0,
         "vu_peak": 0.0, "vu_left": 0.0, "vu_right": 0.0,
@@ -1797,6 +1805,16 @@ def metrics_main_loop(stop_event):
             integrations = get_integrations_state()
             monitor_state = get_monitor_state()
 
+            # Захватываем последнее посчитанное VU-значение ДО того, как
+            # common_metrics будет переприсвоен целиком ниже - сам блок VU
+            # находится ПОСЛЕ медленных метрик по циклу (см. комментарий там
+            # же про "иначе vu-ключи терялись бы") и обновляет common_metrics
+            # каждый БЫСТРЫЙ тик, а не раз в POLL_INTERVAL - у истории графика
+            # (см. ниже) для минутного тренда более частая запись не нужна,
+            # хватает того же ритма, что и у cpu/ram/gpu. Лаг в один тик
+            # (~TICK_INTERVAL) для минутного графика незначим.
+            prev_vu_peak = common_metrics.get("vu_peak", 0.0)
+
             common_metrics = {
                 "cpu": cpu_pct, "ram": ram_pct,
                 "gpu": gpu_stats["gpu_pct"], "gpu_vram": gpu_stats["gpu_vram_pct"],
@@ -1804,6 +1822,19 @@ def metrics_main_loop(stop_event):
                 "disk2": disk2["used_pct"] if disk2 else 0.0,
                 "net": net_pct,
             }
+
+            # История для мини-графиков (cpu_graph/ram_graph/... - см.
+            # history.py/variables._graph()) - раз в POLL_INTERVAL, тем же
+            # ритмом, что и сами common_metrics выше (а не каждый быстрый
+            # тик, как VU для ленты) - при том же размере буфера
+            # (history._BUFFER_MAXLEN) это даёт заметно больший реальный
+            # охват по времени, а минутному тренду секундная точность
+            # избыточна. Простой цикл по common_metrics.items() автоматически
+            # подхватит любую метрику, которую добавят сюда в будущем -
+            # отдельного списка ключей поддерживать не нужно.
+            for metric_key, metric_value in common_metrics.items():
+                metric_history.record(metric_key, metric_value, now=now)
+            metric_history.record("vu_peak", prev_vu_peak, now=now)
 
             context = {
                 "cpu_pct": round(cpu_pct), "cpu_pct_core_max": round(cpu_pct_core_max),
@@ -1849,6 +1880,13 @@ def metrics_main_loop(stop_event):
                 # "stream" (см. обсуждение в чате про "свой/чужой Plex-сеанс"
                 # и докстринг build_active_screens() в screens.py).
                 "my_plex_user": cfg.get("my_plex_user", ""),
+                # metric_history - тот же служебный, не-переменная-шаблона
+                # ключ context, что и my_plex_user выше - используется ТОЛЬКО
+                # резолверами *_graph (см. variables._graph()) для доступа к
+                # накопленной истории cpu/ram/gpu/... за последние секунды,
+                # сам по себе переменной шаблона не является и в легенде на
+                # /screens не появится (не зарегистрирован в variables.VARIABLES).
+                "metric_history": metric_history,
                 # Plex (через Tautulli) + qBittorrent - integrations уже
                 # содержит РОВНО те ключи, что ожидают резолверы variables.py
                 # (plex_*/streams/recent/qbt_*/torrents) - см.
