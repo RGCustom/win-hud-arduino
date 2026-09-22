@@ -541,7 +541,7 @@ void drawLineBars(int16_t x0, int16_t baseline_y, const char *line) {
           // сплошная заливка "стена к стене"; drawVLine(x,y,h) рисует ВНИЗ
           // от y, поэтому верхний край считаем от baseline_y так, чтобы
           // низ столбика лёг ровно на baseline (как и текст рядом).
-          u8g2.drawVLine(x + cellW / 2, baseline_y - h + 1, h);
+          u8g2.drawBox(x, baseline_y - h + 1, cellW - 1, h);
         }
         x += cellW;
         p++;
