@@ -200,6 +200,14 @@ DEFAULT_ENCODER = {
     "warning_color": "FFA500",
     "warning_threshold_pct": 95,
     "volume_colors": {"c1": "00FF42", "c2": "FFF600", "c3": "FF0000"},
+    # В каком из четырёх режимов ленты (classic/center/edges/flat, см.
+    # BAR_MODES ниже и ledbar.compute_volume_osd_pixels()) рисовать OSD
+    # громкости - ОТДЕЛЬНАЯ настройка от режима обычной метрики
+    # (cfg["mode"]["bar0"]) - раньше OSD ВСЕГДА рисовался как center,
+    # независимо от того, что выбрано для метрики (см. обсуждение в чате).
+    # Дефолт "center" - прежнее поведение без изменений для тех, кто ещё не
+    # трогал эту настройку.
+    "osd_bar_mode": "center",
 }
 
 # ---- OSD-очередь (см. osd.py/класс OsdManager и обсуждение в чате про
@@ -1513,6 +1521,8 @@ def api_encoder():
             for stop in ("c1", "c2", "c3"):
                 if stop in body["volume_colors"]:
                     enc["volume_colors"][stop] = body["volume_colors"][stop].upper()
+        if "osd_bar_mode" in body and body["osd_bar_mode"] in BAR_MODES:
+            enc["osd_bar_mode"] = body["osd_bar_mode"]
         save_settings(state["cfg"])
     return jsonify({"ok": True})
 
@@ -1607,12 +1617,33 @@ def metrics_main_loop(stop_event):
     # триггеров - НЕ событие, а сравнение значения тик-к-тику). None -
     # "ещё не было ни одного успешного чтения" - первый тик после старта
     # процесса НЕ должен триггерить popup (иначе при запуске мигнёт
-    # бесполезный "сменили на текущий язык/устройство"). Обновляются внутри
-    # блока медленных метрик ниже - keyboard_layout/audio_device_name
-    # читаются именно там, не каждый тик.
+    # бесполезный "сменили на текущий язык/устройство").
+    #
+    # ВАЖНО: раскладка клавиатуры (watched_layout/watched_layout_pid)
+    # проверяется КАЖДЫЙ тик главного цикла (см. блок сразу после чтения
+    # serial ниже), А НЕ раз в POLL_INTERVAL, как остальные метрики -
+    # иначе OSD-попап смены раскладки ощутимо запаздывал (до POLL_INTERVAL
+    # секунд, по умолчанию 1с) относительно реального переключения языка -
+    # в отличие от энкодера (событие с платы, тоже разбирается каждый тик),
+    # раскладка - watched-value diff, и её нужно было явно вынести из
+    # "медленного" блока, чтобы popup срабатывал так же быстро. Само чтение
+    # (GetForegroundWindow/GetKeyboardLayout, см.
+    # metrics_windows.read_keyboard_state()) - пара дешёвых системных
+    # вызовов, лишней нагрузки на TICK_INTERVAL (~25Гц по умолчанию) не
+    # создаёт.
+    #
+    # audio_device_name (watched_device_name) остаётся на прежнем ритме -
+    # раз в POLL_INTERVAL, внутри блока медленных метрик ниже: смена
+    # устройства вывода не настолько срочное событие (см. её низкий
+    # приоритет в osd.OSD_TYPES), и её чтение (pycaw) заметно тяжелее
+    # простого чтения раскладки.
     watched_layout = None
     watched_layout_pid = None
     watched_device_name = None
+    # Последнее прочитанное значение раскладки - обновляется каждый тик (см.
+    # ниже), используется при сборке context() внутри медленного блока -
+    # чтобы не читать его там ещё раз.
+    keyboard_layout = None
 
     last_metrics_tick = 0.0
     # last_vu_time - ОТДЕЛЬНЫЙ от last_metrics_tick таймер: VU обновляется
@@ -1693,6 +1724,33 @@ def metrics_main_loop(stop_event):
                     state["serial_connected"] = False
                 last_reconnect_attempt = now
 
+        # ---- раскладка клавиатуры: КАЖДЫЙ тик, НЕ раз в POLL_INTERVAL -
+        # см. подробное обоснование у объявления watched_layout выше (без
+        # этого попап смены раскладки запаздывал на секунду и более).
+        # watched-value diff - та же логика 1-в-1, что раньше жила внутри
+        # блока медленных метрик, просто перенесена сюда, чтобы срабатывать
+        # с частотой TICK_INTERVAL, а не POLL_INTERVAL.
+        keyboard_state = metrics_windows.read_keyboard_state()
+        keyboard_layout = keyboard_state["keyboard_layout"]
+        foreground_pid = keyboard_state["foreground_pid"]
+
+        # ---- watched-value diff: раскладка клавиатуры (см. osd.py) -
+        # триггерим popup, только если раскладка ДЕЙСТВИТЕЛЬНО сменилась
+        # (не первый тик после старта - watched_layout is not None) И
+        # foreground_pid НЕ изменился одновременно с ней - иначе это не
+        # реальное переключение языка, а alt-tab между окнами с разной
+        # per-window раскладкой (см. подробное обоснование в докстринге
+        # metrics_windows.read_keyboard_state()).
+        if (
+            watched_layout is not None
+            and keyboard_layout is not None
+            and keyboard_layout != watched_layout
+            and foreground_pid == watched_layout_pid
+        ):
+            osd_manager.push("layout", {"layout": keyboard_layout}, now, cfg)
+        watched_layout = keyboard_layout
+        watched_layout_pid = foreground_pid
+
         # ---- медленные метрики: раз в POLL_INTERVAL ----
         if now - last_metrics_tick >= POLL_INTERVAL:
             dt = now - last_metrics_tick if last_metrics_tick else POLL_INTERVAL
@@ -1763,26 +1821,9 @@ def metrics_main_loop(stop_event):
 
             audio_state = audio_controller.read_state()
             media_state = media_monitor.read()
-            keyboard_state = metrics_windows.read_keyboard_state()
-            keyboard_layout = keyboard_state["keyboard_layout"]
-            foreground_pid = keyboard_state["foreground_pid"]
-
-            # ---- watched-value diff: раскладка клавиатуры (см. osd.py) -
-            # триггерим popup, только если раскладка ДЕЙСТВИТЕЛЬНО сменилась
-            # (не первый тик после старта - watched_layout is not None) И
-            # foreground_pid НЕ изменился одновременно с ней - иначе это не
-            # реальное переключение языка, а alt-tab между окнами с разной
-            # per-window раскладкой (см. подробное обоснование в докстринге
-            # metrics_windows.read_keyboard_state()).
-            if (
-                watched_layout is not None
-                and keyboard_layout is not None
-                and keyboard_layout != watched_layout
-                and foreground_pid == watched_layout_pid
-            ):
-                osd_manager.push("layout", {"layout": keyboard_layout}, now, cfg)
-            watched_layout = keyboard_layout
-            watched_layout_pid = foreground_pid
+            # keyboard_layout - уже прочитан ВЫШЕ, КАЖДЫЙ тик (см. блок
+            # сразу после чтения serial в начале while) - тут повторно НЕ
+            # читается, просто используется в context ниже как есть.
 
             # ---- watched-value diff: устройство вывода звука (см. osd.py) -
             # без фильтра по окну (переключение устройства не связано с

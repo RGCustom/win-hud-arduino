@@ -287,12 +287,22 @@ def compute_volume_osd_pixels(
     muted=False,
     mute_color="FF0000", warning_color="FFA500", warning_threshold_pct=95,
     leds_per_bar=LEDS_PER_BAR,
+    bar_mode="center",
 ):
     """
-    Пиксели для OSD-попапа громкости: одно значение (volume_pct), рисуется
-    СИММЕТРИЧНО от центра ленты в обе стороны - частный случай
-    compute_bar_pixels_center() с одинаковым pct на обе половины (см.
-    пояснение "Зеркальность" в докстринге модуля выше).
+    Пиксели для OSD-попапа громкости: одно значение (volume_pct).
+
+    bar_mode - в каком из четырёх режимов ленты рисовать OSD (см. докстринг
+    модуля за геометрией каждого): "classic" (обычный градиент по всей
+    длине), "center" (СИММЕТРИЧНО от центра в обе стороны - исторический
+    дефолт, частный случай compute_bar_pixels_center() с одинаковым pct на
+    обе половины, см. пояснение "Зеркальность" в докстринге модуля выше),
+    "edges" (от обоих краёв к центру) или "flat" (вся лента одним плывущим
+    цветом). Это ОТДЕЛЬНАЯ настройка от режима обычной метрики
+    (cfg["mode"]["bar0"] в pc_hud.py) - живёт в cfg["encoder"]["osd_bar_mode"],
+    пользователь может держать их разными (см. обсуждение в чате: раньше OSD
+    ВСЕГДА рисовался как center, независимо от режима метрики). Невалидное
+    значение откатывается на "center" - прежнее поведение по умолчанию.
 
     Цвет переопределяется на "тревожный" в двух случаях, ИГНОРИРУЯ обычный
     c1/c2/c3 градиент бара - чтобы состояние было видно однозначно, вне
@@ -305,13 +315,17 @@ def compute_volume_osd_pixels(
                                                 грани максимума"
         - иначе - обычный 3-стопный градиент c1->c2->c3, как всегда
 
-    Технически "сплошной цвет" получается тем же _gradient_pixels() с
-    ОДИНАКОВЫМ hex на всех трёх стопах (c1=c2=c3=color) - блендинг между
-    одинаковыми цветами даёт этот же цвет, так что solid-флаг тут не важен,
-    отдельная ветка кода не нужна.
+    Технически "сплошной цвет" получается подстановкой ОДИНАКОВОГО hex на
+    все три стопа (c1=c2=c3=color) ДО вызова функции конкретного режима -
+    блендинг между одинаковыми цветами даёт этот же цвет во всех режимах
+    (включая flat, где три стопа и так есть), так что solid-флаг нигде не
+    нужен, отдельная ветка кода на "тревожный" цвет не требуется.
 
     Без peak hold - для OSD это лишнее: попап и так живёт считанные секунды
-    (см. таймер в pc_hud.py), пик держать незачем.
+    (см. таймер в pc_hud.py), пик держать незачем. flat игнорирует его и у
+    обычной метрики (см. compute_bar_pixels_flat()), для остальных режимов
+    он просто не передаётся (peak_pct=None по умолчанию у соответствующих
+    функций).
 
     Возвращает список из leds_per_bar строк 'RRGGBB'.
     """
@@ -323,13 +337,29 @@ def compute_volume_osd_pixels(
         color = None
 
     if color is not None:
-        return compute_bar_pixels_center(
-            volume_pct, volume_pct,
-            color, color, color, False,
-            color, color, color, False,
+        c1_hex = c2_hex = c3_hex = color
+
+    if bar_mode == "classic":
+        return compute_bar_pixels(
+            volume_pct, c1_hex, c2_hex, c3_hex, False,
             leds_per_bar=leds_per_bar,
         )
 
+    if bar_mode == "edges":
+        return compute_bar_pixels_edges(
+            volume_pct, volume_pct,
+            c1_hex, c2_hex, c3_hex, False,
+            c1_hex, c2_hex, c3_hex, False,
+            leds_per_bar=leds_per_bar,
+        )
+
+    if bar_mode == "flat":
+        return compute_bar_pixels_flat(
+            volume_pct, c1_hex, c2_hex, c3_hex,
+            leds_per_bar=leds_per_bar,
+        )
+
+    # "center" - дефолт и фолбэк для невалидного значения bar_mode
     return compute_bar_pixels_center(
         volume_pct, volume_pct,
         c1_hex, c2_hex, c3_hex, False,

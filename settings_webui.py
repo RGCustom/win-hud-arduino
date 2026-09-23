@@ -174,6 +174,18 @@ SETTINGS_PAGE_HTML = """<!doctype html>
       </select>
     </div>
 
+    <div class="row">
+      <label>Анимация OSD громкости</label>
+      <select id="osd-bar-mode">
+        <option value="classic">Classic (слева направо)</option>
+        <option value="center">Center (от центра в обе стороны)</option>
+        <option value="edges">Edges (от краёв к центру)</option>
+        <option value="flat">Flat (вся лента одним цветом)</option>
+      </select>
+    </div>
+    <div class="note">В каком режиме ленты показывается всплывающий индикатор громкости при
+      вращении энкодера - независимо от режима, выбранного для обычной метрики ниже.</div>
+
     <div class="slider-row">
       <label>OSD держится после вращения, сек</label>
       <input type="range" id="osd-hold-seconds" min="0.5" max="10" step="0.5" value="3">
@@ -473,6 +485,7 @@ tickIntervalEl.addEventListener("change", () => {
 
 const volumeStepEl = document.getElementById("volume-step");
 const encoderClickEl = document.getElementById("encoder-click-action");
+const osdBarModeEl = document.getElementById("osd-bar-mode");
 const osdHoldEl = document.getElementById("osd-hold-seconds");
 const osdHoldValEl = document.getElementById("osd-hold-seconds-val");
 const muteColorEl = document.getElementById("volume-mute-color");
@@ -486,6 +499,7 @@ function sendEncoderSettings(partial) {
 
 debounceSave(volumeStepEl, v => editingVolumeStep = v, () => sendEncoderSettings({ volume_step_pct: parseInt(volumeStepEl.value) }));
 encoderClickEl.addEventListener("change", () => sendEncoderSettings({ click_action: encoderClickEl.value }));
+osdBarModeEl.addEventListener("change", () => sendEncoderSettings({ osd_bar_mode: osdBarModeEl.value }));
 
 osdHoldEl.addEventListener("input", () => {
   editingOsdHold = true;
@@ -963,6 +977,7 @@ function render(state) {
 
   if (!editingVolumeStep) volumeStepEl.value = state.cfg.encoder.volume_step_pct;
   encoderClickEl.value = state.cfg.encoder.click_action;
+  osdBarModeEl.value = state.cfg.encoder.osd_bar_mode || "center";
   if (!editingOsdHold) {
     osdHoldEl.value = state.cfg.encoder.osd_hold_seconds;
     osdHoldValEl.textContent = parseFloat(state.cfg.encoder.osd_hold_seconds).toFixed(1) + "с";

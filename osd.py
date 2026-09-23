@@ -69,8 +69,15 @@ def _render_volume(payload, cfg, leds_count):
     """payload: {"volume_pct": int, "muted": bool}. Логика 1-в-1 с прежним
     инлайн-блоком volume OSD в metrics_main_loop - просто переехала сюда без
     изменений (см. ledbar.compute_volume_osd_pixels за деталями геометрии -
-    расходится от центра ленты в обе стороны, тревожный цвет при mute/почти
-    максимуме)."""
+    тревожный цвет при mute/почти максимуме).
+
+    osd_bar_mode (cfg["encoder"], см. DEFAULT_ENCODER в pc_hud.py) - в каком
+    из четырёх режимов ленты (classic/center/edges/flat) рисовать именно
+    этот OSD-попап - ОТДЕЛЬНАЯ настройка от режима обычной метрики
+    (cfg["mode"]["bar0"]), см. докстринг ledbar.compute_volume_osd_pixels()
+    за обоснованием (раньше OSD ВСЕГДА рисовался как center, независимо от
+    выбора пользователя для метрики). .get() с фолбэком на "center" - на
+    случай settings.json, сохранённого версией до появления этой настройки."""
     enc = cfg["encoder"]
     pixels = ledbar.compute_volume_osd_pixels(
         payload["volume_pct"],
@@ -79,6 +86,7 @@ def _render_volume(payload, cfg, leds_count):
         mute_color=enc["mute_color"], warning_color=enc["warning_color"],
         warning_threshold_pct=enc["warning_threshold_pct"],
         leds_per_bar=leds_count,
+        bar_mode=enc.get("osd_bar_mode", "center"),
     )
     osd_line = "MUTE" if payload["muted"] else f"Vol {payload['volume_pct']}%"
     lines = ["", _center_line(osd_line), ""]
