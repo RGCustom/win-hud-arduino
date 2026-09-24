@@ -104,7 +104,7 @@ import metrics_ping
 import flash
 import flash_webui
 
-SCRIPT_VERSION = "2026-09-15-1"
+SCRIPT_VERSION = "2026-09-24-1"
 
 CONTAINER_START_TIME = time.time()
 
@@ -157,14 +157,12 @@ DEFAULT_PING_FAIL_THRESHOLD = 2     # столько провалов подря
                                       # гистерезис в metrics_ping.PingMonitor)
 DEFAULT_PING_RECOVER_THRESHOLD = 1  # столько успехов подряд для возврата в online
 
-# Порог "top_process_name" (см. metrics_windows.TopProcessMonitor) - раньше
-# был захардкожен константой MIN_CPU_PCT прямо в metrics_windows.py, теперь
-# живая настройка в /settings (та же причина, что и у DEFAULT_PING_* выше -
-# верное значение зависит от конкретного железа, см. докстринг класса:
-# psutil отдаёт CPU% ненормализованным по числу потоков, поэтому на
-# многопоточных CPU один загруженный поток даёт всего несколько процентов).
-# Дефолт 25.0 - тот же, что был зашит раньше.
-DEFAULT_TOP_PROCESS_MIN_CPU_PCT = 25.0
+# Порог показа топ-процесса (top_process_name) больше НЕ глобальная настройка:
+# он задаётся пороговым условием самого экрана на /screens (например
+# top_process_cpu_pct >= 25, см. screens.py, conditions) - верное значение
+# зависит от железа (psutil отдаёт CPU% ненормализованным по числу потоков),
+# и разным экранам могут быть нужны разные пороги. TopProcessMonitor теперь
+# всегда отдаёт реальный топ-процесс (см. metrics_windows.py).
 
 WEB_PORT = int(os.environ.get("WEB_PORT", "8189"))
 
@@ -233,12 +231,14 @@ DEFAULT_LAYOUT_COLORS = {
 }
 
 # ---- Приоритетная ротация экранов - см. screens.RotationState.
-# "Каждый N-й слот" для personal/ambient дорожек - см. докстринг screens.py
+# "Каждый N-й слот" для priority/ambient дорожек - см. докстринг screens.py
 # за полным описанием алгоритма (round-robin внутри дорожки + форс-прерывание
-# только у personal). Живые настройки в /settings, а не константы - т.к.
+# только у priority). Живые настройки в /settings, а не константы - т.к.
 # "насколько часто" это вопрос личного вкуса пользователя, как и tick_interval.
-DEFAULT_PRIORITY_BOOST_PERSONAL = 2
-DEFAULT_PRIORITY_BOOST_AMBIENT = 4
+# (tier "priority" - прежнее "personal", "приоритетный" вместо "личный";
+# ключи настроек переименованы соответственно - см. _LEGACY_SETTING_RENAMES.)
+DEFAULT_BOOST_PRIORITY = 2
+DEFAULT_BOOST_AMBIENT = 4
 
 BAR_METRICS = {
     "cpu": "CPU",
@@ -322,15 +322,15 @@ DEFAULT_SETTINGS = {
     "device_hold_seconds": DEFAULT_DEVICE_HOLD_SECONDS,
     "osd_cooldown_seconds": DEFAULT_OSD_COOLDOWN_SECONDS,
     "layout_colors": DEFAULT_LAYOUT_COLORS,
-    # Приоритетная ротация экранов (tier=personal/ambient, см. screens.py) -
+    # Приоритетная ротация экранов (tier=priority/ambient, см. screens.py) -
     # "каждый N-й слот" для каждой дорожки.
-    "priority_boost_personal": DEFAULT_PRIORITY_BOOST_PERSONAL,
-    "priority_boost_ambient": DEFAULT_PRIORITY_BOOST_AMBIENT,
+    "boost_priority": DEFAULT_BOOST_PRIORITY,
+    "boost_ambient": DEFAULT_BOOST_AMBIENT,
     # Tautulli (Plex) - адрес/ключ подключения, тот же принцип, что и
     # serial_port/net1_iface выше - живая настройка в /settings, а не
     # переменная окружения. my_plex_user - если заполнено и совпадает
     # со stream_user активного сеанса (Tautulli отдаёт friendly_name) - этот
-    # сеанс считается tier="personal" (тот же человек смотрит на этом же ПК),
+    # сеанс считается tier="priority" (тот же человек смотрит на этом же ПК),
     # а не "ambient" - см. обсуждение в чате про "чужой/свой Plex-сеанс".
     # Пусто (дефолт) - ВСЕ Plex-сеансы считаются ambient, безопасное поведение.
     "tautulli_url": "",
@@ -359,16 +359,24 @@ DEFAULT_SETTINGS = {
     "ping_timeout_ms": DEFAULT_PING_TIMEOUT_MS,
     "ping_fail_threshold": DEFAULT_PING_FAIL_THRESHOLD,
     "ping_recover_threshold": DEFAULT_PING_RECOVER_THRESHOLD,
-    # Порог топ-процесса по CPU (см. DEFAULT_TOP_PROCESS_MIN_CPU_PCT выше и
-    # metrics_windows.TopProcessMonitor) - живая настройка, слайдер в
-    # /settings, читается в integrations_loop() на каждом опросе.
-    "top_process_min_cpu_pct": DEFAULT_TOP_PROCESS_MIN_CPU_PCT,
     # avrdude - путь к папке (или сразу к avrdude.exe), если он не в PATH -
     # см. flash.resolve_avrdude_exe(). Живая настройка со страницы /flash,
     # тот же принцип, что serial_port/tautulli_url и т.п. выше. Пусто -
     # используется переменная окружения AVRDUDE_PATH, а если и её нет -
     # обычный поиск "avrdude" в PATH (старое поведение без изменений).
     "avrdude_path": "",
+}
+
+
+# Прежние ключи settings.json -> текущие (tier "personal" переименован в
+# "priority", "личный" -> "приоритетный"). Значение переносится один раз при
+# загрузке, если нового ключа ещё нет; старый ключ дальше игнорируется (его
+# нет в DEFAULT_SETTINGS) и пропадает из файла при первом же сохранении.
+# top_process_min_cpu_pct тут НЕ переносится: порог переехал в условия экранов
+# и мигрирует отдельно - см. screens._migrate_top_process_conditions().
+_LEGACY_SETTING_RENAMES = {
+    "priority_boost_personal": "boost_priority",
+    "priority_boost_ambient": "boost_ambient",
 }
 
 
@@ -386,6 +394,11 @@ def load_settings():
             saved = json.load(f)
     except Exception:
         saved = {}
+
+    if isinstance(saved, dict):
+        for old_key, new_key in _LEGACY_SETTING_RENAMES.items():
+            if old_key in saved and new_key not in saved:
+                saved[new_key] = saved[old_key]
 
     cfg = copy.deepcopy(DEFAULT_SETTINGS)
     for key, default_val in DEFAULT_SETTINGS.items():
@@ -469,6 +482,9 @@ _integrations_state = {
     "streams": [], "recent": [],
     "qbt_total_dl": "0 B/s", "qbt_total_ul": "0 B/s", "qbt_ratio": 0.0, "qbt_free_space_gb": "?",
     "qbt_count_all": 0, "torrents": [],
+    # числовые двойники qbt_total_dl/ul (Мбит/с) для пороговых условий экранов;
+    # None = нет данных (интеграция выключена/сервер недоступен)
+    "qbt_dl_mbps": None, "qbt_ul_mbps": None,
     # top_process_* - топ-процесс по CPU переехал сюда из главного
     # цикла (metrics_main_loop) в integrations_loop, см. комментарий там же -
     # psutil.Process.cpu_percent()/memory_percent()/name() на КАЖДЫЙ процесс
@@ -661,6 +677,16 @@ def format_rate(bytes_delta, dt):
         return f"{mbps:.1f}Mbps"
     kbps = bits_per_sec / 1000
     return f"{kbps:.0f}Kbps"
+
+
+def rate_mbps(bytes_delta, dt):
+    """Скорость в Мбит/с ЧИСЛОМ (float) - числовой двойник format_rate() для
+    пороговых условий экранов (net*_rx_mbps/net*_tx_mbps в variables.py):
+    порог на строку вроде "12.3Mbps" не повесить. Единицы те же, что у
+    format_rate() (мегабит = 1_000_000 бит)."""
+    if dt <= 0 or bytes_delta < 0:
+        return 0.0
+    return round(bytes_delta * 8 / dt / 1_000_000, 2)
 
 
 def format_bytes_total(bytes_val):
@@ -1405,17 +1431,23 @@ def api_osd():
 
 @app.route("/api/priority_boost", methods=["POST"])
 def api_priority_boost():
-    """"Каждый N-й слот" для personal/ambient дорожек ротации (см.
-    screens.RotationState) - нижняя граница 1 (личный/фоновый экран получает
-    ВООБЩЕ КАЖДЫЙ слот - предельный случай, отдельно не запрещаем, это
-    осмысленная настройка "показывать только это"), верхняя - произвольный
-    разумный потолок, чтобы не запутаться в UI."""
+    """"Каждый N-й слот" для priority/ambient дорожек ротации (см.
+    screens.RotationState) - нижняя граница 1 (приоритетный/фоновый экран
+    получает ВООБЩЕ КАЖДЫЙ слот - предельный случай, отдельно не запрещаем,
+    это осмысленная настройка "показывать только это"), верхняя -
+    произвольный разумный потолок, чтобы не запутаться в UI.
+
+    Ключи тела: boost_priority, boost_ambient. Прежние имена
+    (priority_boost_personal/priority_boost_ambient - до переименования tier
+    "personal" -> "priority") принимаются как алиасы: страница /settings
+    прежней версии продолжает сохранять настройки, пока её не заменили."""
     body = request.get_json(force=True)
     with state_lock:
-        if "priority_boost_personal" in body:
-            state["cfg"]["priority_boost_personal"] = max(1, min(20, int(body["priority_boost_personal"])))
-        if "priority_boost_ambient" in body:
-            state["cfg"]["priority_boost_ambient"] = max(1, min(20, int(body["priority_boost_ambient"])))
+        for new_key, legacy_key in (("boost_priority", "priority_boost_personal"),
+                                     ("boost_ambient", "priority_boost_ambient")):
+            raw = body.get(new_key, body.get(legacy_key))
+            if raw is not None:
+                state["cfg"][new_key] = max(1, min(20, int(raw)))
         save_settings(state["cfg"])
     return jsonify({"ok": True})
 
@@ -1478,24 +1510,6 @@ def api_ping_settings():
             state["cfg"]["ping_fail_threshold"] = max(1, min(10, int(body["ping_fail_threshold"])))
         if "ping_recover_threshold" in body:
             state["cfg"]["ping_recover_threshold"] = max(1, min(10, int(body["ping_recover_threshold"])))
-        save_settings(state["cfg"])
-    return jsonify({"ok": True})
-
-
-@app.route("/api/top_process_settings", methods=["POST"])
-def api_top_process_settings():
-    """Порог "top_process_name" (см. metrics_windows.TopProcessMonitor и
-    DEFAULT_TOP_PROCESS_MIN_CPU_PCT выше) - границы 0-100%, тот же принцип,
-    что у /api/ping_settings. Опрашивается фоновым потоком
-    (integrations_loop, см. ниже), поэтому сохранение тут не требует
-    немедленного пересчёта - новое значение подхватится на следующем тике
-    (INTEGRATIONS_POLL_INTERVAL)."""
-    body = request.get_json(force=True)
-    with state_lock:
-        if "top_process_min_cpu_pct" in body:
-            state["cfg"]["top_process_min_cpu_pct"] = round(
-                max(0.0, min(100.0, float(body["top_process_min_cpu_pct"]))), 1
-            )
         save_settings(state["cfg"])
     return jsonify({"ok": True})
 
@@ -1787,6 +1801,8 @@ def metrics_main_loop(stop_event):
                 prev_rx, prev_tx = prev_net_counters[slot]
                 rx_str = format_rate(rx - prev_rx, dt) if prev_rx is not None else "0Kbps"
                 tx_str = format_rate(tx - prev_tx, dt) if prev_tx is not None else "0Kbps"
+                rx_mbps = rate_mbps(rx - prev_rx, dt) if prev_rx is not None else 0.0
+                tx_mbps = rate_mbps(tx - prev_tx, dt) if prev_tx is not None else 0.0
 
                 if prev_rx is not None and dt > 0 and slot == "net1":
                     mbps = (rx - prev_rx) * 8 / 1_000_000 / dt
@@ -1806,6 +1822,7 @@ def metrics_main_loop(stop_event):
                     "speed": format_speed_mbps(metrics_windows.read_iface_speed_mbps(iface)),
                     "rx": rx_str, "tx": tx_str,
                     "total_rx": total_rx_str, "total_tx": total_tx_str,
+                    "rx_mbps": rx_mbps, "tx_mbps": tx_mbps,
                 }
 
             # ---- диск I/O (суммарно по всем дискам) - скорость чтения/записи, МБ/с ----
@@ -1957,8 +1974,8 @@ def metrics_main_loop(stop_event):
             if osd_manager.tick(now, cfg) is None:
                 lines = rotation.current_lines(
                     current_screens, context, now=now,
-                    priority_boost_personal=cfg.get("priority_boost_personal", DEFAULT_PRIORITY_BOOST_PERSONAL),
-                    priority_boost_ambient=cfg.get("priority_boost_ambient", DEFAULT_PRIORITY_BOOST_AMBIENT),
+                    boost_priority=cfg.get("boost_priority", DEFAULT_BOOST_PRIORITY),
+                    boost_ambient=cfg.get("boost_ambient", DEFAULT_BOOST_AMBIENT),
                 )
         #    with state_lock:
         #        state["oled_lines"] = lines
@@ -2197,9 +2214,9 @@ def integrations_loop(stop_event):
             {"url": cfg["qbt2_url"], "api_key": cfg["qbt2_api_key"]},
         ]
         qbt_data = qbt_client.read(qbt_servers)
-        top_process_data = top_process_monitor.read(
-            min_cpu_pct=cfg.get("top_process_min_cpu_pct", DEFAULT_TOP_PROCESS_MIN_CPU_PCT)
-        )
+        # Без порога - монитор всегда отдаёт реальный топ-процесс, "показывать
+        # ли его" решает пороговое условие экрана (см. screens.py conditions).
+        top_process_data = top_process_monitor.read()
 
         with _integrations_lock:
             _integrations_state.update(tautulli_data)

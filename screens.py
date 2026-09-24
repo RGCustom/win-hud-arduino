@@ -2,76 +2,69 @@
 screens.py  (win-hud-arduino)
 
 Хранилище OLED-экранов + логика ротации - портировано из shkaf-hud. Движок
-(CRUD/build_active_screens/RotationState) в основе не менялся - он уже был
-написан общим - опирается на templates.template_group() и
-variables.group_count(), а не на конкретные переменные проекта. Repeating-
-группы (stream/recent/qbt/mon, см. variables.REPEATING_GROUPS) в этом
-проекте НЕ пусты (Plex/qBittorrent были возвращены, позже добавился
-мониторинг произвольных ресурсов - см. докстринг variables.py) - ветка
-"экран в N копий" В ROTATION.PY ДОСТИЖИМА, если пользователь вручную
-добавит на /screens экран, использующий stream_*/recent_*/qbt_*-переменную,
-а для мониторинга (mon_*) она достижима СРАЗУ ИЗ КОРОБКИ - см.
-DEFAULT_SCREENS ниже, "default-monitoring"/"default-alert".
+(CRUD/build_active_screens/RotationState) опирается на templates.template_group()
+и variables.group_count(), а не на конкретные переменные проекта. Repeating-
+группы (stream/recent/qbt/mon, см. variables.REPEATING_GROUPS) достижимы: для
+мониторинга (mon_*) - сразу из коробки (см. "default-monitoring"/
+"default-alert" в DEFAULT_SCREENS), для Plex/qBittorrent - если пользователь
+добавит на /screens экран с соответствующими переменными.
 
-Изменилось только:
-  - DEFAULT_SCREENS - под новые переменные (CPU/RAM/GPU/диски/сеть/звук/
-    раскладка вместо Cache/Array/Plex/qBittorrent), плюс два экрана
-    мониторинга ресурсов (см. ниже)
-  - CONFIG_DIR - дефолт под Windows (%APPDATA%\\win-hud-arduino), не /config
-    докер-тома
-  - НОВОЕ: приоритетная ротация (см. обсуждение в чате про личные/фоновые
-    экраны, показывающиеся чаще обычных) - у каждого экрана появились два
-    новых поля:
-      "tier"         - "normal" (по умолчанию) | "personal" | "ambient".
-                       Задаётся вручную в /screens (выпадающий список), НЕ
-                       определяется автоматически по содержимому шаблона -
-                       угадывание по переменным (например "если экран
-                       использует media_title - значит personal") было бы
-                       хрупким и неочевидным для пользователя. "personal" -
-                       чаще (см. cfg["priority_boost_personal"] в
-                       pc_hud.py) и с правом принудительно прервать текущий
-                       показ (активация/смена контента); "ambient" - чаще
-                       (cfg["priority_boost_ambient"]), но БЕЗ права
-                       прерывания - просто получает более частые слоты в
-                       обычной ротации. ИСКЛЮЧЕНИЕ: у копий repeating-группы
-                       "stream" (Plex-сеансы) tier="ambient" МОЖЕТ быть
-                       точечно повышен до "personal" ДЛЯ ОДНОЙ КОНКРЕТНОЙ
-                       копии, если её "user" совпадает с настройкой
-                       cfg["my_plex_user"] (/settings, карточка Tautulli) -
-                       см. _stream_copy_tier() ниже. Остальные копии того
-                       же экрана (чужие сеансы) остаются "ambient" как есть.
-      "trigger_vars" - список имён переменных (подмножество тех, что уже
-                       используются в l1/l2/l3 этого экрана), изменение
-                       которых на УЖЕ ПОКАЗЫВАЕМОМ personal-экране должно
-                       форсировать немедленное обновление содержимого и
-                       продление его duration заново (например
-                       ["media_title", "media_artist"] - смена трека, а не
-                       ["stream_progress"] - которое меняется каждую
-                       секунду и не должно дёргать интерфейс). Пусто по
-                       умолчанию - тогда форс работает только на активацию
-                       (экран появился/исчез из active), без реакции на
-                       изменение контента внутри уже активного показа.
-                       Не используется для tier="normal"/"ambient" - там
-                       принудительных обновлений вообще нет, см. RotationState.
-    Сама логика выбора следующего экрана с учётом tier - в RotationState
-    ниже (не в build_active_screens() - она как строила плоский список
-    активных экранов, так и строит, теперь ещё и с point-override tier для
-    "stream" - разбивка на "дорожки" per-tier - уже ответственность
-    RotationState, ей достаточно готового поля tier на каждом элементе active).
-  - НОВОЕ: два дефолтных экрана мониторинга ресурсов (см. metrics_ping.py) -
-    "default-monitoring" (tier="ambient", крутит статус каждой настроенной
-    цели по очереди - repeating-группа "mon", 0 копий = экран просто
-    отсутствует, пока в /settings не заведена ни одна цель) и "default-alert"
-    (tier="personal", trigger_vars=["mon_down_names"]) - ЖИВАЯ ИЛЛЮСТРАЦИЯ
-    того же приёма, что уже используется у "default-nowplaying" ниже: экран
-    невидим, пока mon_down_names резолвится в None (всё живо, см.
-    metrics_ping.PingMonitor.read()), и мгновенно всплывает поверх текущей
-    ротации, как только что-то падает - никакой новой логики в screens.py
-    ради этого не понадобилось, тот же общий механизм build_active_screens()/
-    RotationState, что и для Now Playing.
+Поля экрана, связанные с приоритетной ротацией и условиями показа:
+
+  "tier"         - "normal" (по умолчанию) | "priority" | "ambient".
+                   Задаётся вручную в /screens, НЕ определяется автоматически
+                   по содержимому шаблона (угадывание по переменным было бы
+                   хрупким). "priority" (ранее "personal" - переименовано,
+                   старые значения в screens.json переезжают сами, см.
+                   _TIER_ALIASES) - показывается чаще (cfg["boost_priority"]
+                   в pc_hud.py) и с правом принудительно прервать текущий
+                   показ (экран появился в ротации или сменился контент);
+                   "ambient" - чаще (cfg["boost_ambient"]), но БЕЗ права
+                   прерывания. ИСКЛЮЧЕНИЕ: у копий repeating-группы "stream"
+                   tier="ambient" может быть точечно повышен до "priority"
+                   для ОДНОЙ копии, если её "user" совпадает с
+                   cfg["my_plex_user"] - см. _stream_copy_tier().
+
+  "trigger_vars" - имена переменных, СМЕНА значения которых на УЖЕ показываемом
+                   priority-экране форсирует обновление и продление его
+                   duration (например ["media_title", "media_artist"] -
+                   смена трека). Это реакция на ИЗМЕНЕНИЕ; порог значения
+                   выражается через "conditions" ниже.
+
+  "conditions"   - НОВОЕ. Список ПОРОГОВЫХ условий показа (логика И):
+                       {"var": "cpu_pct", "op": ">", "value": 25.0,
+                        "for_s": 0.0, "hold_s": 0.0}
+                   Это ЖЁСТКИЙ ФИЛЬТР: пока хоть одно условие не выполнено,
+                   экран не участвует в ротации вовсе (так же, как экран с
+                   None-переменной, см. build_active_screens()). Когда
+                   условия начинают выполняться, экран появляется в active -
+                   и если он priority, RotationState форсированно прерывает
+                   текущий показ (тот же механизм "newly active", что у Now
+                   Playing и алерта мониторинга); для normal/ambient он просто
+                   входит в обычную ротацию. Только числовые переменные (см.
+                   variables.NUMERIC_UNITS); значение None ("нет данных")
+                   считается невыполненным условием.
+                     for_s  - условие должно выполняться N секунд ПОДРЯД,
+                              прежде чем сработать (отсекает короткие всплески);
+                     hold_s - после того как условие перестало выполняться,
+                              экран остаётся ещё N секунд (защита от дребезга
+                              на границе порога).
+                   Состояние for_s/hold_s хранит ConditionTracker внутри
+                   RotationState. Оно обновляется при каждом вызове
+                   current_lines(), т.е. с шагом POLL_INTERVAL главного цикла
+                   (по умолчанию 1 с) - значения for_s/hold_s меньше этого
+                   шага фактически округляются до него.
+
+Миграции при загрузке screens.json (результат сразу сохраняется на диск):
+  - tier "personal" -> "priority";
+  - экраны на top_process_* без поля "conditions" получают условие
+    top_process_cpu_pct >= <прежний порог из settings.json>: раньше экран
+    скрывал сам TopProcessMonitor по настройке top_process_min_cpu_pct (она
+    убирается из /settings), теперь это обычное условие экрана.
 """
 
 import json
+import operator
 import os
 import time
 import uuid
@@ -80,17 +73,31 @@ import templates
 import variables
 
 # На Windows %APPDATA% всегда есть (обычно C:\Users\<user>\AppData\Roaming) -
-# берём его как базу для конфига, аналог CONFIG_DIR=/config в shkaf-hud.
-# CONFIG_DIR всё равно можно переопределить переменной окружения, если нужно
-# хранить конфиг в другом месте.
+# берём его как базу для конфига. CONFIG_DIR можно переопределить переменной
+# окружения.
 _DEFAULT_CONFIG_DIR = os.path.join(os.environ.get("APPDATA", "."), "win-hud-arduino")
 CONFIG_DIR = os.environ.get("CONFIG_DIR", _DEFAULT_CONFIG_DIR)
 SCREENS_FILE = os.path.join(CONFIG_DIR, "screens.json")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")  # только для разовой миграции порога топ-процесса
 
-# Допустимые значения "tier" - см. докстринг модуля выше. "normal" - дефолт
-# для новых экранов и для всех уже сохранённых screens.json от версии ДО
-# этой настройки (см. backfill в load_screens() ниже).
-SCREEN_TIERS = ("normal", "personal", "ambient")
+# Допустимые значения "tier" - см. докстринг модуля.
+SCREEN_TIERS = ("normal", "priority", "ambient")
+
+# Прежние названия tier -> текущие. Применяется при загрузке/валидации, так что
+# старый screens.json и старые клиенты (если такие остались) не ломаются.
+_TIER_ALIASES = {"personal": "priority"}
+
+# Операторы пороговых условий (ASCII в JSON, в интерфейсе рисуются как > < ≥ ≤).
+CONDITION_OPS = {
+    ">": operator.gt,
+    "<": operator.lt,
+    ">=": operator.ge,
+    "<=": operator.le,
+}
+CONDITION_MAX_SECONDS = 3600.0  # потолок for_s/hold_s
+
+_TOP_PROCESS_VARS = ("top_process_name", "top_process_cpu_pct", "top_process_ram_pct")
+_LEGACY_TOP_PROCESS_MIN_CPU_PCT = 25.0  # прежний дефолт настройки, если settings.json недоступен
 
 DEFAULT_SCREENS = [
     {
@@ -103,6 +110,7 @@ DEFAULT_SCREENS = [
         "enabled": True,
         "tier": "normal",
         "trigger_vars": [],
+        "conditions": [],
     },
     {
         "id": "default-gpu",
@@ -114,6 +122,7 @@ DEFAULT_SCREENS = [
         "enabled": True,
         "tier": "normal",
         "trigger_vars": [],
+        "conditions": [],
     },
     {
         "id": "default-disks",
@@ -125,6 +134,7 @@ DEFAULT_SCREENS = [
         "enabled": True,
         "tier": "normal",
         "trigger_vars": [],
+        "conditions": [],
     },
     {
         "id": "default-net1",
@@ -136,6 +146,7 @@ DEFAULT_SCREENS = [
         "enabled": True,
         "tier": "normal",
         "trigger_vars": [],
+        "conditions": [],
     },
     {
         "id": "default-audio",
@@ -147,22 +158,18 @@ DEFAULT_SCREENS = [
         "enabled": True,
         "tier": "normal",
         "trigger_vars": [],
+        "conditions": [],
     },
     {
         # media_title/media_artist резолвятся в None, когда сейчас ничего не
-        # играет (см. metrics_windows.MediaMonitor) - экран автоматически
-        # выпадает из ротации через общий механизм build_active_screens()
-        # ниже, отдельной логики "показывать только когда играет" тут нет.
+        # играет (см. metrics_windows.MediaMonitor) - экран выпадает из
+        # ротации через общий механизм build_active_screens().
         #
-        # tier="personal" - живая демонстрация приоритетной ротации (см.
-        # докстринг модуля выше): показывается чаще обычных экранов
-        # (cfg["priority_boost_personal"] в pc_hud.py) и имеет право
-        # прервать текущий показ, если появился (заиграла музыка) или
-        # если сменился трек ПРЯМО во время его собственного показа -
-        # trigger_vars ниже перечисляет именно те переменные, смена
-        # которых означает "это другое событие, а не то же самое" (не
-        # включаем media_playing - он не меняется без смены title/artist
-        # в паре, был бы избыточен как триггер).
+        # tier="priority": показывается чаще и может прервать текущий показ,
+        # если появился (заиграла музыка) или сменился трек во время своего
+        # показа - trigger_vars перечисляет переменные, смена которых означает
+        # "это другое событие" (media_playing не включаем - он не меняется без
+        # смены title/artist).
         "id": "default-nowplaying",
         "name": "Now Playing",
         "l1": "{media_title:16}",
@@ -170,8 +177,9 @@ DEFAULT_SCREENS = [
         "l3": "",
         "duration": 4.0,
         "enabled": True,
-        "tier": "personal",
+        "tier": "priority",
         "trigger_vars": ["media_title", "media_artist"],
+        "conditions": [],
     },
     {
         "id": "default-clock",
@@ -183,28 +191,16 @@ DEFAULT_SCREENS = [
         "enabled": True,
         "tier": "normal",
         "trigger_vars": [],
+        "conditions": [],
     },
     {
         # Мониторинг ресурсов (см. metrics_ping.py) - repeating-группа "mon",
-        # экран сам размножается по числу целей, настроенных в /settings
-        # (0 целей = экран просто отсутствует в ротации, тот же общий
-        # механизм group_count()==0 -> цикл рендера ни разу не выполнился,
-        # что и у stream_*/qbt_* экранов без настроенной интеграции).
+        # экран сам размножается по числу целей из /settings (0 целей = экран
+        # просто отсутствует).
         #
-        # НАМЕРЕННО не используется mon_latency_ms в шаблоне ниже - это поле
-        # резолвится в None для offline-целей (см. metrics_ping.PingMonitor.read()
-        # - задержку мёртвого ресурса показывать нечего), а ЛЮБАЯ None-
-        # переменная в l1/l2/l3 гасит именно ЭТУ копию экрана (см. докстринг
-        # build_active_screens() ниже) - то есть упавший ресурс перестал бы
-        # попадать в "спокойную" ротацию статуса ровно тогда, когда его
-        # статус нужнее всего показать. mon_label/mon_status/mon_since
-        # никогда не резолвятся в None, пока цель вообще существует в
-        # /settings - см. metrics_ping.py, поэтому безопасны для дефолтного
-        # шаблона; кто хочет видеть latency - может сделать свой экран.
-        #
-        # tier="ambient" - показывается чаще обычных (cfg["priority_boost_ambient"]),
-        # без права прерывания - та же рекомендованная настройка, что и для
-        # экранов на Plex/qBittorrent-переменных (см. подсказку на /screens).
+        # НАМЕРЕННО не используется mon_latency_ms: для offline-целей он None,
+        # а любая None-переменная гасит копию экрана - упавший ресурс выпал бы
+        # из ротации ровно тогда, когда его статус нужнее всего.
         "id": "default-monitoring",
         "name": "Мониторинг",
         "l1": "{mon_label:16}",
@@ -214,29 +210,17 @@ DEFAULT_SCREENS = [
         "enabled": True,
         "tier": "ambient",
         "trigger_vars": [],
+        "conditions": [],
     },
     {
         # Алерт мониторинга - НЕВИДИМ, пока mon_down_names резолвится в None
-        # (все настроенные ресурсы живы, см. metrics_ping.PingMonitor.read()) -
-        # тот же общий механизм build_active_screens(), что и у
-        # "default-nowplaying" выше (любая None-переменная в шаблоне гасит
-        # экран целиком). mon_down_names - СКАЛЯР (не часть repeating-группы
-        # "mon"), поэтому у этого экрана ровно ОДНА копия, а не по числу
-        # упавших целей - сразу все имена через запятую на одной строке.
+        # (все ресурсы живы). mon_down_names - скаляр, поэтому у экрана ровно
+        # одна копия со всеми именами через запятую.
         #
-        # tier="personal" + trigger_vars=["mon_down_names"] - ключевая часть
-        # задумки (см. обсуждение в чате): как только ХОТЬ ОДИН ресурс падает,
-        # mon_down_names становится непустой строкой - экран "появляется в
-        # active", которого не было на прошлом тике, и RotationState
-        # ПРИНУДИТЕЛЬНО прерывает текущий показ (см. "newly_active_personal"
-        # в RotationState.current_lines() ниже) - алерт всплывает мгновенно,
-        # а не ждёт своей очереди. Если СПИСОК упавших изменится ПРЯМО во
-        # время показа алерта (упал ещё один, либо один из упавших ожил, но
-        # остальные ещё нет) - trigger_vars заметит, что mon_down_names стал
-        # другой строкой, и продлит показ с обновлённым содержимым, как
-        # будто экран показался заново (та же механика, что у смены трека на
-        # Now Playing). Как только ПОСЛЕДНИЙ упавший ресурс восстановится -
-        # mon_down_names снова None, и экран сам пропадает из ротации.
+        # tier="priority" + trigger_vars=["mon_down_names"]: как только хоть
+        # один ресурс падает, экран появляется в active и RotationState
+        # форсированно прерывает текущий показ; если список упавших меняется
+        # во время показа - показ продлевается с новым содержимым.
         "id": "default-monitoring-alert",
         "name": "Алерт мониторинга",
         "l1": "\u26a0 Недоступно:",
@@ -244,57 +228,29 @@ DEFAULT_SCREENS = [
         "l3": "",
         "duration": 5.0,
         "enabled": True,
-        "tier": "personal",
+        "tier": "priority",
         "trigger_vars": ["mon_down_names"],
+        "conditions": [],
     },
 ]
 
 
-def _backfill_tier_fields(screen):
-    """Дополняет ОДИН экран полями tier/trigger_vars, если их нет (файл
-    screens.json сохранён версией до появления приоритетной ротации) -
-    мутирует и возвращает тот же dict. tier валидируется на случай ручной
-    правки файла руками/старого бага - невалидное значение откатывается
-    на "normal", а не падает и не пропускает экран."""
-    if screen.get("tier") not in SCREEN_TIERS:
-        screen["tier"] = "normal"
-    if not isinstance(screen.get("trigger_vars"), list):
-        screen["trigger_vars"] = []
-    return screen
+# ---------------- валидация ----------------
 
+def _normalize_tier(value):
+    """Значение tier с учётом _TIER_ALIASES, либо None, если оно невалидно."""
+    value = _TIER_ALIASES.get(value, value)
+    return value if value in SCREEN_TIERS else None
 
-def load_screens():
-    try:
-        with open(SCREENS_FILE) as f:
-            data = json.load(f)
-        if isinstance(data, list) and data:
-            return [_backfill_tier_fields(s) for s in data]
-    except Exception:
-        pass
-    return [dict(s) for s in DEFAULT_SCREENS]
-
-
-def save_screens(screens):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(SCREENS_FILE, "w") as f:
-        json.dump(screens, f)
-
-
-# ---------------- CRUD (портировано из shkaf-hud + tier/trigger_vars - НОВОЕ, см. докстринг модуля) ----------------
 
 def _sanitize_tier(value, fallback="normal"):
-    """Валидирует tier против SCREEN_TIERS - невалидное/отсутствующее
-    значение откатывается на fallback, а не падает (та же терпимость к
-    мусорному вводу, что и у остальных /api/* эндпоинтов в pc_hud.py -
-    например api_mode() там же молча игнорирует значение не из BAR_MODES)."""
-    return value if value in SCREEN_TIERS else fallback
+    """Невалидное/отсутствующее значение откатывается на fallback, а не
+    падает (та же терпимость к мусорному вводу, что у остальных /api/*)."""
+    return _normalize_tier(value) or fallback
 
 
 def _sanitize_trigger_vars(value):
-    """Список имён переменных для форс-обновления personal-экрана (см.
-    докстринг модуля) - непустые строки, без дублей, порядок не важен для
-    самой логики сравнения (используется как множество), но список
-    сохраняем как есть (не set) ради стабильной сериализации в JSON."""
+    """Непустые строки без дублей; список (не set) ради стабильного JSON."""
     if not isinstance(value, list):
         return []
     seen = []
@@ -304,7 +260,120 @@ def _sanitize_trigger_vars(value):
     return seen
 
 
-def new_screen(name="New screen", l1="", l2="", l3="", duration=4.0, tier="normal", trigger_vars=None):
+def _to_seconds(value):
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if f != f:  # NaN
+        return 0.0
+    return round(max(0.0, min(CONDITION_MAX_SECONDS, f)), 1)
+
+
+def _sanitize_conditions(value):
+    """Список условий -> только валидные записи. Отбрасываются: не-словари,
+    неизвестные/нечисловые переменные, неизвестный оператор, нечисловой
+    порог. for_s/hold_s приводятся к 0..CONDITION_MAX_SECONDS."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for c in value:
+        if not isinstance(c, dict):
+            continue
+        var = c.get("var")
+        op = c.get("op")
+        if not isinstance(var, str) or not variables.is_numeric(var):
+            continue
+        if op not in CONDITION_OPS:
+            continue
+        try:
+            threshold = float(c.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if threshold != threshold or threshold in (float("inf"), float("-inf")):
+            continue
+        out.append({
+            "var": var, "op": op, "value": threshold,
+            "for_s": _to_seconds(c.get("for_s")), "hold_s": _to_seconds(c.get("hold_s")),
+        })
+    return out
+
+
+def _backfill_screen_fields(screen):
+    """Дополняет/нормализует ОДИН экран (tier/trigger_vars/conditions) -
+    файл мог быть сохранён более старой версией. Мутирует и возвращает тот же dict."""
+    screen["tier"] = _normalize_tier(screen.get("tier")) or "normal"
+    if not isinstance(screen.get("trigger_vars"), list):
+        screen["trigger_vars"] = []
+    screen["conditions"] = _sanitize_conditions(screen.get("conditions"))
+    return screen
+
+
+# ---------------- миграции ----------------
+
+def _legacy_top_process_threshold():
+    """Прежняя настройка top_process_min_cpu_pct из settings.json (она убирается
+    из /settings) - нужна один раз, чтобы перенести её в условие экрана."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        return float(saved.get("top_process_min_cpu_pct", _LEGACY_TOP_PROCESS_MIN_CPU_PCT))
+    except Exception:
+        return _LEGACY_TOP_PROCESS_MIN_CPU_PCT
+
+
+def _migrate_top_process_conditions(screens):
+    """Экраны на top_process_* БЕЗ поля "conditions" (файл старого формата) -
+    добавляем top_process_cpu_pct >= прежний порог. Должно вызываться ДО
+    _backfill_screen_fields(), которая заводит пустой "conditions"."""
+    threshold = None
+    for s in screens:
+        if not isinstance(s, dict) or "conditions" in s:
+            continue
+        used = set()
+        for key in ("l1", "l2", "l3"):
+            used |= set(templates.used_variables(s.get(key, "")))
+        if used & set(_TOP_PROCESS_VARS):
+            if threshold is None:
+                threshold = _legacy_top_process_threshold()
+            s["conditions"] = [{
+                "var": "top_process_cpu_pct", "op": ">=", "value": threshold,
+                "for_s": 0.0, "hold_s": 0.0,
+            }]
+
+
+def load_screens():
+    try:
+        with open(SCREENS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and data:
+            before = json.dumps(data, sort_keys=True)
+            _migrate_top_process_conditions(data)
+            result = [_backfill_screen_fields(s) for s in data]
+            if json.dumps(result, sort_keys=True) != before:
+                # что-то мигрировало/дополнилось - фиксируем сразу, иначе
+                # разовая миграция порога потеряла бы источник (settings.json
+                # перестанет хранить top_process_min_cpu_pct)
+                try:
+                    save_screens(result)
+                except OSError:
+                    pass
+            return result
+    except Exception:
+        pass
+    return [json.loads(json.dumps(s)) for s in DEFAULT_SCREENS]
+
+
+def save_screens(screens):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(SCREENS_FILE, "w", encoding="utf-8") as f:
+        json.dump(screens, f, ensure_ascii=False)
+
+
+# ---------------- CRUD ----------------
+
+def new_screen(name="New screen", l1="", l2="", l3="", duration=4.0, tier="normal",
+               trigger_vars=None, conditions=None):
     return {
         "id": uuid.uuid4().hex[:12],
         "name": name,
@@ -313,6 +382,7 @@ def new_screen(name="New screen", l1="", l2="", l3="", duration=4.0, tier="norma
         "enabled": True,
         "tier": _sanitize_tier(tier),
         "trigger_vars": _sanitize_trigger_vars(trigger_vars),
+        "conditions": _sanitize_conditions(conditions),
     }
 
 
@@ -323,6 +393,7 @@ def create_screen(screens, data):
         duration=data.get("duration", 4.0),
         tier=data.get("tier", "normal"),
         trigger_vars=data.get("trigger_vars"),
+        conditions=data.get("conditions"),
     )
     screens.append(screen)
     return screens, screen
@@ -342,6 +413,8 @@ def update_screen(screens, screen_id, data):
                 s["tier"] = _sanitize_tier(data["tier"], fallback=s.get("tier", "normal"))
             if "trigger_vars" in data:
                 s["trigger_vars"] = _sanitize_trigger_vars(data["trigger_vars"])
+            if "conditions" in data:
+                s["conditions"] = _sanitize_conditions(data["conditions"])
             return screens, s
     return screens, None
 
@@ -357,41 +430,120 @@ def reorder_screens(screens, id_order):
     return reordered + missing
 
 
-# ---------------- рендер активного списка (без изменений логики) ----------------
+# ---------------- пороговые условия ----------------
 
-def build_active_screens(screens, context):
+def _condition_raw(cond, context, index):
+    """Выполняется ли условие ПРЯМО СЕЙЧАС (без for_s/hold_s). Нет данных
+    (None/не число) - условие невыполнено."""
+    value = variables.to_number(variables.resolve(cond["var"], context, index))
+    if value is None:
+        return False
+    return CONDITION_OPS[cond["op"]](value, cond["value"])
+
+
+class ConditionTracker:
+    """
+    Состояние for_s/hold_s для условий экранов. Живёт в RotationState (один
+    инстанс на процесс), между вызовами build_active_screens() - как и
+    остальные "стейты между тиками" (PeakHold, RotationState).
+
+    Ключ состояния - (ключ экрана, номер условия): ключ экрана это screen_id
+    либо "screen_id#idx" для копии repeating-экрана. begin()/end() окружают
+    один проход build_active_screens(): состояние тех ключей, что в этом
+    проходе не проверялись (экран отключён/удалён, условие отредактировано,
+    копия исчезла), сбрасывается - при следующем появлении отсчёт for_s
+    начнётся заново.
+
+    Правила одного условия:
+      - сейчас выполняется: запоминаем момент начала непрерывной серии
+        ("since") и последний момент выполнения ("last_true"); как только
+        серия длится >= for_s - условие "сработало" (met);
+      - сейчас не выполняется: серия рвётся; уже сработавшее условие остаётся
+        met, пока с last_true не прошло hold_s, потом гаснет;
+      - уже сработавшее условие, снова ставшее true во время удержания,
+        остаётся met без повторного ожидания for_s.
+    """
+
+    def __init__(self):
+        self._states = {}
+        self._seen = set()
+
+    def begin(self):
+        self._seen = set()
+
+    def end(self):
+        for key in list(self._states.keys()):
+            if key not in self._seen:
+                del self._states[key]
+
+    def check(self, screen_key, conditions, context, index, now):
+        """True, если ВСЕ условия экрана сработали. Пустой список - True.
+        Не прерывается на первом невыполненном - состояние каждого условия
+        должно обновляться на каждом проходе."""
+        all_met = True
+        for i, cond in enumerate(conditions):
+            state_key = (screen_key, i)
+            self._seen.add(state_key)
+            st = self._states.setdefault(state_key, {"since": None, "met": False, "last_true": None})
+
+            if _condition_raw(cond, context, index):
+                if st["since"] is None:
+                    st["since"] = now
+                st["last_true"] = now
+                if now - st["since"] >= cond.get("for_s", 0.0):
+                    st["met"] = True
+            else:
+                st["since"] = None
+                if st["met"] and now - st["last_true"] >= cond.get("hold_s", 0.0):
+                    st["met"] = False
+
+            if not st["met"]:
+                all_met = False
+        return all_met
+
+
+def _conditions_pass(tracker, screen_key, conditions, context, index, now):
+    """С трекером - полные правила (for_s/hold_s); без него - только текущее
+    значение (например при разовом вызове build_active_screens() без ротации)."""
+    if not conditions:
+        return True
+    if tracker is not None:
+        return tracker.check(screen_key, conditions, context, index, now)
+    return all(_condition_raw(c, context, index) for c in conditions)
+
+
+# ---------------- рендер активного списка ----------------
+
+def build_active_screens(screens, context, tracker=None, now=None):
     """
     Возвращает список готовых к показу экранов:
         [{"screen_id": ..., "lines": [l1,l2,l3], "duration": float,
-          "tier": "normal"|"personal"|"ambient", "trigger_vars": [str, ...]}, ...]
-    tier/trigger_vars - см. докстринг модуля выше про приоритетную ротацию;
-    копируются как есть из исходного screen-словаря (уже провалидированы при
-    загрузке/сохранении - см. _backfill_tier_fields()/_sanitize_tier()), тут
-    только подстраховка на случай мусора (см. tier not in SCREEN_TIERS ниже).
+          "tier": "normal"|"priority"|"ambient", "trigger_vars": [str, ...]}, ...]
 
-    В win-hud-arduino репитящихся групп несколько (stream/recent/qbt/mon,
-    см. variables.REPEATING_GROUPS) - для каждого КОНКРЕТНОГО экрана
-    используется не более одной из них за раз (см. len(groups) > 1 ниже -
-    смешивать переменные из разных групп в одном шаблоне не поддерживается,
-    непонятно было бы, по какому из счётчиков размножать копии).
+    tracker (ConditionTracker) и now - для пороговых условий с for_s/hold_s
+    (см. докстринг модуля); RotationState передаёт свой трекер на каждом
+    вызове. Без трекера условия проверяются по текущему значению.
 
-    ВАЖНО - как правильно делать "экран не включается, если ..." (портировано
-    из shkaf-hud, см. пример disk1/disk2/net1/net2 - экран гаснет, если буква
-    диска/интерфейс не выбраны в /settings; media - экран гаснет, если сейчас
-    ничего не играет; mon_down_names - алерт-экран гаснет, если всё живо, см.
-    metrics_windows.MediaMonitor/metrics_ping.PingMonitor соответственно):
+    Экран попадает в active, только если: включён, все его условия
+    выполнены, и ВСЕ переменные в l1/l2/l3 резолвятся (не None).
 
-    Экран автоматически выпадает из ротации, если ХОТЯ БЫ ОДНА переменная в
-    его l1/l2/l3 резолвится в None (см. ok1/ok2/ok3 ниже - all_resolved из
-    templates.render()). НЕ пишите условие видимости экрана здесь, в
-    screens.py - вместо этого resolver соответствующей переменной (в
-    variables.py) или, чаще, источник данных в context (metrics_windows.py/
-    metrics_ping.py/pc_hud.py) должен класть None именно в тот момент, когда
-    данных "нет по смыслу" (а не только когда их технически не удалось
-    прочитать). Дальше этот же общий механизм сработает сам - для ЛЮБОГО
-    будущего экрана, условного или нет, без специального кода тут.
+    Для каждого конкретного экрана допускается не более одной repeating-группы
+    (смешивать в одном шаблоне stream_*/mon_*/... не поддерживается - неясно,
+    по какому из счётчиков размножать копии). Группу определяют только
+    шаблоны строк, не условия: условие на переменную группы у экрана без
+    этой группы в шаблонах не выполнится (index не передаётся, резолвер даёт
+    None).
+
+    КАК ДЕЛАТЬ "экран не включается, если ...": экран выпадает из ротации,
+    если ХОТЬ ОДНА переменная его l1/l2/l3 резолвится в None (см. ok1/ok2/ok3),
+    либо не выполнено пороговое условие. НЕ пишите условия видимости здесь -
+    пусть resolver в variables.py или источник данных в context кладёт None,
+    когда данных "нет по смыслу", либо задайте условие в самом экране.
     """
+    now = now if now is not None else time.time()
     active = []
+    if tracker is not None:
+        tracker.begin()
 
     for screen in screens:
         if not screen.get("enabled", True):
@@ -405,12 +557,13 @@ def build_active_screens(screens, context):
         if len(groups) > 1:
             continue
 
-        tier = screen.get("tier", "normal")
-        if tier not in SCREEN_TIERS:
-            tier = "normal"
+        tier = _normalize_tier(screen.get("tier")) or "normal"
         trigger_vars = screen.get("trigger_vars") or []
+        conditions = screen.get("conditions") or []
 
         if not groups:
+            if not _conditions_pass(tracker, screen["id"], conditions, context, None, now):
+                continue
             r1, ok1 = templates.render(l1, context)
             r2, ok2 = templates.render(l2, context)
             r3, ok3 = templates.render(l3, context)
@@ -421,19 +574,17 @@ def build_active_screens(screens, context):
                 })
             continue
 
-        # Достижимая ветка (несмотря на комментарий "недостижимая" в
-        # некоторых старых заметках проекта) - пользователь МОЖЕТ вручную
-        # добавить экран на переменных repeating-группы (stream_*/recent_*/
-        # qbt_*/mon_*, см. README) через /screens, интеграции для этого
-        # предусмотрены (metrics_tautulli.py/metrics_qbittorrent.py/
-        # metrics_ping.py); для "mon" это ДОСТИЖИМО СРАЗУ из коробки - см.
-        # default-monitoring в DEFAULT_SCREENS выше. tier/trigger_vars
-        # относятся к ЭКРАНУ целиком - у всех N копий одно и то же БАЗОВОЕ
-        # значение, ЗА ИСКЛЮЧЕНИЕМ point-override ниже для group_name ==
-        # "stream" (см. _stream_copy_tier()).
+        # repeating-группа: N копий экрана. tier/trigger_vars/conditions
+        # общие для всех копий; условия проверяются для КАЖДОЙ копии со своим
+        # index (условие на mon_latency_ms > 100 - по задержке именно этой
+        # цели). ЗА ИСКЛЮЧЕНИЕМ point-override tier для группы "stream" (см.
+        # _stream_copy_tier()).
         group_name = next(iter(groups))
         count = variables.group_count(group_name, context)
         for idx in range(count):
+            copy_key = f"{screen['id']}#{idx}"
+            if not _conditions_pass(tracker, copy_key, conditions, context, idx, now):
+                continue
             r1, ok1 = templates.render(l1, context, index=idx)
             r2, ok2 = templates.render(l2, context, index=idx)
             r3, ok3 = templates.render(l3, context, index=idx)
@@ -442,30 +593,26 @@ def build_active_screens(screens, context):
                 if group_name == "stream":
                     copy_tier = _stream_copy_tier(tier, idx, context)
                 active.append({
-                    "screen_id": f"{screen['id']}#{idx}",
+                    "screen_id": copy_key,
                     "lines": [r1, r2, r3],
                     "duration": screen["duration"],
                     "tier": copy_tier, "trigger_vars": trigger_vars,
                 })
 
+    if tracker is not None:
+        tracker.end()
     return active
 
 
 def _stream_copy_tier(base_tier, idx, context):
-    """Point-override tier ОДНОЙ конкретной копии repeating-группы "stream" -
-    см. обсуждение в чате про "свой/чужой Plex-сеанс": если у пользователя
-    заполнена настройка my_plex_user (/settings, карточка Tautulli) И она
-    совпадает с полем "user" именно ЭТОГО сеанса (context["streams"][idx],
-    см. metrics_tautulli.TautulliClient._get_activity() - там же friendly_name
-    попадает в это поле) - апгрейдим tier ЭТОЙ КОНКРЕТНОЙ копии экрана до
-    "personal" (тот же человек смотрит на этом же ПК, событие локальное).
+    """Point-override tier ОДНОЙ копии repeating-группы "stream": если
+    заполнен my_plex_user (/settings, карточка Tautulli) и совпадает с "user"
+    именно ЭТОГО сеанса - копия становится "priority" (тот же человек смотрит
+    на этом же ПК, событие локальное).
 
-    Апгрейд применяется, ТОЛЬКО если базовый tier экрана - "ambient" (это и
-    есть рекомендованная настройка для экрана на stream-переменных - см.
-    подсказку в /screens) - если админ явно поставил другой tier для всего
-    экрана (например "normal" или уже "personal"), это осознанный выбор,
-    point-override его не трогает. Чужие сеансы (user не совпал, или
-    my_plex_user не заполнен) возвращают base_tier как есть - без изменений."""
+    Апгрейд только если базовый tier экрана - "ambient" (рекомендованная
+    настройка для экранов на stream-переменных); явно выбранный другой tier
+    point-override не трогает. Чужие сеансы возвращают base_tier как есть."""
     if base_tier != "ambient":
         return base_tier
     my_user = (context.get("my_plex_user") or "").strip()
@@ -476,99 +623,82 @@ def _stream_copy_tier(base_tier, idx, context):
         return base_tier
     session_user = streams[idx].get("user") or ""
     if session_user == my_user:
-        return "personal"
+        return "priority"
     return base_tier
 
 
-# ---------------- ротация (НОВОЕ - три дорожки по tier, см. докстринг модуля) ----------------
+# ---------------- ротация (три дорожки по tier) ----------------
 
 class RotationState:
     """
-    Живёт в памяти главного цикла (один инстанс на процесс, как и раньше) -
-    продвигает текущий экран по его СОБСТВЕННОМУ duration (пользовательская
-    настройка НИКОГДА не переопределяется этим классом - см. докстринг
-    модуля: механизм управляет только тем, КАК ЧАСТО экран получает слот,
-    а не тем, сколько секунд он висит на этом слоте), плюс:
+    Живёт в памяти главного цикла (один инстанс на процесс) - продвигает
+    текущий экран по его СОБСТВЕННОМУ duration (пользовательская настройка
+    никогда не переопределяется: механизм управляет только тем, КАК ЧАСТО
+    экран получает слот), плюс:
 
-      - три независимых "дорожки" (lanes) по tier - personal/ambient/normal -
+      - три независимых "дорожки" (lanes) по tier - priority/ambient/normal -
         каждая крутится по кругу САМА ПО СЕБЕ (round-robin по screen_id
-        внутри своей дорожки, не смешиваясь с другими) - см. _pick_in_lane();
-      - slot_counter решает, чья дорожка получает ПЛАНОВЫЙ (не форсированный)
-        слот на этот виток - см. _select_tier(): personal - каждый
-        priority_boost_personal-й слот, ambient - каждый priority_boost_ambient-й,
-        иначе - normal. Если "должная" дорожка на этот виток пуста - слот
-        просто достаётся normal (или следующей непустой дорожке) - "должок"
-        НЕ копится, ждём следующего совпадения по модулю (см. обсуждение -
-        осознанно простое правило, без carry-over);
-      - только personal-дорожка имеет право ФОРСИРОВАННО прервать текущий
-        показ (см. current_lines() ниже) - при активации (экран появился в
-        active, которого не было на прошлом тике) или при изменении его
-        trigger_vars ПРЯМО во время собственного показа (в этом случае это
-        НЕ смена текущего экрана, а продление duration с обновлённым
-        содержимым - см. "elif cur_tier == 'personal'" ниже). ambient никогда
-        не прерывает - только получает более частые ПЛАНОВЫЕ слоты;
-      - если экран, который сейчас показывается, ИСЧЕЗ из active раньше
-        истечения своего duration (событие закончилось/условие перестало
-        выполняться) - уступаем место немедленно, не дожидаясь таймера, для
-        ЛЮБОГО tier (не только personal) - иначе завис бы на устаревшем
-        содержимом (см. обсуждение п.3.4 - тот же нюанс был скрытым багом и
-        в старой index-модели, просто маскировался там переиндексацией).
+        внутри дорожки) - см. _pick_in_lane();
+      - slot_counter решает, чья дорожка получает ПЛАНОВЫЙ слот: priority -
+        каждый boost_priority-й, ambient - каждый boost_ambient-й, иначе
+        normal (см. _select_tier()). Если "должная" дорожка пуста, слот
+        достаётся следующей непустой - "должок" не копится;
+      - только priority-дорожка имеет право ФОРСИРОВАННО прервать текущий
+        показ: при активации (экран появился в active - в том числе потому,
+        что сработали его пороговые условия) или при изменении его
+        trigger_vars прямо во время показа (тогда это не смена экрана, а
+        продление duration с новым содержимым). ambient не прерывает никогда;
+      - если показываемый экран ИСЧЕЗ из active раньше истечения duration
+        (событие закончилось / условия перестали выполняться и hold_s
+        истёк) - уступаем место немедленно, для ЛЮБОГО tier.
 
-    trigger_fingerprints - кэш последних значений trigger_vars на экран (по
-    screen_id), нужен только personal-экранам с непустым trigger_vars -
-    используется, чтобы отличить "контент сменился" (стоит форсировать
-    обновление/продление) от "контент тот же" (ничего специально делать не
-    нужно - строки и так перерисовываются каждый вызов, см. ниже).
-
-    _prev_active_ids - screen_id, которые были активны на ПРЕДЫДУЩЕМ вызове -
-    сравнение с текущим active даёт "какие personal-экраны только что
-    активировались" (её не было раньше, появилась сейчас).
+    conditions - ConditionTracker (см. выше) с состоянием for_s/hold_s.
+    trigger_fingerprints - кэш последних значений trigger_vars по screen_id
+    (нужен priority-экранам с непустым trigger_vars). _prev_active_ids -
+    screen_id, активные на ПРЕДЫДУЩЕМ вызове: сравнение с текущим active даёт
+    "какие priority-экраны только что активировались".
     """
 
     def __init__(self):
-        self.lane_cursors = {"personal": None, "ambient": None, "normal": None}
+        self.lane_cursors = {"priority": None, "ambient": None, "normal": None}
         self.slot_counter = 0
         self.current = None  # {"screen_id","tier","lines","duration","started_at"} | None
         self.trigger_fingerprints = {}
+        self.conditions = ConditionTracker()
         self._prev_active_ids = set()
 
     @staticmethod
     def _fingerprint(screen_id, trigger_vars_by_id, context):
-        """None, если у экрана нет trigger_vars (форс только на активацию,
-        см. докстринг класса) - иначе кортеж значений его trigger_vars ПРЯМО
-        СЕЙЧАС, для сравнения с прошлым вызовом."""
+        """None, если у экрана нет trigger_vars - иначе кортеж значений его
+        trigger_vars ПРЯМО СЕЙЧАС, для сравнения с прошлым вызовом."""
         tvars = trigger_vars_by_id.get(screen_id) or []
         if not tvars:
             return None
         return tuple(variables.resolve(v, context) for v in tvars)
 
-    def _select_tier(self, lanes, priority_boost_personal, priority_boost_ambient):
-        """Чья дорожка получает ПЛАНОВЫЙ слот на этот виток - см. докстринг
-        класса. Пустая "должная" дорожка молча уступает normal, а если и
-        normal пуста - следующей непустой (personal, потом ambient) - до
-        полностью пустого active() дело не доходит, этот случай отсекается
-        раньше, в current_lines()."""
-        personal_boost = max(1, int(priority_boost_personal))
-        ambient_boost = max(1, int(priority_boost_ambient))
+    def _select_tier(self, lanes, boost_priority, boost_ambient):
+        """Чья дорожка получает ПЛАНОВЫЙ слот на этот виток. Пустая "должная"
+        дорожка молча уступает normal, а если и normal пуста - следующей
+        непустой (priority, потом ambient)."""
+        priority_boost = max(1, int(boost_priority))
+        ambient_boost = max(1, int(boost_ambient))
 
-        if lanes["personal"] and self.slot_counter % personal_boost == 0:
-            return "personal"
+        if lanes["priority"] and self.slot_counter % priority_boost == 0:
+            return "priority"
         if lanes["ambient"] and self.slot_counter % ambient_boost == 0:
             return "ambient"
         if lanes["normal"]:
             return "normal"
-        if lanes["personal"]:
-            return "personal"
+        if lanes["priority"]:
+            return "priority"
         if lanes["ambient"]:
             return "ambient"
         return None
 
     def _pick_in_lane(self, tier, lane_ids):
-        """Round-robin ВНУТРИ одной дорожки, независимо от других дорожек -
-        курсор хранит screen_id (не индекс!), т.к. active пересобирается
-        каждый вызов и порядковый индекс "поплыл" бы при любом изменении
-        состава активных экранов между тиками (это и была скрытая слабость
-        старой index-модели - см. докстринг класса)."""
+        """Round-robin ВНУТРИ одной дорожки - курсор хранит screen_id (не
+        индекс!), т.к. active пересобирается каждый вызов и порядковый индекс
+        "поплыл" бы при любом изменении состава активных экранов."""
         if not lane_ids:
             return None
         cursor = self.lane_cursors.get(tier)
@@ -576,16 +706,26 @@ class RotationState:
             idx = lane_ids.index(cursor)
             next_id = lane_ids[(idx + 1) % len(lane_ids)]
         else:
-            # курсор не найден (первый вызов, либо прошлый экран этой
-            # дорожки исчез из active) - начинаем дорожку заново с начала
+            # курсор не найден (первый вызов, либо прошлый экран дорожки
+            # исчез из active) - начинаем дорожку заново
             next_id = lane_ids[0]
         self.lane_cursors[tier] = next_id
         return next_id
 
     def current_lines(self, screens, context, now=None,
-                       priority_boost_personal=2, priority_boost_ambient=4):
+                       boost_priority=2, boost_ambient=4,
+                       priority_boost_personal=None, priority_boost_ambient=None):
+        # priority_boost_personal/priority_boost_ambient - прежние имена
+        # параметров (до переименования tier "personal" -> "priority"), приняты
+        # как алиасы, чтобы pc_hud.py прежней версии продолжал работать до
+        # своего обновления.
+        if priority_boost_personal is not None:
+            boost_priority = priority_boost_personal
+        if priority_boost_ambient is not None:
+            boost_ambient = priority_boost_ambient
+
         now = now if now is not None else time.time()
-        active = build_active_screens(screens, context)
+        active = build_active_screens(screens, context, tracker=self.conditions, now=now)
         active_by_id = {a["screen_id"]: a for a in active}
 
         if not active:
@@ -593,7 +733,7 @@ class RotationState:
             self._prev_active_ids = set()
             return ["", "", ""]
 
-        lanes = {"personal": [], "ambient": [], "normal": []}
+        lanes = {"priority": [], "ambient": [], "normal": []}
         for item in active:
             tier = item.get("tier", "normal")
             if tier not in lanes:
@@ -602,9 +742,9 @@ class RotationState:
 
         trigger_vars_by_id = {item["screen_id"]: item.get("trigger_vars") or [] for item in active}
 
-        # ---- какие personal-экраны только что появились в active (не было
+        # ---- какие priority-экраны только что появились в active (не было
         # на прошлом вызове) - право форс-прерывания текущего показа ----
-        newly_active_personal = [sid for sid in lanes["personal"] if sid not in self._prev_active_ids]
+        newly_active_priority = [sid for sid in lanes["priority"] if sid not in self._prev_active_ids]
         self._prev_active_ids = set(active_by_id.keys())
 
         # ---- текущий показываемый экран: исчез / контент сменился / жив как есть ----
@@ -613,30 +753,26 @@ class RotationState:
             cur_tier = self.current["tier"]
 
             if cur_id not in active_by_id:
-                # событие закончилось / условие видимости перестало
-                # выполняться - уступаем место немедленно, не дожидаясь
-                # истечения duration, независимо от tier (см. докстринг класса)
+                # событие закончилось / условия перестали выполняться -
+                # уступаем место немедленно, независимо от tier
                 self.current = None
             else:
                 # экран всё ещё активен - строки перерисовываем в любом
-                # случае (context мог поменяться в нетриггерных полях, см.
-                # обсуждение п.3.1 - это просто обновление текста, не смена
-                # слота и не продление таймера)
+                # случае (это обновление текста, не смена слота и не
+                # продление таймера)
                 self.current["lines"] = active_by_id[cur_id]["lines"]
-                if cur_tier == "personal":
+                if cur_tier == "priority":
                     fp = self._fingerprint(cur_id, trigger_vars_by_id, context)
                     if fp is not None and self.trigger_fingerprints.get(cur_id) != fp:
-                        # это другое событие (например, сменился трек, либо
-                        # изменился список упавших ресурсов на алерт-экране),
-                        # а не то же самое - форсируем полное продление
-                        # duration, как будто экран показался заново
+                        # другое событие (сменился трек, изменился список
+                        # упавших ресурсов) - форсируем продление duration
                         self.trigger_fingerprints[cur_id] = fp
                         self.current["started_at"] = now
 
-        # ---- форс-активация: personal-экран появился, которого не было
-        # (и это не тот, что уже показывается сейчас) ----
+        # ---- форс-активация: priority-экран появился (и это не тот, что
+        # уже показывается сейчас) ----
         force_target = None
-        for sid in newly_active_personal:
+        for sid in newly_active_priority:
             if self.current is None or self.current["screen_id"] != sid:
                 force_target = sid
                 break
@@ -644,11 +780,11 @@ class RotationState:
         if force_target is not None:
             item = active_by_id[force_target]
             self.current = {
-                "screen_id": force_target, "tier": "personal",
+                "screen_id": force_target, "tier": "priority",
                 "lines": item["lines"], "duration": item["duration"], "started_at": now,
             }
             self.trigger_fingerprints[force_target] = self._fingerprint(force_target, trigger_vars_by_id, context)
-            self.lane_cursors["personal"] = force_target
+            self.lane_cursors["priority"] = force_target
             return self.current["lines"]
 
         # ---- обычное продолжение текущего показа (duration ещё не истёк) ----
@@ -656,8 +792,8 @@ class RotationState:
             return self.current["lines"]
 
         # ---- плановая смена: duration истёк (или self.current стал None
-        # выше из-за исчезновения экрана) - выбираем следующий по алгоритму ----
-        tier = self._select_tier(lanes, priority_boost_personal, priority_boost_ambient)
+        # из-за исчезновения экрана) - выбираем следующий по алгоритму ----
+        tier = self._select_tier(lanes, boost_priority, boost_ambient)
         self.slot_counter += 1
         if tier is None:
             # теоретически недостижимо (active непуст -> хотя бы одна
@@ -671,6 +807,6 @@ class RotationState:
             "screen_id": screen_id, "tier": tier,
             "lines": item["lines"], "duration": item["duration"], "started_at": now,
         }
-        if tier == "personal":
+        if tier == "priority":
             self.trigger_fingerprints[screen_id] = self._fingerprint(screen_id, trigger_vars_by_id, context)
         return self.current["lines"]

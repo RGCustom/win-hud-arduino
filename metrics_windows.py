@@ -278,57 +278,58 @@ class TopProcessMonitor:
     Процесс с наибольшей загрузкой CPU прямо сейчас - аналог столбца CPU в
     Диспетчере задач, отсортированного по убыванию.
 
+    ПОРОГА ПОКАЗА ЗДЕСЬ БОЛЬШЕ НЕТ. Раньше read() сам возвращал name=None,
+    если самый загруженный процесс не дотягивал до порога (настройка
+    top_process_min_cpu_pct в /settings). Теперь монитор всегда отдаёт
+    реальный топ-процесс, а "показывать ли его" решает сам OLED-экран через
+    пороговое условие (например top_process_cpu_pct >= 25 в редакторе
+    /screens, см. screens.py conditions) - так порог живёт там же, где
+    остальные условия показа, и его можно задать per-экран, а не один на всё
+    приложение. Верное значение порога по-прежнему зависит от железа: psutil
+    отдаёт CPU% НЕ нормализованным по числу потоков (сумма по ядрам), поэтому
+    на многопоточном CPU один полностью загруженный поток даёт лишь несколько
+    процентов.
+
     psutil.Process.cpu_percent(interval=None) - "неблокирующий" режим:
     считает загрузку МЕЖДУ двумя вызовами для ОДНОГО И ТОГО ЖЕ объекта
-    Process (точно то же поведение, что у psutil.cpu_percent(percpu=True) в
-    read_cpu_stats() выше) - первый вызов сразу после создания объекта
-    Process всегда возвращает 0.0 (нет предыдущей точки для сравнения),
-    осмысленное значение появляется со второго вызова. Поэтому Process-
-    объекты кэшируются между тиками в self._procs по pid, а не создаются
-    заново на каждый read() - иначе top_process_cpu_pct был бы всегда 0.
+    Process (то же поведение, что у psutil.cpu_percent(percpu=True) в
+    read_cpu_stats() выше) - первый вызов после создания объекта всегда
+    возвращает 0.0 (нет предыдущей точки для сравнения), осмысленное значение
+    появляется со второго вызова. Поэтому Process-объекты кэшируются между
+    вызовами в self._procs по pid, а не создаются заново на каждый read().
+    Процесс, ВПЕРВЫЕ замеченный в текущем вызове, в выборе топа не участвует
+    (его "прайминг" и чтение шли бы подряд с интервалом в миллисекунды - такое
+    значение шумное и может дать ложный всплеск) - он начнёт учитываться со
+    следующего вызова.
 
-    ИСКЛЮЧЕНИЯ (см. обсуждение в чате - "постоянно показывает System Idle
-    Process"): System Idle Process (PID 0 на Windows) - это НЕ реальный
-    процесс, а бухгалтерская запись psutil/ОС для "незанятого" времени CPU -
-    на многоядерных машинах Windows отдаёт его cpu_percent() в величинах,
-    которые из-за способа расчёта (сумма по ядрам, не среднее) часто
-    оказываются ВЫШЕ, чем у любого реально нагруженного процесса, поэтому
-    Idle почти всегда "побеждал" в сравнении best_cpu выше, даже когда
-    машина занята чем-то конкретным. PID 4 ("System") - тоже служебная
-    запись ядра Windows (не то, что пользователь хочет увидеть как "топ-
-    процесс") - исключается по той же причине. _IGNORED_PIDS ниже - не
-    константа модуля, а атрибут класса, т.к. используется только здесь.
+    ИСКЛЮЧЕНИЯ ("постоянно показывает System Idle Process"): System Idle
+    Process (PID 0 на Windows) - это НЕ реальный процесс, а бухгалтерская
+    запись ОС для "незанятого" времени CPU; на многоядерных машинах его
+    cpu_percent() из-за суммирования по ядрам часто выше, чем у любого
+    реально нагруженного процесса, и Idle почти всегда "побеждал" в
+    сравнении. PID 4 ("System") - служебная запись ядра Windows, не то, что
+    пользователь хочет видеть как "топ-процесс" - исключается по той же
+    причине (_IGNORED_PIDS).
     """
 
     _IGNORED_PIDS = (0, 4)  # System Idle Process, System
-
-    # Минимальный процент загрузки CPU, ниже которого top_process_name
-    # считается "нет активности, достойной показа" (см. обсуждение в
-    # чате - хотим видеть значение только во время игры/работы, не любой
-    # фоновый процесс на доли процента). ЖИВАЯ настройка в /settings
-    # (cfg["top_process_min_cpu_pct"], см. DEFAULT_SETTINGS в pc_hud.py) -
-    # это значение тут только ДЕФОЛТ, используемый read(), если
-    # min_cpu_pct не передан явно (старый settings.json без ключа, прямой
-    # вызов из самотеста модуля и т.п.). Разумный дефолт по-прежнему нужен
-    # тут же, т.к. верный порог сильно зависит от железа конкретной машины
-    # (см. обоснование 25% для 20-поточного CPU в докстринге модуля выше) -
-    # именно поэтому это слайдер в /settings, а не общая для всех константа.
-    MIN_CPU_PCT = 25.0
 
     def __init__(self):
         self._procs = {}  # pid -> psutil.Process
 
     def read(self, min_cpu_pct=None):
-        """min_cpu_pct - живой порог из /settings (см. MIN_CPU_PCT выше за
-        обоснованием дефолта) - None означает "использовать дефолт класса".
+        """min_cpu_pct - УСТАРЕЛО, значение игнорируется (порог теперь задаётся
+        условием экрана, см. докстринг класса). Параметр оставлен только для
+        совместимости с вызовом из прежней версии pc_hud.py (integrations_loop
+        передавал его по имени) - без него старый вызов упал бы с TypeError и
+        оборвал бы весь фоновый поток интеграций.
 
         Возвращает dict: top_process_name (str|None - None, если ни один
-        процесс не удалось прочитать ЛИБО ни один реальный процесс не
-        превысил min_cpu_pct прямо сейчас), top_process_cpu_pct,
-        top_process_ram_pct (0.0, если name is None)."""
-        if min_cpu_pct is None:
-            min_cpu_pct = self.MIN_CPU_PCT
+        процесс не удалось прочитать ЛИБО ни у одного пока нет ненулевой
+        загрузки, например сразу после запуска приложения),
+        top_process_cpu_pct, top_process_ram_pct (0.0, если name is None)."""
         current_pids = set()
+        fresh_pids = set()  # впервые замеченные в ЭТОМ вызове - см. докстринг класса
         try:
             for p in psutil.process_iter(["pid"]):
                 pid = p.info["pid"]
@@ -337,6 +338,7 @@ class TopProcessMonitor:
                     continue
                 if pid not in self._procs:
                     self._procs[pid] = p
+                    fresh_pids.add(pid)
                     try:
                         p.cpu_percent(None)  # "прайминг" первой точки отсчёта - результат не нужен
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -350,23 +352,23 @@ class TopProcessMonitor:
             if pid not in current_pids:
                 del self._procs[pid]
 
-        best_name, best_cpu, best_ram = None, -1.0, 0.0
-        for proc in self._procs.values():
+        best_name, best_cpu, best_ram = None, 0.0, 0.0
+        for pid, proc in self._procs.items():
+            if pid in fresh_pids:
+                continue
             try:
                 cpu = proc.cpu_percent(None)
                 if cpu > best_cpu:
-                    best_cpu = cpu
-                    best_ram = proc.memory_percent()
-                    best_name = proc.name()
+                    # имя/RAM читаем ДО присвоения best_cpu - если чтение
+                    # упадёт (процесс завершился между вызовами), кандидат
+                    # целиком отбрасывается, а не остаётся с чужим именем
+                    ram = proc.memory_percent()
+                    name = proc.name()
+                    best_cpu, best_ram, best_name = cpu, ram, name
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        # Ниже порога min_cpu_pct - считаем, что "ничего особо тяжёлого не
-        # происходит" и не показываем top_process вовсе (см. докстринг
-        # класса выше) - тот же смысл, что и у best_name is None ниже,
-        # просто по другой причине (не "не удалось прочитать", а "все
-        # найденные процессы слишком лёгкие").
-        if best_name is None or best_cpu < min_cpu_pct:
+        if best_name is None:
             return {"top_process_name": None, "top_process_cpu_pct": 0.0, "top_process_ram_pct": 0.0}
 
         return {
@@ -919,7 +921,7 @@ if __name__ == "__main__":
     print("Keyboard state (layout + foreground_pid):", read_keyboard_state())
 
     top_proc = TopProcessMonitor()
-    print("Top process (1st call, ожидаемо 0.0 - см. докстринг класса):", top_proc.read())
+    print("Top process (1st call, ожидаемо name=None - все процессы ещё \"новые\", см. докстринг класса):", top_proc.read())
     time.sleep(1)
     print("Top process (2nd call, через 1с):", top_proc.read())
 

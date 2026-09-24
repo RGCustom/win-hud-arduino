@@ -20,6 +20,10 @@ shkaf-hud практически без изменений логики: дви�
     (Система/Время и раскладка/GPU/Диски/Сеть/Аудио/Медиа/Plex/qBittorrent/
     Мониторинг, вместо Система/Диски.../Media/qBittorrent)
 
+Условия показа (НОВОЕ): у каждого экрана есть список пороговых условий (conditions,
+см. screens.py) - редактор в модальном окне, переменные берутся из /api/variables
+(только с numeric=true). Tier "personal" переименован в "priority" ("Приоритетный").
+
 get_context - функция без аргументов, возвращающая текущий context (тот же
 словарь, что build_active_screens ожидает) - нужна для живого превью при
 редактировании шаблона. Подключается вызовом register_screens_routes(app, get_context).
@@ -71,7 +75,7 @@ SCREENS_PAGE_HTML = """<!doctype html>
   .screen-row .name { font-size:14px; }
   .tier-badge { display:inline-block; font-size:9px; font-weight:700; letter-spacing:.03em;
                 border-radius:4px; padding:1px 5px; margin-left:8px; vertical-align:middle; }
-  .tier-badge-personal { background:var(--accent); color:#151515; }
+  .tier-badge-priority { background:var(--accent); color:#151515; }
   .tier-badge-ambient { background:#2c2e31; color:var(--muted); border:1px solid var(--border); }
   .screen-row .preview { font-size:11px; color:var(--muted); font-family:monospace; white-space:nowrap;
                           overflow:hidden; text-overflow:ellipsis; }
@@ -100,6 +104,26 @@ SCREENS_PAGE_HTML = """<!doctype html>
     border-radius:6px; padding:8px 10px; font-size:13px;
   }
   .tier-hint { font-size:11px; color:var(--muted); margin-top:4px; line-height:1.4; }
+
+  /* ---- Условия показа (пороговые условия экрана) ---- */
+  .cond-summary { font-size:11px; color:var(--accent); opacity:.85; margin-top:2px; white-space:nowrap;
+                  overflow:hidden; text-overflow:ellipsis; }
+  .cond-row { border:1px solid var(--border); border-radius:8px; padding:8px; margin-top:8px; background:#191a1c; }
+  .cond-line { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .cond-line + .cond-line { margin-top:6px; }
+  .modal .cond-line select, .modal .cond-line input[type=number] {
+    background:#101112; color:var(--text); border:1px solid var(--border); border-radius:6px;
+    padding:6px 8px; font-size:13px; font-family:inherit; }
+  .modal .cond-line select.cond-var { flex:1 1 200px; min-width:0; width:auto; }
+  .modal .cond-line select.cond-op { width:56px; }
+  .modal .cond-line input.cond-val { width:90px; }
+  .modal .cond-line input.cond-num { width:72px; }
+  .cond-unit, .cond-lbl { font-size:12px; color:var(--muted); }
+  .cond-now { font-size:11px; color:var(--muted); font-family:monospace; }
+  .cond-del { margin-left:auto; background:none; border:1px solid var(--border); color:var(--muted);
+              border-radius:6px; padding:4px 9px; cursor:pointer; font-size:13px; }
+  .cond-del:hover { color:var(--danger); border-color:var(--danger); }
+  .cond-empty { font-size:12px; color:var(--muted); margin-top:6px; }
   .trigger-vars-list { display:flex; flex-wrap:wrap; gap:4px 12px; margin-top:6px; }
   .trigger-vars-list label { display:inline-flex; align-items:center; gap:5px; margin:0;
                               font-size:12px; color:var(--text); font-family:monospace; }
@@ -151,15 +175,24 @@ SCREENS_PAGE_HTML = """<!doctype html>
     <label>Приоритет (tier)</label>
     <select id="edit-tier">
       <option value="normal">Обычный</option>
-      <option value="personal">Личный (чаще + может прервать другой экран)</option>
+      <option value="priority">Приоритетный (чаще + может прервать другой экран)</option>
       <option value="ambient">Фоновый (чаще, без права прерывания)</option>
     </select>
     <div class="tier-hint" id="tier-hint"></div>
 
     <div id="trigger-vars-block" style="display:none">
-      <label>Триггер-переменные (мгновенное обновление, без ожидания своей очереди)</label>
+      <label>Триггер-переменные (смена значения на показываемом экране продлевает показ)</label>
       <div class="trigger-vars-list" id="trigger-vars-list"></div>
     </div>
+
+    <label>Условия показа (порог значения)</label>
+    <div class="tier-hint">Экран показывается, только пока выполнены ВСЕ условия (например
+      загрузка CPU &gt; 25%). Приоритетный экран при срабатывании условий сразу прерывает текущий
+      показ. «Держится не менее» - условие должно выполняться столько секунд подряд (отсекает
+      короткие всплески), «после спада ещё» - экран остаётся ещё на столько секунд после того,
+      как значение упало ниже порога (защита от дребезга). Точность - около секунды.</div>
+    <div id="conditions-list"></div>
+    <button type="button" class="btn secondary" id="add-condition-btn" style="margin-top:8px">+ Добавить условие</button>
 
     <label>Строка 1</label>
     <input type="text" id="edit-l1" placeholder="CPU {cpu_pct}%">
@@ -189,6 +222,7 @@ SCREENS_PAGE_HTML = """<!doctype html>
 let screensCache = [];
 let draggedId = null;
 let focusedField = null;
+let numericVars = [];  // переменные, на которые можно вешать пороги (из /api/variables, numeric=true)
 
 document.querySelectorAll('#edit-l1,#edit-l2,#edit-l3').forEach(el => {
   el.addEventListener('focus', () => focusedField = el);
@@ -196,7 +230,8 @@ document.querySelectorAll('#edit-l1,#edit-l2,#edit-l3').forEach(el => {
 
 function loadScreens() {
   fetch('/api/screens').then(r => r.json()).then(data => {
-    screensCache = data;
+    // страховка: сервер сам мигрирует прежний tier 'personal' -> 'priority', но не ломаемся и на старом ответе
+    screensCache = data.map(s => s.tier === 'personal' ? Object.assign({}, s, { tier: 'priority' }) : s);
     renderList();
   });
 }
@@ -241,10 +276,10 @@ function renderList() {
     const name = document.createElement('div');
     name.className = 'name';
     name.textContent = s.name;
-    if (s.tier === 'personal' || s.tier === 'ambient') {
+    if (s.tier === 'priority' || s.tier === 'ambient') {
       const tierBadge = document.createElement('span');
       tierBadge.className = 'tier-badge tier-badge-' + s.tier;
-      tierBadge.textContent = s.tier === 'personal' ? 'ЛИЧНЫЙ' : 'ФОНОВЫЙ';
+      tierBadge.textContent = s.tier === 'priority' ? 'ПРИОРИТЕТ' : 'ФОНОВЫЙ';
       name.appendChild(tierBadge);
     }
     const preview = document.createElement('div');
@@ -252,6 +287,12 @@ function renderList() {
     preview.textContent = [s.l1, s.l2, s.l3].filter(Boolean).join('  |  ');
     info.appendChild(name);
     info.appendChild(preview);
+    if (s.conditions && s.conditions.length) {
+      const summary = document.createElement('div');
+      summary.className = 'cond-summary';
+      summary.textContent = '\u2691 ' + s.conditions.map(condToText).join('  \u00b7  ');
+      info.appendChild(summary);
+    }
 
     const dur = document.createElement('input');
     dur.type = 'number';
@@ -283,6 +324,9 @@ function saveOrder() {
 
 function buildLegend() {
   fetch('/api/variables').then(r => r.json()).then(vars => {
+    numericVars = vars.filter(v => v.numeric);
+    renderList();        // подписи единиц в сводке условий появляются, когда пришёл список переменных
+    renderConditions();
     const categories = {};
     vars.forEach(v => { (categories[v.category] = categories[v.category] || []).push(v); });
 
@@ -349,8 +393,8 @@ function livePreview(inputEl, previewEl) {
 
 const TIER_HINTS = {
   normal: 'Обычная ротация, без особого поведения.',
-  personal: 'Показывается чаще (см. "Приоритетная ротация" на /settings) и может мгновенно ' +
-    'прервать текущий показ - как при появлении (например, началась музыка), так и при смене ' +
+  priority: 'Показывается чаще (см. "Приоритетная ротация" на /settings) и может мгновенно ' +
+    'прервать текущий показ - при появлении (началась музыка, сработали условия показа ниже), а также при смене ' +
     'выбранных ниже триггер-переменных на уже показываемом экране (например, сменился трек).',
   ambient: 'Показывается чаще обычного, но НЕ прерывает текущий показ - просто получает более ' +
     'частые слоты в очереди.',
@@ -410,13 +454,208 @@ function rebuildTriggerVars() {
 
 function applyTierVisibility(tier) {
   document.getElementById('tier-hint').textContent = TIER_HINTS[tier] || '';
-  // trigger_vars имеют смысл ТОЛЬКО для tier=personal (мгновенное
+  // trigger_vars имеют смысл ТОЛЬКО для tier=priority (мгновенное
   // продление показа при смене контента - см. докстринг screens.py, для
   // ambient/normal такого права нет) - не показываем блок зря.
-  document.getElementById('trigger-vars-block').style.display = tier === 'personal' ? 'block' : 'none';
+  document.getElementById('trigger-vars-block').style.display = tier === 'priority' ? 'block' : 'none';
 }
 
 document.getElementById('edit-tier').addEventListener('change', e => applyTierVisibility(e.target.value));
+
+// ---- Условия показа (пороговые условия, см. screens.py conditions) ----
+// Состояние живёт в массиве (не в DOM): renderConditions() перестраивает
+// строки только при открытии окна/добавлении/удалении, а правка полей пишет
+// прямо в объект строки - так набор текста в поле не сбрасывается.
+let currentConditions = [];
+const COND_OPS = [['>', '>'], ['<', '<'], ['>=', '\u2265'], ['<=', '\u2264']];
+
+function opLabel(op) {
+  const f = COND_OPS.find(o => o[0] === op);
+  return f ? f[1] : op;
+}
+
+function unitSuffix(varName) {
+  const v = numericVars.find(x => x.name === varName);
+  const u = v ? (v.unit || '') : '';
+  if (!u) return '';
+  return (u === '%' || u === '\u00b0C') ? u : ' ' + u;
+}
+
+function condToText(c) {
+  return c.var + ' ' + opLabel(c.op) + ' ' + c.value + unitSuffix(c.var);
+}
+
+// Текущее значение переменной рядом с порогом - чтобы выбирать порог "на глаз".
+function refreshCondNow(varName, el) {
+  if (!varName) { el.textContent = ''; return; }
+  fetch('/api/preview', { method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ template: '{' + varName + '}' }) })
+    .then(r => r.json())
+    .then(res => {
+      el.textContent = res.all_resolved ? ('сейчас: ' + res.rendered + unitSuffix(varName)) : 'сейчас: нет данных';
+    })
+    .catch(() => { el.textContent = ''; });
+}
+
+function makeNumInput(cls, value, min, max, step, onInput) {
+  const inp = document.createElement('input');
+  inp.type = 'number';
+  inp.className = cls;
+  inp.min = min; inp.max = max; inp.step = step;
+  inp.value = value;
+  inp.addEventListener('input', () => onInput(inp.value));
+  return inp;
+}
+
+function renderConditions() {
+  const wrap = document.getElementById('conditions-list');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  if (!currentConditions.length) {
+    const empty = document.createElement('div');
+    empty.className = 'cond-empty';
+    empty.textContent = '(условий нет - экран показывается всегда)';
+    wrap.appendChild(empty);
+    return;
+  }
+
+  currentConditions.forEach((c, idx) => {
+    const row = document.createElement('div');
+    row.className = 'cond-row';
+
+    // --- строка 1: переменная / оператор / порог / единица / текущее значение ---
+    const line1 = document.createElement('div');
+    line1.className = 'cond-line';
+
+    const varSel = document.createElement('select');
+    varSel.className = 'cond-var';
+    const ph = document.createElement('option');
+    ph.value = ''; ph.textContent = '(выберите переменную)';
+    varSel.appendChild(ph);
+    const byCat = {};
+    numericVars.forEach(v => { (byCat[v.category] = byCat[v.category] || []).push(v); });
+    Object.keys(byCat).forEach(cat => {
+      const og = document.createElement('optgroup');
+      og.label = cat;
+      byCat[cat].forEach(v => {
+        const o = document.createElement('option');
+        o.value = v.name;
+        o.textContent = v.label;
+        og.appendChild(o);
+      });
+      varSel.appendChild(og);
+    });
+    if (c.var && !numericVars.some(v => v.name === c.var)) {
+      // переменной нет в списке (список ещё не загрузился/переменную убрали) - не теряем выбор молча
+      const o = document.createElement('option');
+      o.value = c.var; o.textContent = c.var;
+      varSel.appendChild(o);
+    }
+    varSel.value = c.var || '';
+
+    const opSel = document.createElement('select');
+    opSel.className = 'cond-op';
+    COND_OPS.forEach(([val, text]) => {
+      const o = document.createElement('option');
+      o.value = val; o.textContent = text;
+      opSel.appendChild(o);
+    });
+    opSel.value = c.op;
+    opSel.addEventListener('change', () => { c.op = opSel.value; });
+
+    const valInput = document.createElement('input');
+    valInput.type = 'number';
+    valInput.className = 'cond-val';
+    valInput.step = 'any';
+    valInput.placeholder = 'порог';
+    valInput.value = c.value;
+    valInput.addEventListener('input', () => { c.value = valInput.value; });
+
+    const unitEl = document.createElement('span');
+    unitEl.className = 'cond-unit';
+    unitEl.textContent = unitSuffix(c.var).trim();
+
+    const nowEl = document.createElement('span');
+    nowEl.className = 'cond-now';
+
+    varSel.addEventListener('change', () => {
+      c.var = varSel.value;
+      unitEl.textContent = unitSuffix(c.var).trim();
+      refreshCondNow(c.var, nowEl);
+    });
+
+    line1.appendChild(varSel);
+    line1.appendChild(opSel);
+    line1.appendChild(valInput);
+    line1.appendChild(unitEl);
+    row.appendChild(line1);
+
+    const nowLine = document.createElement('div');
+    nowLine.className = 'cond-line';
+    nowLine.appendChild(nowEl);
+    row.appendChild(nowLine);
+    refreshCondNow(c.var, nowEl);
+
+    // --- строка 2: задержка / удержание / удалить ---
+    const line2 = document.createElement('div');
+    line2.className = 'cond-line';
+
+    const lbl1 = document.createElement('span');
+    lbl1.className = 'cond-lbl';
+    lbl1.textContent = 'держится не менее';
+    const forInput = makeNumInput('cond-num', c.for_s, 0, 3600, 0.5, v => { c.for_s = v; });
+    const lbl2 = document.createElement('span');
+    lbl2.className = 'cond-lbl';
+    lbl2.textContent = 'с, после спада ещё';
+    const holdInput = makeNumInput('cond-num', c.hold_s, 0, 3600, 0.5, v => { c.hold_s = v; });
+    const lbl3 = document.createElement('span');
+    lbl3.className = 'cond-lbl';
+    lbl3.textContent = 'с';
+
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'cond-del';
+    delBtn.textContent = '\u2715';
+    delBtn.title = 'Удалить условие';
+    delBtn.addEventListener('click', () => {
+      currentConditions.splice(idx, 1);
+      renderConditions();
+    });
+
+    line2.appendChild(lbl1);
+    line2.appendChild(forInput);
+    line2.appendChild(lbl2);
+    line2.appendChild(holdInput);
+    line2.appendChild(lbl3);
+    line2.appendChild(delBtn);
+    row.appendChild(line2);
+
+    wrap.appendChild(row);
+  });
+}
+
+document.getElementById('add-condition-btn').addEventListener('click', () => {
+  currentConditions.push({ var: '', op: '>', value: '', for_s: 0, hold_s: 0 });
+  renderConditions();
+});
+
+// Собирает условия для сохранения. incomplete=true, если есть строки без
+// переменной или с нечисловым порогом - такие не сохраняем молча (сервер всё
+// равно отбросил бы их при валидации), а просим исправить.
+function collectConditions() {
+  const list = [];
+  let incomplete = false;
+  currentConditions.forEach(c => {
+    const value = parseFloat(c.value);
+    if (!c.var || c.value === '' || isNaN(value)) { incomplete = true; return; }
+    list.push({
+      var: c.var, op: c.op, value: value,
+      for_s: Math.max(0, parseFloat(c.for_s) || 0),
+      hold_s: Math.max(0, parseFloat(c.hold_s) || 0),
+    });
+  });
+  return { list: list, incomplete: incomplete };
+}
 
 function openModal(s) {
   document.getElementById('modal-title').textContent = s ? 'Редактировать экран' : 'Новый экран';
@@ -431,6 +670,8 @@ function openModal(s) {
   document.getElementById('edit-tier').value = tier;
   applyTierVisibility(tier);
   currentTriggerVars = new Set((s && s.trigger_vars) || []);
+  currentConditions = ((s && s.conditions) || []).map(c => Object.assign({}, c));
+  renderConditions();
   rebuildTriggerVars();
   ['l1','l2','l3'].forEach(k => livePreview(document.getElementById('edit-'+k), document.getElementById('preview-'+k)));
   document.getElementById('modal-bg').classList.add('show');
@@ -444,6 +685,11 @@ document.getElementById('add-btn').addEventListener('click', () => openModal(nul
 document.getElementById('cancel-btn').addEventListener('click', closeModal);
 
 document.getElementById('save-btn').addEventListener('click', () => {
+  const condRes = collectConditions();
+  if (condRes.incomplete) {
+    alert('В условиях показа заполните переменную и порог, либо удалите пустые условия.');
+    return;
+  }
   const id = document.getElementById('edit-id').value;
   const body = {
     name: document.getElementById('edit-name').value || 'Screen',
@@ -453,6 +699,7 @@ document.getElementById('save-btn').addEventListener('click', () => {
     duration: parseFloat(document.getElementById('edit-duration').value) || 4,
     tier: document.getElementById('edit-tier').value,
     trigger_vars: Array.from(currentTriggerVars),
+    conditions: condRes.list,
   };
   const req = id
     ? fetch('/api/screens/' + id, { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })

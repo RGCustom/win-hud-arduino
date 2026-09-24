@@ -70,6 +70,14 @@ def _human_rate(bps):
     return f"{bps:.1f} TB/s"
 
 
+def _bps_to_mbps(bytes_per_sec):
+    """Байт/с -> Мбит/с (число, а не строка) - для пороговых условий экранов
+    (см. qbt_dl_mbps/qbt_ul_mbps в variables.py): порог на отформатированную
+    строку вроде "1.2 MB/s" не повесить. Мегабит = 1_000_000 бит, как у
+    net*_rx_mbps (сетевые скорости считаются в тех же единицах)."""
+    return round((bytes_per_sec or 0) * 8 / 1_000_000, 2)
+
+
 def _format_qbt_speed(dlspeed, upspeed):
     """Скорость с указанием направления - качаем (↓) или раздаём (↑)."""
     if dlspeed > 0:
@@ -124,6 +132,13 @@ class QbittorrentClient:
                                            серверам (dl_info_speed/up_info_speed
                                            из sync/maindata, а НЕ "скачано за
                                            всё время" - 1-в-1 с shkaf-hud)
+            qbt_dl_mbps, qbt_ul_mbps    - ТЕ ЖЕ суммарные скорости, но ЧИСЛОМ в
+                                           Мбит/с (float) - для пороговых условий
+                                           экранов. None, если интеграция выключена
+                                           или НИ ОДИН сервер не ответил на
+                                           sync/maindata (нет данных - условие на
+                                           такую переменную не выполняется, а не
+                                           срабатывает на "0 Мбит/с")
             qbt_ratio                   - float, суммарный аплоад/суммарный
                                            даунлоад ПО ВСЕМ серверам разом
             qbt_free_space_gb           - строка "123.4 GB"/"1.20 TB" - СУММА
@@ -139,6 +154,7 @@ class QbittorrentClient:
         """
         empty = {
             "qbt_total_dl": "0 B/s", "qbt_total_ul": "0 B/s",
+            "qbt_dl_mbps": None, "qbt_ul_mbps": None,
             "qbt_ratio": 0.0, "qbt_free_space_gb": "?",
             "qbt_count_all": 0, "torrents": [],
         }
@@ -147,6 +163,7 @@ class QbittorrentClient:
             return empty
 
         total_dlspeed = total_upspeed = 0
+        any_speed_data = False  # хоть один сервер вернул sync/maindata - иначе скорости "неизвестны", а не нулевые
         total_free_space = None  # None, пока ни с одного сервера не пришло валидное значение
         total_count_all = 0
         total_downloaded = total_uploaded = 0
@@ -157,6 +174,7 @@ class QbittorrentClient:
 
             maindata = _qbt_get(base_url, api_key, "sync/maindata")
             if maindata is not None:
+                any_speed_data = True
                 server_state = maindata.get("server_state", {})
                 total_dlspeed += server_state.get("dl_info_speed", 0) or 0
                 total_upspeed += server_state.get("up_info_speed", 0) or 0
@@ -190,6 +208,8 @@ class QbittorrentClient:
         return {
             "qbt_total_dl": _human_rate(total_dlspeed),
             "qbt_total_ul": _human_rate(total_upspeed),
+            "qbt_dl_mbps": _bps_to_mbps(total_dlspeed) if any_speed_data else None,
+            "qbt_ul_mbps": _bps_to_mbps(total_upspeed) if any_speed_data else None,
             "qbt_ratio": ratio,
             "qbt_free_space_gb": _format_free_space(total_free_space),
             "qbt_count_all": total_count_all,

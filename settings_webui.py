@@ -30,6 +30,11 @@ pc_hud.py) со своим, гораздо более редким интерв�
 /api/monitor_targets, /api/ping_settings, /api/serial_port, /api/disks,
 /api/net-ifaces - этот файл только читает/пишет через них). Этот файл -
 чистая разметка + JS.
+
+Изменения (пороговые условия экранов): карточка "Топ-процесс (CPU)" с порогом показа
+убрана - порог теперь задаётся пороговым условием самого экрана на /screens (например
+top_process_cpu_pct >= 25, см. screens.py conditions). Tier "personal" ("личный")
+переименован в "priority" ("приоритетный"), настройки ротации - boost_priority/boost_ambient.
 """
 
 from flask import Response
@@ -251,33 +256,20 @@ SETTINGS_PAGE_HTML = """<!doctype html>
   <!-- ---- Приоритетная ротация экранов (НОВОЕ) ---- -->
   <div class="global-card">
     <h2>Приоритетная ротация экранов</h2>
-    <div class="hint">"Личные" экраны (например Now Playing - см. tier в редакторе /screens)
-      показывают чаще обычных и могут прервать текущий показ, если появились или сменился
-      их контент (например трек). "Фоновые" (Plex/qBittorrent) показываются чаще обычных,
-      но без права прерывания - просто получают более частые слоты. Число ниже - "каждый
-      N-й слот" ротации достаётся этой дорожке, если на неё сейчас есть что показать.</div>
+    <div class="hint">"Приоритетные" экраны (например Now Playing или Алерт мониторинга - см. tier
+      в редакторе /screens) показываются чаще обычных и могут прервать текущий показ - когда
+      они появились в ротации (в том числе когда сработали их условия показа) или сменился их
+      контент (например трек). "Фоновые" (Plex/qBittorrent) показываются чаще обычных, но без
+      права прерывания - просто получают более частые слоты. Число ниже - "каждый N-й слот"
+      ротации достаётся этой дорожке, если на неё сейчас есть что показать. Пороговые условия
+      показа (например "загрузка CPU > 25%") задаются у самого экрана на /screens.</div>
     <div class="row">
-      <label>Личные - каждый N-й слот</label>
-      <input type="number" id="priority-boost-personal" min="1" max="20" value="2">
+      <label>Приоритетные - каждый N-й слот</label>
+      <input type="number" id="boost-priority" min="1" max="20" value="2">
     </div>
     <div class="row">
       <label>Фоновые - каждый N-й слот</label>
-      <input type="number" id="priority-boost-ambient" min="1" max="20" value="4">
-    </div>
-  </div>
-
-  <!-- ---- Топ-процесс по CPU (НОВОЕ) ---- -->
-  <div class="global-card">
-    <h2>Топ-процесс (CPU)</h2>
-    <div class="hint">Порог загрузки CPU, ниже которого экран "top_process_name" не показывается
-      (см. {top_process_name}/{top_process_cpu_pct}/{top_process_ram_pct} на /screens) - без порога
-      в топе постоянно мелькали бы лёгкие фоновые процессы. psutil считает загрузку НЕ нормализованной
-      по числу потоков (сумма по ядрам) - на многопоточном CPU один полностью загруженный поток даёт
-      лишь несколько процентов, поэтому нужное значение сильно зависит от конкретного железа.</div>
-    <div class="slider-row">
-      <label>Порог показа, %</label>
-      <input type="range" id="top-process-min-cpu" min="0" max="100" step="1" value="25">
-      <span class="val" id="top-process-min-cpu-val">25%</span>
+      <input type="number" id="boost-ambient" min="1" max="20" value="4">
     </div>
   </div>
 
@@ -320,7 +312,7 @@ SETTINGS_PAGE_HTML = """<!doctype html>
       <input type="text" id="my-plex-user" placeholder="(необязательно) ваш friendly name в Plex">
     </div>
     <div class="note">Если заполнено - сеанс с этим пользователем на экранах, использующих
-      stream_* переменные (см. /screens), считается "личным" (tier=personal, показывается чаще
+      stream_* переменные (см. /screens), считается "приоритетным" (tier=priority, показывается чаще
       и может прервать текущий показ), а не "фоновым" - см. обсуждение "свой/чужой Plex-сеанс".
       Работает, только если сам экран настроен как tier="ambient" (рекомендуемая настройка для
       таких экранов). Пусто - ВСЕ Plex-сеансы считаются фоновыми.</div>
@@ -393,9 +385,8 @@ let editingLedsCount = false, editingVolumeStep = false, editingWarningThreshold
 let editingTautulliUrl = false, editingTautulliApiKey = false, editingMyPlexUser = false;
 let editingQbt1Url = false, editingQbt1ApiKey = false, editingQbt2Url = false, editingQbt2ApiKey = false;
 let editingLayoutHold = false, editingDeviceHold = false, editingOsdCooldown = false;
-let editingPriorityPersonal = false, editingPriorityAmbient = false;
+let editingBoostPriority = false, editingBoostAmbient = false;
 let editingPingInterval = false, editingPingTimeout = false, editingPingFail = false, editingPingRecover = false;
-let editingTopProcessMinCpu = false;
 let layoutColorsBuilt = false;
 
 // ---- Подключение / диски / сеть (ПЕРЕЕХАЛО с Sensors, см. докстринг модуля) ----
@@ -590,12 +581,12 @@ function sendPriorityBoost(partial) {
   fetch("/api/priority_boost", { method: "POST", headers: {"Content-Type":"application/json"},
     body: JSON.stringify(partial) });
 }
-const priorityPersonalEl = document.getElementById("priority-boost-personal");
-const priorityAmbientEl = document.getElementById("priority-boost-ambient");
-debounceSave(priorityPersonalEl, v => editingPriorityPersonal = v,
-  () => sendPriorityBoost({ priority_boost_personal: parseInt(priorityPersonalEl.value) }));
-debounceSave(priorityAmbientEl, v => editingPriorityAmbient = v,
-  () => sendPriorityBoost({ priority_boost_ambient: parseInt(priorityAmbientEl.value) }));
+const boostPriorityEl = document.getElementById("boost-priority");
+const boostAmbientEl = document.getElementById("boost-ambient");
+debounceSave(boostPriorityEl, v => editingBoostPriority = v,
+  () => sendPriorityBoost({ boost_priority: parseInt(boostPriorityEl.value) }));
+debounceSave(boostAmbientEl, v => editingBoostAmbient = v,
+  () => sendPriorityBoost({ boost_ambient: parseInt(boostAmbientEl.value) }));
 
 // ---- Tautulli (Plex) ----
 function sendTautulli(partial) {
@@ -730,19 +721,6 @@ pingIntervalEl.addEventListener("change", () => {
 debounceSave(pingTimeoutEl, v => editingPingTimeout = v, () => sendPingSettings({ ping_timeout_ms: parseInt(pingTimeoutEl.value) }));
 debounceSave(pingFailEl, v => editingPingFail = v, () => sendPingSettings({ ping_fail_threshold: parseInt(pingFailEl.value) }));
 debounceSave(pingRecoverEl, v => editingPingRecover = v, () => sendPingSettings({ ping_recover_threshold: parseInt(pingRecoverEl.value) }));
-
-// ---- Топ-процесс по CPU (порог показа, см. metrics_windows.TopProcessMonitor) ----
-const topProcessMinCpuEl = document.getElementById("top-process-min-cpu");
-const topProcessMinCpuValEl = document.getElementById("top-process-min-cpu-val");
-topProcessMinCpuEl.addEventListener("input", () => {
-  editingTopProcessMinCpu = true;
-  topProcessMinCpuValEl.textContent = topProcessMinCpuEl.value + "%";
-});
-topProcessMinCpuEl.addEventListener("change", () => {
-  fetch("/api/top_process_settings", { method: "POST", headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({ top_process_min_cpu_pct: parseFloat(topProcessMinCpuEl.value) }) });
-  editingTopProcessMinCpu = false;
-});
 
 function renderVolumeColors(colors) {
   const wrap = document.getElementById("volume-colors");
@@ -1011,11 +989,6 @@ function render(state) {
   if (!editingPingFail) pingFailEl.value = state.cfg.ping_fail_threshold;
   if (!editingPingRecover) pingRecoverEl.value = state.cfg.ping_recover_threshold;
 
-  if (!editingTopProcessMinCpu) {
-    topProcessMinCpuEl.value = state.cfg.top_process_min_cpu_pct;
-    topProcessMinCpuValEl.textContent = Math.round(state.cfg.top_process_min_cpu_pct) + "%";
-  }
-
   if (!editingLayoutHold) {
     layoutHoldEl.value = state.cfg.layout_hold_seconds;
     layoutHoldValEl.textContent = parseFloat(state.cfg.layout_hold_seconds).toFixed(1) + "с";
@@ -1030,8 +1003,8 @@ function render(state) {
   }
   if (!layoutColorsBuilt) buildLayoutColorsRows(state.cfg.layout_colors || {});
 
-  if (!editingPriorityPersonal) priorityPersonalEl.value = state.cfg.priority_boost_personal;
-  if (!editingPriorityAmbient) priorityAmbientEl.value = state.cfg.priority_boost_ambient;
+  if (!editingBoostPriority) boostPriorityEl.value = state.cfg.boost_priority;
+  if (!editingBoostAmbient) boostAmbientEl.value = state.cfg.boost_ambient;
 
   if (!editingPeakHold) {
     peakHoldEl.value = state.cfg.peak_hold_seconds;

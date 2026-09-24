@@ -42,6 +42,15 @@ context", плюс легенда для веб-интерфейса (те же 
 статистика по библиотекам/сеансам/недавнему это сильно упрощает) и
 qBittorrent - под них и появились "stream"/"recent"/"qbt" ниже. Ещё позже
 добавился мониторинг произвольных ресурсов (ping/TCP-порт) - группа "mon".
+
+Числовые переменные (флаг "numeric" + "unit" в реестре, см. NUMERIC_UNITS
+ниже) - НОВОЕ: на них в редакторе /screens можно вешать ПОРОГОВЫЕ УСЛОВИЯ
+показа экрана ("cpu_pct > 25", "gpu_temp_c > 80"), см. screens.py
+(conditions). Для тех величин, что в context хранятся уже отформатированной
+строкой ("12.3Mbps", "1.2 MB/s"), заведены числовые двойники (*_mbps) - порог
+на строку не повесить. Сам реестр только ПОМЕЧАЕТ переменные числовыми и
+даёт to_number() для безопасного приведения - сравнение и состояние
+(задержка/удержание) живут в screens.py, не тут.
 """
 
 import history
@@ -63,7 +72,8 @@ import history
 #
 #     "net": {
 #         "net1": {"name": str, "speed": str, "rx": str, "tx": str,
-#                   "total_rx": str, "total_tx": str} | None,
+#                   "total_rx": str, "total_tx": str,
+#                   "rx_mbps": float, "tx_mbps": float} | None,   # числовые двойники rx/tx (для порогов)
 #         "net2": {...} | None,
 #     },
 #
@@ -112,6 +122,7 @@ import history
 #     "qbt_total_dl": str|None, "qbt_total_ul": str|None,
 #     "qbt_ratio": float|None, "qbt_free_space_gb": float|None,
 #     "qbt_count_all": int|None,
+#     "qbt_dl_mbps": float|None, "qbt_ul_mbps": float|None,   # числовые двойники qbt_total_dl/ul, Мбит/с
 #     "torrents": [                         # repeating-группа "qbt"
 #         {"name": str, "speed": str, "eta": str},
 #         ...
@@ -353,6 +364,8 @@ VARIABLES = {
     # LED-полоса "net" (см. BAR_METRICS в pc_hud.py) - НЕ отдельная история
     # ради этой переменной, тот же ключ "net" в общем MetricHistory.
     "net_graph":       {"label": "Net1: мини-график загрузки линка (спарклайн)", "group": "scalar", "category": "Сеть", "resolver": _graph("net")},
+    "net1_rx_mbps":    {"label": "Net1: входящая скорость, Мбит/с (число, для порогов)",  "group": "scalar", "category": "Сеть", "resolver": _net_field("net1", "rx_mbps")},
+    "net1_tx_mbps":    {"label": "Net1: исходящая скорость, Мбит/с (число, для порогов)", "group": "scalar", "category": "Сеть", "resolver": _net_field("net1", "tx_mbps")},
 
     # --- Аудио (энкодер на плате крутит системную громкость, клик - настраиваемое
     # действие в /settings: mute/unmute, переключение устройства вывода и т.п.) ---
@@ -381,6 +394,8 @@ VARIABLES = {
     "net2_tx":         {"label": "Net2: исходящая скорость", "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "tx")},
     "net2_total_rx":   {"label": "Net2: накоплено принято (с запуска)", "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "total_rx")},
     "net2_total_tx":   {"label": "Net2: накоплено отдано (с запуска)",  "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "total_tx")},
+    "net2_rx_mbps":    {"label": "Net2: входящая скорость, Мбит/с (число, для порогов)",  "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "rx_mbps")},
+    "net2_tx_mbps":    {"label": "Net2: исходящая скорость, Мбит/с (число, для порогов)", "group": "scalar", "category": "Сеть", "resolver": _net_field("net2", "tx_mbps")},
 
     # --- Plex (через Tautulli, см. metrics_tautulli.TautulliClient) - счётчики
     # библиотек/пользователей обновляются раз в минуту, plex_server_status ==
@@ -426,6 +441,8 @@ VARIABLES = {
     "qbt_ratio":         {"label": "qBittorrent: общий рейтинг раздачи (оба сервера)", "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_ratio")},
     "qbt_free_space_gb": {"label": "qBittorrent: свободно на диске (сумма по серверам)", "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_free_space_gb")},
     "qbt_count_all":     {"label": "qBittorrent: торрентов всего (оба сервера)", "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_count_all")},
+    "qbt_dl_mbps":       {"label": "qBittorrent: суммарная скорость скачивания, Мбит/с (число, для порогов)", "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_dl_mbps")},
+    "qbt_ul_mbps":       {"label": "qBittorrent: суммарная скорость раздачи, Мбит/с (число, для порогов)",    "group": "scalar", "category": "qBittorrent", "resolver": _scalar("qbt_ul_mbps")},
 
     # --- qBittorrent: активные торренты (REPEATING-группа "qbt") - С ОБОИХ
     # серверов вперемешку, отсортированы по убыванию скорости скачивания (см.
@@ -462,6 +479,59 @@ VARIABLES = {
     "mon_pos":        {"label": "Ресурс: номер по порядку",           "group": "mon", "category": "Мониторинг", "resolver": _group_pos("mon")},
     "mon_count":      {"label": "Ресурс: всего настроено целей мониторинга", "group": "mon", "category": "Мониторинг", "resolver": _group_total("mon")},
 }
+
+# ---------------- числовые переменные (для пороговых условий на /screens) ----------------
+#
+# имя переменной -> единица (только для подписи в редакторе, на сравнение не
+# влияет). Сюда попадают только переменные, чьё значение в context - ЧИСЛО
+# (int/float), а не готовая строка. Строки вида "12.3Mbps" сюда не входят -
+# для них есть числовые двойники *_mbps. Список умышленно явный, а не
+# "всё, что оказалось числом": пороговое условие на счётчик вроде year_now
+# или cpu_freq_mhz технически возможно, но в интерфейсе только засоряет выбор.
+NUMERIC_UNITS = {
+    # Система
+    "cpu_pct": "%", "cpu_pct_core_max": "%", "ram_pct": "%",
+    "top_process_cpu_pct": "%", "top_process_ram_pct": "%",
+    "disk_io_read_mbps": "MB/s", "disk_io_write_mbps": "MB/s",
+    # GPU
+    "gpu_pct": "%", "gpu_temp_c": "°C", "gpu_vram_pct": "%", "gpu_power_w": "Вт",
+    # Диски
+    "disk1_used_pct": "%", "disk2_used_pct": "%", "disk1_free_gb": "GB", "disk2_free_gb": "GB",
+    # Сеть (числовые двойники)
+    "net1_rx_mbps": "Мбит/с", "net1_tx_mbps": "Мбит/с",
+    "net2_rx_mbps": "Мбит/с", "net2_tx_mbps": "Мбит/с",
+    # Аудио
+    "volume_pct": "%", "vu_peak_pct": "%", "vu_left_pct": "%", "vu_right_pct": "%",
+    # Мониторинг ресурсов
+    "mon_down_count": "",
+    # Plex
+    "plex_transcode_count": "", "plex_users_count": "", "stream_count": "",
+    # qBittorrent (числовые двойники)
+    "qbt_dl_mbps": "Мбит/с", "qbt_ul_mbps": "Мбит/с",
+}
+
+for _name, _unit in NUMERIC_UNITS.items():
+    assert _name in VARIABLES, f"NUMERIC_UNITS: неизвестная переменная {_name!r}"
+    VARIABLES[_name]["numeric"] = True
+    VARIABLES[_name]["unit"] = _unit
+
+
+def is_numeric(var_name):
+    """True, если по переменной можно задавать пороговое условие."""
+    return bool(VARIABLES.get(var_name, {}).get("numeric"))
+
+
+def to_number(value):
+    """Значение переменной -> float, либо None, если это не число (None,
+    строка, bool). bool исключён намеренно: в Python True == 1, и условие
+    вида "> 0" не должно срабатывать на флаг. None означает "нет данных" -
+    вызывающий код (screens.py) трактует такое условие как невыполненное."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
 
 # Порядок категорий в легенде на /screens (buildLegend() в screens_webui.py -
 # общий с shkaf-hud код, сортирует по этому списку, а не по алфавиту).
@@ -541,6 +611,8 @@ def legend():
             "group": spec["group"],
             "category": spec.get("category", "Прочее"),
             "repeating": spec["group"] in REPEATING_GROUPS,
+            "numeric": bool(spec.get("numeric")),
+            "unit": spec.get("unit", ""),
             "label": spec["label"],
         }
         for name, spec in VARIABLES.items()
