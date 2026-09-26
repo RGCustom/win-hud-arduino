@@ -79,11 +79,13 @@ def _bps_to_mbps(bytes_per_sec):
 
 
 def _format_qbt_speed(dlspeed, upspeed):
-    """Скорость с указанием направления - качаем (↓) или раздаём (↑)."""
+    """Скорость, без указания направления стрелками (↓/↑ убраны - шрифты
+    u8g2 на плате их не рисуют, см. обсуждение про нечитаемые значки на OLED).
+    Направление легко добавить самому в шаблоне экрана при желании."""
     if dlspeed > 0:
-        return f"\u2193 {_human_rate(dlspeed)}"
+        return _human_rate(dlspeed)
     if upspeed > 0:
-        return f"\u2191 {_human_rate(upspeed)}"
+        return _human_rate(upspeed)
     return "0 B/s"
 
 
