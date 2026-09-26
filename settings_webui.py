@@ -105,7 +105,7 @@ SETTINGS_PAGE_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <div class="brand"><span class="dot"></span><h1>win-hud-arduino</h1></div>
-  <div class="nav"><a href="/">Sensors</a><a href="/settings" class="active">Settings</a><a href="/screens">OLED screens</a><a href="/flash">Flash</a></div>
+  <div class="nav"><a href="/">Sensors</a><a href="/settings" class="active">Settings</a><a href="/screens">OLED screens</a><a href="/offline">Offline</a><a href="/flash">Flash</a></div>
 
   <!-- ---- Подключение (ПЕРЕЕХАЛО с Sensors, см. докстринг модуля выше) ---- -->
   <div class="global-card">

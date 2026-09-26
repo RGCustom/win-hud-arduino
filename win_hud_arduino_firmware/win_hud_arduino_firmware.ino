@@ -58,33 +58,29 @@
   данные (никакого дополнительного подтверждения на возврат не нужно - первая
   же пришедшая BAR:/L1-3: команда перезапишет содержимое сама).
 
-  "РАЗБУДИТЬ" ХОСТА КЛИКОМ ЭНКОДЕРА (см. attemptWakeHost() ниже): пока
-  hostTimedOut==true, клик кнопки энкодера НЕ шлёт BTN:CLICK по serial (слать
-  некому - хост не читает порт) - вместо этого плата сама представляется
-  Windows USB HID-клавиатурой (Keyboard.h, штатно доступна на 32u4/Leonardo)
-  и шлёт одно короткое нажатие Left Ctrl. Left Ctrl выбран специально - это
-  модификатор, он ничего не печатает, даже если случайно попадёт в активное
-  текстовое поле после пробуждения.
+  WATCHDOG ОТСУТСТВИЯ ДАННЫХ ОТ ХОСТА: если ПК выключили/pc_hud.py закрыли -
+  serial-порт с той стороны просто перестаёт слать что-либо, а плата САМА ПО
+  СЕБЕ никак об этом не узнаёт и без специальной проверки держала бы ПОСЛЕДНИЙ
+  полученный кадр (лента+OLED) вечно. См. NO_DATA_TIMEOUT_MS/checkHostTimeout()
+  ниже - если за NO_DATA_TIMEOUT_MS не пришло НИ ОДНОЙ command-строки, лента
+  гасится, OLED очищается (либо, если включён офлайн-режим - показывается
+  офлайн-экран, см. ниже) - и остаются в этом состоянии, пока не придут новые
+  данные (никакого дополнительного подтверждения на возврат не нужно - первая
+  же пришедшая BAR:/L1-3: команда перезапишет содержимое сама).
 
-  ВАЖНО - что это реально может и не может разбудить (ограничение
-  железа/BIOS/Windows, не прошивки):
-    - Сон (Sleep/S3)              - работает практически всегда "из коробки".
-    - Полное выключение (Shutdown/S5) - работает, ТОЛЬКО если в BIOS
-      материнки явно включена опция вида "Power On By Keyboard/USB" (у
-      разных производителей называется по-разному) - без неё чипсет в S5
-      просто не слушает USB, и это никак не обойти со стороны прошивки.
-    - Зависание Windows / самопроизвольная перезагрузка - НЕ поможет и не
-      должно: это не про "включение", тут вмешиваться нечем.
-  Плата физически остаётся запитанной по USB даже в этих состояниях - иначе
-  сам watchdog выше не мог бы гасить ленту/OLED - поэтому USB HID в принципе
-  долетает до хоста, вопрос только в том, слушает ли его в данный момент
-  конкретная материнка/ОС.
+  Клик кнопки энкодера во время hostTimedOut НИЧЕГО не делает (слать
+  BTN:CLICK некому - хост не читает порт). Раньше тут была попытка
+  "разбудить" хост через USB HID-клавиатуру (Keyboard.h) - убрана: на
+  практике не срабатывала, а композитный USB HID-дескриптор заметно раздувал
+  и без того небольшую флеш-память ATmega32u4 (32КБ, из которых часть уже
+  занята бутлоадером).
 */
 
 #include <FastLED.h>
 #include <U8g2lib.h>
 #include <Wire.h>
-#include <Keyboard.h>
+#include <stdlib.h>   // strtoul (TSYNC:/OFFCFG:)
+#include <string.h>   // strncpy/strchr/strncmp/strlen (уже неявно требовались и раньше, для strtok/atoi)
 
 // ---------------- КОНФИГ ЖЕЛЕЗА ----------------
 
@@ -144,6 +140,14 @@
 // протокольный канал ради этого избыточно; значение просто правится тут же
 // перед перепрошивкой, как и OLED_SCROLL_STEP_PX/BUTTON_DEBOUNCE_MS выше.
 #define NO_DATA_TIMEOUT_MS 45000UL
+
+// OfflineToken - объявлена ЗДЕСЬ, в самом верху файла, а НЕ рядом с местом
+// использования - Arduino IDE сама генерирует forward-декларации всех
+// функций сразу после блока #include/#define, то есть РАНЬШЕ любого места
+// дальше в файле; если бы struct был объявлен позже, автосгенерированный
+// прототип функции с параметром этого типа ссылался бы на ещё неизвестный
+// компилятору тип ("has not been declared").
+struct OfflineToken { const char *name; const char *value; };
 
 // ---------------- LED_MAP: калибровка физического порядка диодов ----------------
 // Индекс массива - логический номер (0 = "начало" ленты в терминах
@@ -238,6 +242,182 @@ bool buttonDebounced = HIGH;
 unsigned long lastHostDataMs = 0;
 bool hostTimedOut = false;   // true - лента/OLED уже погашены watchdog'ом, ждём новых данных
 
+// ---------------- offline-режим: конфиг (ТОЛЬКО в RAM, без EEPROM) ----------------
+// Плата 24/7 подключена к ПК - реальное отключение питания платы бывает
+// исключительно редко (аварийное отключение электричества, раз в несколько
+// лет - см. обсуждение с Konstantin), поэтому конфиг офлайн-экрана хранится
+// ПРОСТО В ОЗУ, с дефолтами при старте: если питание всё же пропадёт, плата
+// поднимется с дефолтом (офлайн-режим выключен) и тут же получит актуальный
+// конфиг от хоста заново при следующем подключении (см. OFFCFG:/OFFL1-3: в
+// processCommandLine() ниже) - никакого EEPROM.h не нужно, экономит и флеш,
+// и код (нет магии валидности записи/загрузки/сохранения).
+
+#define OFFLINE_LINE_MAX 28   // с запасом над 16-символьной OLED-сеткой -
+                                // шаблон может быть чуть длиннее подстрок
+
+struct OfflineConfig {
+  uint8_t enabled;
+  uint16_t timeout_s;   // 0 = ещё не приходило от хоста - см. effectiveTimeoutMs()
+  uint16_t start_min;   // минуты с полуночи, окно показа офлайн-экрана
+  uint16_t end_min;
+  char l1[OFFLINE_LINE_MAX];
+  char l2[OFFLINE_LINE_MAX];
+  char l3[OFFLINE_LINE_MAX];
+};
+
+// Дефолты - "весь день" (start==end) и офлайн-режим выключен, пока хост не
+// пришлёт первый OFFCFG: (см. api_offline()/metrics_main_loop в pc_hud.py -
+// шлёт конфиг сразу при (пере)подключении, так что в реальности эти
+// значения живут доли секунды после старта платы).
+OfflineConfig offlineConfig = {
+  0, (uint16_t)(NO_DATA_TIMEOUT_MS / 1000UL), 0, 1439,
+  "{time_now}", "{weekday_name} {date_now}", "{uptime}",
+};
+
+unsigned long effectiveTimeoutMs() {
+  // timeout_s == 0 - хост ещё ни разу не присылал OFFCFG: (либо прислал
+  // мусор) - используем тот же фолбэк, что и раньше (NO_DATA_TIMEOUT_MS).
+  if (offlineConfig.timeout_s == 0) return NO_DATA_TIMEOUT_MS;
+  return (unsigned long)offlineConfig.timeout_s * 1000UL;
+}
+
+// ---------------- offline-режим: мягкие часы поверх millis() ----------------
+// RTC на плате нет - "сейчас" считается от последней синхронизации с хостом
+// (TSYNC:, см. processCommandLine() ниже), дальше тикает по millis().
+
+unsigned long epochAtSync = 0;
+unsigned long millisAtSync = 0;
+bool clockSynced = false;      // false - TSYNC ещё ни разу не приходил (плата
+                                 // только что включена) - без синхронизации
+                                 // офлайн-экран показывать нельзя, часы
+                                 // попросту неизвестны
+#define OFFLINE_UPTIME_MAX 20   // "5d 12h"/"48m" и т.п. - см. format_duration()
+                                  // на хосте (pc_hud.py), там значения всегда
+                                  // короткие; с запасом
+char lastUptimeText[OFFLINE_UPTIME_MAX] = "";  // последний UPT: - замороженный
+                                                 // аптайм Windows для {uptime}
+                                                 // на офлайн-экране - обычный
+                                                 // char[], не String: реже
+                                                 // приходит, heap-аллокация
+                                                 // тут не нужна вовсе.
+
+// Days-from-civil/civil-from-days по алгоритму Говарда Хиннанта
+// (http://howardhinnant.github.io/date_algorithms.html) - целочисленный,
+// без float, корректен для любого разумного диапазона дат. Нужен, т.к.
+// на плате нет ни time.h с настоящим RTC, ни места под тяжёлую библиотеку
+// работы с календарём - тут требуется только epoch -> (год, месяц, день).
+void civilFromDays(long z, int &y, int &m, int &d) {
+  z += 719468L;
+  long era = (z >= 0 ? z : z - 146096L) / 146097L;
+  unsigned long doe = (unsigned long)(z - era * 146097L);           // [0, 146096]
+  unsigned long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;  // [0, 399]
+  long yr = (long)yoe + era * 400L;
+  unsigned long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);       // [0, 365]
+  unsigned long mp = (5 * doy + 2) / 153;                            // [0, 11]
+  d = (int)(doy - (153 * mp + 2) / 5 + 1);                           // [1, 31]
+  m = (int)(mp + (mp < 10 ? 3 : -9));                                 // [1, 12]
+  y = (int)(yr + (m <= 2 ? 1 : 0));
+}
+
+// Текущее "мягкое" время - epochAtSync + прошедшее с синхронизации (в millis(),
+// беззнаково - переполнение millis() через ~49 дней корректно самокомпенсируется
+// обычным беззнаковым вычитанием, отдельно не обрабатывается).
+void computeLocalTime(int &year, int &month, int &day, int &hour, int &minute, int &weekday) {
+  unsigned long elapsedS = (unsigned long)(millis() - millisAtSync) / 1000UL;
+  unsigned long nowEpoch = epochAtSync + elapsedS;
+  long days = (long)(nowEpoch / 86400UL);
+  unsigned long rem = nowEpoch % 86400UL;
+  hour = (int)(rem / 3600UL);
+  minute = (int)((rem % 3600UL) / 60UL);
+  // epoch 0 (01.01.1970) - четверг; в схеме Пн=0..Вс=6 это индекс 3.
+  weekday = (int)(((days % 7) + 3 + 7) % 7);
+  civilFromDays(days, year, month, day);
+}
+
+const char *OFFLINE_WEEKDAY_NAMES[7] = {"Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"};
+
+bool withinOfflineWindow(int nowMinutes) {
+  int s = offlineConfig.start_min, e = offlineConfig.end_min;
+  if (s == e) return true;             // "весь день" - вырожденный случай
+  if (s < e) return nowMinutes >= s && nowMinutes < e;
+  return nowMinutes >= s || nowMinutes < e;   // окно через полночь
+}
+
+// Общая функция вместо повторяющихся макро-разворачиваний constrain() -
+// см. её использование в processCommandLine() при разборе OFFCFG:.
+uint16_t clampU16(unsigned long v, unsigned long lo, unsigned long hi) {
+  if (v < lo) v = lo;
+  if (v > hi) v = hi;
+  return (uint16_t)v;
+}
+
+// ---------------- offline-режим: состояние показа ----------------
+
+bool offlineScreenActive = false;       // сейчас показывается офлайн-экран
+                                          // (а не просто погашенный watchdog'ом OLED)
+unsigned long lastOfflineScreenUpdateMs = 0;
+#define OFFLINE_SCREEN_UPDATE_INTERVAL_MS 1000UL   // часы тикают по минутам -
+                                                     // секундная частота
+                                                     // перерисовки с большим
+                                                     // запасом, дороже незачем
+
+// Рендерит один шаблон офлайн-экрана в out (bounded, null-terminated).
+// Поддерживаются ТОЛЬКО пять токенов {time_now}/{weekday_name}/{date_now}/
+// {year_now}/{uptime} - без спецификаторов ширины ({var:N}), в отличие от
+// обычных L1-3 (те уже полностью отрендерены хостом). Нераспознанный/
+// незакрытый токен -> ничего не подставляется (та же логика, что и у
+// templates.render() на хосте для нерезолвящейся переменной - пустая
+// строка, а не мусор/авария).
+void renderOfflineLine(const char *tpl, char *out, size_t outSize, OfflineToken *tokens, uint8_t tokenCount) {
+  size_t oi = 0;
+  const char *p = tpl;
+  while (*p && oi + 1 < outSize) {
+    if (*p == '{') {
+      const char *close = strchr(p, '}');
+      if (close != NULL) {
+        size_t tokLen = (size_t)(close - (p + 1));
+        bool matched = false;
+        for (uint8_t i = 0; i < tokenCount; i++) {
+          size_t nameLen = strlen(tokens[i].name);
+          if (nameLen == tokLen && strncmp(p + 1, tokens[i].name, tokLen) == 0) {
+            const char *v = tokens[i].value;
+            while (*v && oi + 1 < outSize) out[oi++] = *v++;
+            matched = true;
+            break;
+          }
+        }
+        p = close + 1;
+        if (matched) continue;
+        continue;  // нераспознанный токен - просто пропускаем {...}
+      }
+    }
+    out[oi++] = *p++;
+  }
+  out[oi] = '\0';
+}
+
+// Ручное форматирование чисел с ведущими нулями - вместо snprintf("%02d"/
+// "%04d",...): на AVR даже целочисленный printf тянет за собой не самую
+// маленькую библиотеку разбора формата, а тут нужно только "два/четыре
+// знака с нулями слева".
+void fmt2(char *out, int v) {
+  if (v < 0) v = 0;
+  if (v > 99) v = 99;
+  out[0] = '0' + (v / 10);
+  out[1] = '0' + (v % 10);
+  out[2] = '\0';
+}
+
+void fmt4(char *out, int v) {
+  if (v < 0) v = 0;
+  if (v > 9999) v = 9999;
+  out[0] = '0' + (v / 1000);
+  out[1] = '0' + ((v / 100) % 10);
+  out[2] = '0' + ((v / 10) % 10);
+  out[3] = '0' + (v % 10);
+  out[4] = '\0';
+}
+
 // ---------------- вспомогательные функции протокола ----------------
 
 // Разбирает 2 hex-символа в число 0-255. Некорректный ввод -> 0 (не падаем
@@ -323,6 +503,43 @@ void processCommandLine(char *line) {
         applyOledLine(1, value);
       } else if (strcmp(key, "L3") == 0) {
         applyOledLine(2, value);
+      } else if (strcmp(key, "TSYNC") == 0) {
+        // unix epoch секунд - умещается в unsigned long (32 бита) до 2106г.
+        epochAtSync = strtoul(value, NULL, 10);
+        millisAtSync = millis();
+        clockSynced = true;
+      } else if (strcmp(key, "UPT") == 0) {
+        strncpy(lastUptimeText, value, OFFLINE_UPTIME_MAX - 1);
+        lastUptimeText[OFFLINE_UPTIME_MAX - 1] = '\0';
+      } else if (strcmp(key, "OFFCFG") == 0) {
+        // "<enabled>,<timeout_s>,<start_min>,<end_min>" - разбираем ВРУЧНУЮ
+        // через strtoul(p, &p, 10) (endptr сам продвигает указатель за
+        // числом) - НЕ sscanf() (тяжёлая библиотека разбора формата на AVR)
+        // и НЕ strtok(value, ",") (вложенный вызов внутри strtok(NULL, "|")-
+        // цикла этой же функции испортил бы его состояние - strtok
+        // немодифицируемый, единое статическое состояние на весь рантайм).
+        char *p = (char *)value;
+        unsigned long en = strtoul(p, &p, 10);
+        if (*p == ',') p++;
+        unsigned long to = strtoul(p, &p, 10);
+        if (*p == ',') p++;
+        unsigned long sm = strtoul(p, &p, 10);
+        if (*p == ',') p++;
+        unsigned long em = strtoul(p, &p, 10);
+
+        offlineConfig.enabled = en ? 1 : 0;
+        offlineConfig.timeout_s = clampU16(to, 1UL, 65535UL);
+        offlineConfig.start_min = clampU16(sm, 0UL, 1439UL);
+        offlineConfig.end_min = clampU16(em, 0UL, 1439UL);
+      } else if (strcmp(key, "OFFL1") == 0) {
+        strncpy(offlineConfig.l1, value, OFFLINE_LINE_MAX - 1);
+        offlineConfig.l1[OFFLINE_LINE_MAX - 1] = '\0';
+      } else if (strcmp(key, "OFFL2") == 0) {
+        strncpy(offlineConfig.l2, value, OFFLINE_LINE_MAX - 1);
+        offlineConfig.l2[OFFLINE_LINE_MAX - 1] = '\0';
+      } else if (strcmp(key, "OFFL3") == 0) {
+        strncpy(offlineConfig.l3, value, OFFLINE_LINE_MAX - 1);
+        offlineConfig.l3[OFFLINE_LINE_MAX - 1] = '\0';
       }
       // неизвестный key - молча игнорируем (совместимость вперёд, если
       // хост когда-нибудь пришлёт новое поле, а прошивка ещё старая)
@@ -345,54 +562,102 @@ void processCommandLine(char *line) {
 // в false можно было бы и тут, но проще и надёжнее сделать это ровно там же,
 // где обновляется lastHostDataMs (см. loop()), одним местом, а не размазывать
 // по двум функциям.
+void renderOfflineScreenNow();  // объявление вперёд - используется ниже
+
 void checkHostTimeout() {
   if (hostTimedOut) return;
-  if (millis() - lastHostDataMs < NO_DATA_TIMEOUT_MS) return;
+  if (millis() - lastHostDataMs < effectiveTimeoutMs()) return;
 
   hostTimedOut = true;
 
+  // Офлайн-экран показываем, только если: включён в /offline, часы хоть
+  // раз синхронизировались (TSYNC уже приходил - без него "сейчас" попросту
+  // неизвестно) И текущее время суток попадает в разрешённое окно (см.
+  // withinOfflineWindow() - "не хочу, чтоб светился ночью"). Иначе - старое
+  // поведение без изменений: просто гасим ленту и OLED.
+  int y, mo, d, h, mi, wd;
+  computeLocalTime(y, mo, d, h, mi, wd);
+  bool wantOffline = offlineConfig.enabled && clockSynced && withinOfflineWindow(h * 60 + mi);
+
   FastLED.clear();
   FastLED.show();
 
-  oledLines[0] = "";
-  oledLines[1] = "";
-  oledLines[2] = "";
-  oledDirty = true;
+  if (wantOffline) {
+    offlineScreenActive = true;
+    lastOfflineScreenUpdateMs = 0;  // форсировать немедленную первую отрисовку
+    renderOfflineScreenNow();
+  } else {
+    offlineScreenActive = false;
+    oledLines[0] = "";
+    oledLines[1] = "";
+    oledLines[2] = "";
+    oledDirty = true;
+  }
 }
 
-// ---------------- "разбудить" хоста через USB HID (см. докстринг модуля) ----------------
+// Пересчитывает и (если что-то изменилось) перерисовывает офлайн-экран -
+// вызывается сразу при активации (см. checkHostTimeout()) и дальше раз в
+// OFFLINE_SCREEN_UPDATE_INTERVAL_MS, пока offlineScreenActive (см. loop()).
+void renderOfflineScreenNow() {
+  int y, mo, d, h, mi, wd;
+  computeLocalTime(y, mo, d, h, mi, wd);
 
-// Минимальный интервал между попытками - защита от повторных срабатываний
-// при удержании/частых кликах кнопки, пока хост ещё не откликнулся (первая
-// же валидная command-строка от хоста сбросит hostTimedOut в loop(), тогда
-// pollButton() снова пойдёт по обычной ветке BTN:CLICK, а не сюда).
-#define WAKE_KEY_COOLDOWN_MS 5000UL
-unsigned long lastWakeAttemptMs = 0;
+  // Окно активности могло закончиться, пока плата уже показывала офлайн-
+  // экран (например настроено "22:00-08:00", наступило 08:00) - гасим
+  // экран досрочно и больше не пересчитываем, до следующего реального
+  // подключения хоста.
+  if (!withinOfflineWindow(h * 60 + mi)) {
+    offlineScreenActive = false;
+    oledLines[0] = "";
+    oledLines[1] = "";
+    oledLines[2] = "";
+    oledDirty = true;
+    return;
+  }
 
-void attemptWakeHost() {
+  char timeBuf[6];       // "ЧЧ:ММ"
+  char dateBuf[6];       // "ДД.ММ"
+  char yearBuf[5];       // "ГГГГ"
+  char hBuf[3], miBuf[3], dBuf[3], moBuf[3];
+  fmt2(hBuf, h); fmt2(miBuf, mi);
+  timeBuf[0] = hBuf[0]; timeBuf[1] = hBuf[1]; timeBuf[2] = ':';
+  timeBuf[3] = miBuf[0]; timeBuf[4] = miBuf[1]; timeBuf[5] = '\0';
+  fmt2(dBuf, d); fmt2(moBuf, mo);
+  dateBuf[0] = dBuf[0]; dateBuf[1] = dBuf[1]; dateBuf[2] = '.';
+  dateBuf[3] = moBuf[0]; dateBuf[4] = moBuf[1]; dateBuf[5] = '\0';
+  fmt4(yearBuf, y);
+  const char *weekdayStr = OFFLINE_WEEKDAY_NAMES[wd];
+
+  OfflineToken tokens[] = {
+    {"time_now", timeBuf},
+    {"weekday_name", weekdayStr},
+    {"date_now", dateBuf},
+    {"year_now", yearBuf},
+    {"uptime", lastUptimeText},
+  };
+  uint8_t tokenCount = sizeof(tokens) / sizeof(tokens[0]);
+
+  char out1[40], out2[40], out3[40];
+  renderOfflineLine(offlineConfig.l1, out1, sizeof(out1), tokens, tokenCount);
+  renderOfflineLine(offlineConfig.l2, out2, sizeof(out2), tokens, tokenCount);
+  renderOfflineLine(offlineConfig.l3, out3, sizeof(out3), tokens, tokenCount);
+
+  // Перерисовываем (и сбрасываем скролл), только если текст реально
+  // изменился - иначе на статичных строках (например без {uptime}) OLED
+  // бы дёргался лишний раз каждую секунду без всякой пользы.
+  if (oledLines[0] != out1) { oledLines[0] = out1; scrollOffset[0] = 0; oledDirty = true; }
+  if (oledLines[1] != out2) { oledLines[1] = out2; scrollOffset[1] = 0; oledDirty = true; }
+  if (oledLines[2] != out3) { oledLines[2] = out3; scrollOffset[2] = 0; oledDirty = true; }
+}
+
+// Вызывается КАЖДУЮ итерацию loop(), пока offlineScreenActive - сама решает,
+// не рано ли ещё пересчитывать (см. OFFLINE_SCREEN_UPDATE_INTERVAL_MS).
+void updateOfflineScreen() {
+  if (!offlineScreenActive) return;
   unsigned long now = millis();
-  // lastWakeAttemptMs == 0 - ещё не было ни одной попытки, кулдаун не
-  // применяется (иначе первый клик после старта платы пришлось бы ждать
-  // WAKE_KEY_COOLDOWN_MS от millis()==0, чего на практике не случится, но
-  // явная проверка понятнее неявного совпадения).
-  if (lastWakeAttemptMs != 0 && now - lastWakeAttemptMs < WAKE_KEY_COOLDOWN_MS) return;
-  lastWakeAttemptMs = now;
-
-  Keyboard.press(KEY_LEFT_CTRL);
-  delay(15);  // достаточно для регистрации нажатия хостом, короче незаметно для пользователя
-  Keyboard.release(KEY_LEFT_CTRL);
-
-  // Визуальное подтверждение "клик принят, попытка ушла" - обычным путём
-  // (через OLED/ленту от хоста) подтвердить нечего, хоста ещё нет. Короткая
-  // синяя вспышка всей ленты - checkHostTimeout() не будет с ней бороться
-  // (он ничего не делает повторно, пока hostTimedOut уже true, см. его
-  // докстринг), а следующий пришедший от хоста BAR: сам перезапишет ленту
-  // как обычно.
-  fill_solid(leds, NUM_LEDS, CRGB(0, 120, 255));
-  FastLED.show();
-  delay(200);
-  FastLED.clear();
-  FastLED.show();
+  if (lastOfflineScreenUpdateMs != 0 && now - lastOfflineScreenUpdateMs < OFFLINE_SCREEN_UPDATE_INTERVAL_MS) return;
+  lastOfflineScreenUpdateMs = now;
+  renderOfflineScreenNow();
 }
 
 // ---------------- калибровка ленты (команда CAL) ----------------
@@ -444,11 +709,10 @@ void pollButton() {
     buttonDebounced = lastButtonState;
     if (buttonDebounced == LOW) {  // нажатие - активный уровень LOW (INPUT_PULLUP)
       if (hostTimedOut) {
-        // Хост не читает serial (см. checkHostTimeout()) - обычный
-        // BTN:CLICK слать некому, вместо этого пробуем разбудить его через
-        // USB HID (см. attemptWakeHost() и докстринг модуля за подробностями
-        // и ограничениями по Sleep/Shutdown/BIOS).
-        attemptWakeHost();
+        // Хост не читает serial (см. checkHostTimeout()) - BTN:CLICK слать
+        // некому, клик просто игнорируется. Кнопка во время hostTimedOut
+        // свободна для будущих функций (см. "ЗАДЕЛ НА БУДУЩЕЕ" в докстринге
+        // офлайн-режима ниже).
       } else {
         Serial.println(F("BTN:CLICK"));
       }
@@ -623,10 +887,6 @@ void setup() {
 
   lastButtonState = digitalRead(ENCODER_BTN_PIN);
   buttonDebounced = lastButtonState;
-
-  Keyboard.begin();  // USB HID-клавиатура (см. attemptWakeHost()) - composite
-                      // с уже поднятым Serial CDC, ничего дополнительно
-                      // настраивать не нужно на 32u4/Leonardo
 }
 
 void loop() {
@@ -643,6 +903,9 @@ void loop() {
         // тоже говорит о том, что порт живой и с той стороны кто-то есть).
         lastHostDataMs = millis();
         hostTimedOut = false;
+        offlineScreenActive = false;  // хост вернулся - офлайн-экран больше не
+                                        // актуален, дальше oledLines[] перезапишут
+                                        // обычные L1-3: из processCommandLine() ниже
         processCommandLine(serialBuf);
         serialBufLen = 0;
       }
@@ -660,6 +923,7 @@ void loop() {
   pollButton();
   flushEncoder();
   checkHostTimeout();
+  updateOfflineScreen();
 
   updateScroll();
   if (oledDirty) {

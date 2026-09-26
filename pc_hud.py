@@ -93,6 +93,7 @@ import templates
 import screens
 import screens_webui
 import settings_webui
+import offline_webui
 import protocol
 import ledbar
 import osd
@@ -156,6 +157,30 @@ DEFAULT_PING_FAIL_THRESHOLD = 2     # столько провалов подря
                                       # реально признать offline (см.
                                       # гистерезис в metrics_ping.PingMonitor)
 DEFAULT_PING_RECOVER_THRESHOLD = 1  # столько успехов подряд для возврата в online
+
+# Offline-режим платы (см. win_hud_arduino_firmware.ino, докстринг "Offline-
+# режим", и offline_webui.py за страницей настроек) - хост тут только
+# источник конфига (живёт в settings.json, как и остальное) и часов; сама
+# логика "показывать/не показывать" и рендер офлайн-экрана - на плате
+# (EEPROM), т.к. именно в момент офлайн-показа хоста может уже не быть.
+#
+# TIME_SYNC_INTERVAL_SECONDS - как часто слать плате TSYNC:/UPT: (см.
+# protocol.py) для поддержания её "мягких" часов - НЕ настройка в /settings
+# (в отличие от ping_interval_seconds), т.к. это внутренняя техническая
+# деталь протокола, не то, чем пользователю имеет смысл управлять. Значение
+# того же порядка, что и FULL_RESYNC_SECONDS - если плата успела 30 секунд
+# не получать TSYNC (хост завис/перегружен), рассинхронизация часов на эти
+# 30с всё равно не заметна на OLED, где время показывается с точностью до
+# минуты.
+TIME_SYNC_INTERVAL_SECONDS = 30.0
+
+DEFAULT_OFFLINE_ENABLED = False
+DEFAULT_OFFLINE_TIMEOUT_MINUTES = 3.0
+DEFAULT_OFFLINE_WINDOW_START = "00:00"  # "весь день" по умолчанию - пока
+DEFAULT_OFFLINE_WINDOW_END = "23:59"    # пользователь не сузил под "тихие часы"
+DEFAULT_OFFLINE_L1 = "{time_now}"
+DEFAULT_OFFLINE_L2 = "{weekday_name} {date_now}"
+DEFAULT_OFFLINE_L3 = "{uptime}"
 
 # Порог показа топ-процесса (top_process_name) больше НЕ глобальная настройка:
 # он задаётся пороговым условием самого экрана на /screens (например
@@ -359,6 +384,17 @@ DEFAULT_SETTINGS = {
     "ping_timeout_ms": DEFAULT_PING_TIMEOUT_MS,
     "ping_fail_threshold": DEFAULT_PING_FAIL_THRESHOLD,
     "ping_recover_threshold": DEFAULT_PING_RECOVER_THRESHOLD,
+    # Offline-режим (см. DEFAULT_OFFLINE_* выше и /offline в веб-интерфейсе) -
+    # живая настройка, хранится тут же, как и остальной cfg, но РЕАЛЬНО
+    # используется платой (см. отправку OFFCFG:/OFFL1-3: в metrics_main_loop
+    # ниже) - хост лишь хранит источник правды и пересылает его плате.
+    "offline_enabled": DEFAULT_OFFLINE_ENABLED,
+    "offline_timeout_minutes": DEFAULT_OFFLINE_TIMEOUT_MINUTES,
+    "offline_window_start": DEFAULT_OFFLINE_WINDOW_START,
+    "offline_window_end": DEFAULT_OFFLINE_WINDOW_END,
+    "offline_l1": DEFAULT_OFFLINE_L1,
+    "offline_l2": DEFAULT_OFFLINE_L2,
+    "offline_l3": DEFAULT_OFFLINE_L3,
     # avrdude - путь к папке (или сразу к avrdude.exe), если он не в PATH -
     # см. flash.resolve_avrdude_exe(). Живая настройка со страницы /flash,
     # тот же принцип, что serial_port/tautulli_url и т.п. выше. Пусто -
@@ -451,6 +487,45 @@ def _sanitize_mon_targets(raw):
             port = max(1, min(65535, port))
         out.append({"id": tid, "label": label, "host": host, "port": port})
     return out
+
+
+def _parse_hhmm_to_minutes(s, fallback=0):
+    """"HH:MM" -> минуты с полуночи (0-1439). Невалидный ввод -> fallback,
+    не бросаем исключение - тот же принцип терпимости к мусорному вводу, что
+    и у остальных /api/* в проекте (см. _sanitize_mon_targets и т.п.)."""
+    try:
+        h, m = str(s).strip().split(":")
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except (ValueError, AttributeError):
+        pass
+    return fallback
+
+
+def _minutes_to_hhmm(minutes):
+    minutes = max(0, min(1439, int(minutes)))
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _sanitize_offline_window(value, fallback):
+    """Строка "HH:MM" -> та же строка в каноническом виде, либо fallback,
+    если не распознать (см. _parse_hhmm_to_minutes)."""
+    fallback_min = _parse_hhmm_to_minutes(fallback, 0)
+    return _minutes_to_hhmm(_parse_hhmm_to_minutes(value, fallback_min))
+
+
+def _sanitize_offline_template(value):
+    """Шаблон одной строки офлайн-экрана (см. offline_webui.py/прошивка) -
+    убираем '|' (протокольный разделитель полей, см. protocol.py - текст с
+    ним сломал бы разбор строки на плате, тот же принцип действует и для
+    обычных L1-3) и переводы строк, обрезаем до буфера прошивки
+    (OFFLINE_LINE_MAX-1 в .ino) - тут используем то же число явно, чтобы не
+    импортировать константу из .ino (там её и не прочитать программно)."""
+    if not isinstance(value, str):
+        return ""
+    value = value.replace("|", "").replace("\n", " ").replace("\r", "")
+    return value[:27]
 
 
 state_lock = threading.Lock()
@@ -830,7 +905,7 @@ SENSORS_PAGE_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <div class="brand"><span class="dot"></span><h1>win-hud-arduino</h1></div>
-  <div class="nav"><a href="/" class="active">Sensors</a><a href="/settings">Settings</a><a href="/screens">OLED screens</a><a href="/flash">Flash</a></div>
+  <div class="nav"><a href="/" class="active">Sensors</a><a href="/settings">Settings</a><a href="/screens">OLED screens</a><a href="/offline">Offline</a><a href="/flash">Flash</a></div>
 
   <div class="banner" id="banner"><span class="b-dot"></span>
     Pro Micro не подключена - лента и OLED не обновляются, метрики продолжают собираться</div>
@@ -1514,6 +1589,40 @@ def api_ping_settings():
     return jsonify({"ok": True})
 
 
+@app.route("/api/offline", methods=["POST"])
+def api_offline():
+    """Настройки офлайн-экрана платы (см. DEFAULT_OFFLINE_*/offline_webui.py) -
+    реальное потребление этих значений НЕ тут, а в metrics_main_loop ниже
+    (отправка OFFCFG:/OFFL1-3: плате при каждом изменении/переподключении) -
+    здесь только валидация и сохранение в settings.json, тот же принцип, что
+    и у /api/ping_settings//api/monitor_targets."""
+    body = request.get_json(force=True)
+    with state_lock:
+        if "enabled" in body:
+            state["cfg"]["offline_enabled"] = bool(body["enabled"])
+        if "timeout_minutes" in body:
+            try:
+                state["cfg"]["offline_timeout_minutes"] = round(max(0.5, min(60.0, float(body["timeout_minutes"]))), 1)
+            except (TypeError, ValueError):
+                pass
+        if "window_start" in body:
+            state["cfg"]["offline_window_start"] = _sanitize_offline_window(
+                body["window_start"], state["cfg"]["offline_window_start"]
+            )
+        if "window_end" in body:
+            state["cfg"]["offline_window_end"] = _sanitize_offline_window(
+                body["window_end"], state["cfg"]["offline_window_end"]
+            )
+        if "l1" in body:
+            state["cfg"]["offline_l1"] = _sanitize_offline_template(body["l1"])
+        if "l2" in body:
+            state["cfg"]["offline_l2"] = _sanitize_offline_template(body["l2"])
+        if "l3" in body:
+            state["cfg"]["offline_l3"] = _sanitize_offline_template(body["l3"])
+        save_settings(state["cfg"])
+    return jsonify({"ok": True})
+
+
 @app.route("/api/encoder", methods=["POST"])
 def api_encoder():
     body = request.get_json(force=True)
@@ -1543,6 +1652,7 @@ def api_encoder():
 
 screens_webui.register_screens_routes(app, get_context)
 settings_webui.register_settings_routes(app)
+offline_webui.register_offline_routes(app)
 flash_webui.register_flash_routes(
     app, lambda: state["cfg"]["serial_port"], flashing_event,
     is_serial_free=lambda: not state["serial_connected"],
@@ -1594,6 +1704,21 @@ def metrics_main_loop(stop_event):
 
     rotation = screens.RotationState()
     proto = protocol.ProtocolState(full_resync_seconds=FULL_RESYNC_SECONDS)
+    # Offline-режим (см. win_hud_arduino_firmware.ino/offline_webui.py) -
+    # ОТДЕЛЬНЫЙ инстанс ProtocolState (та же diff-логика, что у proto выше,
+    # ProtocolState.build() и так работает с произвольным набором полей) -
+    # OFFCFG:/OFFL1-3: меняются гораздо реже, чем BAR/L1-3 обычной ротации,
+    # и логически не связаны с ней; общий инстанс означал бы, что смена
+    # офлайн-шаблона форсирует пересчёт "изменилось ли" и для BAR/L1-3 тоже -
+    # отдельный proto проще и уже готов (сбрасывается вместе с обычным при
+    # переподключении, см. ser.reset() ниже).
+    offline_proto = protocol.ProtocolState(full_resync_seconds=FULL_RESYNC_SECONDS)
+    # Таймер периодической отправки TSYNC:/UPT: (см. TIME_SYNC_INTERVAL_SECONDS) -
+    # ЭТО НЕ через offline_proto/diff-протокол: epoch меняется каждую секунду,
+    # слать его через diff-механизм означало бы слать его КАЖДЫЙ тик (~25Гц) -
+    # вместо этого отдельная низкочастотная отправка raw-строкой, см. блок
+    # записи в serial ниже.
+    last_time_sync = 0.0
 
     # История для мини-графиков (cpu_graph/ram_graph/... на OLED, см.
     # history.py/variables._graph()) - один инстанс на процесс, живёт тут
@@ -1690,6 +1815,8 @@ def metrics_main_loop(stop_event):
             ser = try_open_serial(cfg["serial_port"])
             if ser is not None:
                 proto.reset()
+                offline_proto.reset()
+                last_time_sync = 0.0  # форсировать немедленную TSYNC: на новом подключении
             last_reconnect_attempt = now
 
         # ---- неблокирующее чтение входящих строк (ENC:/BTN:) ----
@@ -2141,6 +2268,52 @@ def metrics_main_loop(stop_event):
                 with state_lock:
                     state["serial_connected"] = False
                 last_reconnect_attempt = now
+
+        # ---- offline-режим: конфиг платы (OFFCFG:/OFFL1-3:), diff-протокол ----
+        # cfg["offline_*"] - живая настройка (/offline в вебе), см.
+        # DEFAULT_OFFLINE_*/api_offline() выше - offline_proto.build() сам
+        # решает, изменилось ли что-то с прошлого тика (либо настал
+        # FULL_RESYNC_SECONDS - та же страховка на случай перезагрузки платы,
+        # что и у обычного proto). '|' и переносы строк из шаблонов уже
+        # вычищены в _sanitize_offline_template() при сохранении в /settings,
+        # тут это просто готовые строки.
+        offline_values = {
+            "OFFCFG": "{},{},{},{}".format(
+                1 if cfg.get("offline_enabled") else 0,
+                int(round(max(0.5, cfg.get("offline_timeout_minutes", DEFAULT_OFFLINE_TIMEOUT_MINUTES)) * 60)),
+                _parse_hhmm_to_minutes(cfg.get("offline_window_start", DEFAULT_OFFLINE_WINDOW_START), 0),
+                _parse_hhmm_to_minutes(cfg.get("offline_window_end", DEFAULT_OFFLINE_WINDOW_END), 1439),
+            ),
+            "OFFL1": cfg.get("offline_l1", DEFAULT_OFFLINE_L1),
+            "OFFL2": cfg.get("offline_l2", DEFAULT_OFFLINE_L2),
+            "OFFL3": cfg.get("offline_l3", DEFAULT_OFFLINE_L3),
+        }
+        offline_line_to_send = offline_proto.build(offline_values, now=now)
+        if ser is not None and not flashing_event.is_set() and offline_line_to_send is not None:
+            try:
+                ser.write((offline_line_to_send + "\n").encode("utf-8"))
+                _log_serial("tx", offline_line_to_send)
+            except (serial.SerialException, OSError):
+                pass  # основной write-путь выше уже обработает переподключение на своей проверке
+
+        # ---- offline-режим: периодическая синхронизация часов платы ----
+        # TSYNC:/UPT: - см. докстринг protocol.py и win_hud_arduino_firmware.ino
+        # ("Offline-режим"). НЕ через diff-протокол (см. обоснование у
+        # last_time_sync выше) - обычная raw-строка раз в
+        # TIME_SYNC_INTERVAL_SECONDS. uptime_text форматируется тем же
+        # format_duration(), что и context["uptime"] в медленном блоке метрик
+        # выше - тут считается заново, а не берётся из context, чтобы не
+        # зависеть от того, успел ли уже отработать POLL_INTERVAL-блок на
+        # этом конкретном тике.
+        if ser is not None and not flashing_event.is_set() and now - last_time_sync >= TIME_SYNC_INTERVAL_SECONDS:
+            last_time_sync = now
+            uptime_text = format_duration(time.time() - _boot_time())
+            tsync_line = f"TSYNC:{int(time.time())}|UPT:{uptime_text}"
+            try:
+                ser.write((tsync_line + "\n").encode("utf-8"))
+                _log_serial("tx", tsync_line)
+            except (serial.SerialException, OSError):
+                pass
 
         elapsed = time.time() - loop_t0
         # cfg["tick_interval"] - живая настройка из /settings (см.
