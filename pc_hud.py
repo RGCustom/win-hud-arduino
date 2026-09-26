@@ -905,7 +905,7 @@ SENSORS_PAGE_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <div class="brand"><span class="dot"></span><h1>win-hud-arduino</h1></div>
-  <div class="nav"><a href="/" class="active">Sensors</a><a href="/settings">Settings</a><a href="/screens">OLED screens</a><a href="/offline">Offline</a><a href="/flash">Flash</a></div>
+  <div class="nav"><a href="/" class="active">Main</a><a href="/settings">Settings</a><a href="/screens">Screens</a><a href="/offline">Offline</a><a href="/flash">Flash</a></div>
 
   <div class="banner" id="banner"><span class="b-dot"></span>
     Pro Micro не подключена - лента и OLED не обновляются, метрики продолжают собираться</div>

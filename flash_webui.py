@@ -95,7 +95,7 @@ FLASH_PAGE_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <div class="brand"><span class="dot"></span><h1>win-hud-arduino</h1></div>
-  <div class="nav"><a href="/">Sensors</a><a href="/settings">Settings</a><a href="/screens">OLED screens</a><a href="/offline">Offline</a><a href="/flash" class="active">Flash</a></div>
+  <div class="nav"><a href="/">Main</a><a href="/settings">Settings</a><a href="/screens">Screens</a><a href="/offline">Offline</a><a href="/flash" class="active">Flash</a></div>
 
   <div class="card">
     <h2>ПУТЬ К AVRDUDE</h2>
