@@ -75,6 +75,7 @@ pc_hud.py  (win-hud-arduino)
 """
 
 import copy
+import datetime
 import json
 import logging
 import os
@@ -2308,7 +2309,23 @@ def metrics_main_loop(stop_event):
         if ser is not None and not flashing_event.is_set() and now - last_time_sync >= TIME_SYNC_INTERVAL_SECONDS:
             last_time_sync = now
             uptime_text = format_duration(time.time() - _boot_time())
-            tsync_line = f"TSYNC:{int(time.time())}|UPT:{uptime_text}"
+            # У платы нет ни RTC, ни tzdata - computeLocalTime() в .ino просто
+            # считает epochAtSync + millis() и раскладывает в год/месяц/день/
+            # час/минуту, ничего не зная о часовом поясе (см. TSYNC: в
+            # protocol.py/win_hud_arduino_firmware.ino). Если слать сюда
+            # честный int(time.time()) (UTC) - офлайн-часы платы показывают
+            # время по Гринвичу, а не по локальному поясу хоста (на GMT+3
+            # расхождение ровно 3 часа - баг-репорт Konstantin). Вместо того
+            # чтобы учить плату часовым поясам (новое поле в протоколе +
+            # правки прошивки), проще и надёжнее компенсировать смещение
+            # здесь: считаем ТЕКУЩИЙ локальный офсет хоста (учитывает и DST,
+            # если он есть) и шлём плате epoch, СДВИНУТЫЙ на этот офсет -
+            # плата складывает его с millis() и получает уже ПРАВИЛЬНОЕ
+            # локальное время, хотя сама по-прежнему думает, что просто
+            # считает секунды с 1970 года без какой-либо зоны.
+            tz_offset_seconds = round((datetime.datetime.now() - datetime.datetime.utcnow()).total_seconds())
+            local_epoch = int(time.time()) + tz_offset_seconds
+            tsync_line = f"TSYNC:{local_epoch}|UPT:{uptime_text}"
             try:
                 ser.write((tsync_line + "\n").encode("utf-8"))
                 _log_serial("tx", tsync_line)
