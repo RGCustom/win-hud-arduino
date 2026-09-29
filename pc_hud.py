@@ -106,7 +106,7 @@ import metrics_ping
 import flash
 import flash_webui
 
-SCRIPT_VERSION = "2026-09-24-1"
+SCRIPT_VERSION = "2026-09-29-1"
 
 CONTAINER_START_TIME = time.time()
 
@@ -177,11 +177,24 @@ TIME_SYNC_INTERVAL_SECONDS = 30.0
 
 DEFAULT_OFFLINE_ENABLED = False
 DEFAULT_OFFLINE_TIMEOUT_MINUTES = 3.0
-DEFAULT_OFFLINE_WINDOW_START = "00:00"  # "весь день" по умолчанию - пока
-DEFAULT_OFFLINE_WINDOW_END = "23:59"    # пользователь не сузил под "тихие часы"
 DEFAULT_OFFLINE_L1 = "{time_now}"
 DEFAULT_OFFLINE_L2 = "{weekday_name} {date_now}"
 DEFAULT_OFFLINE_L3 = "{uptime}"
+
+# "Ночник" (см. обсуждение в чате) - НОВОЕ:
+#   - button_clock_seconds: пока хост пропал (hostTimedOut на плате), клик
+#     кнопки энкодера показывает офлайн-часы на это число секунд, ДАЖЕ ЕСЛИ
+#     offline_enabled выключен/сейчас вне своего окна - отдельный, разовый
+#     показ "по требованию", независимый от непрерывного офлайн-режима выше.
+#   - led_enabled/led_color: пока хост пропал, энкодер перестаёт крутить
+#     громкость (слать её некому) - вращение вместо этого прибавляет/убавляет
+#     минуты подсветки ленты СПЛОШНЫМ цветом led_color (по часовой - плюс
+#     минута за "клик", против часовой - минус, до полного выключения).
+#     Сама логика таймера/покраски - на плате (см. win_hud_arduino_firmware.ino),
+#     тут только конфиг, пересылаемый через OFFCFG: (см. metrics_main_loop).
+DEFAULT_OFFLINE_BUTTON_CLOCK_SECONDS = 60
+DEFAULT_OFFLINE_LED_ENABLED = False
+DEFAULT_OFFLINE_LED_COLOR = "FF8C2F"
 
 # Порог показа топ-процесса (top_process_name) больше НЕ глобальная настройка:
 # он задаётся пороговым условием самого экрана на /screens (например
@@ -391,11 +404,14 @@ DEFAULT_SETTINGS = {
     # ниже) - хост лишь хранит источник правды и пересылает его плате.
     "offline_enabled": DEFAULT_OFFLINE_ENABLED,
     "offline_timeout_minutes": DEFAULT_OFFLINE_TIMEOUT_MINUTES,
-    "offline_window_start": DEFAULT_OFFLINE_WINDOW_START,
-    "offline_window_end": DEFAULT_OFFLINE_WINDOW_END,
     "offline_l1": DEFAULT_OFFLINE_L1,
     "offline_l2": DEFAULT_OFFLINE_L2,
     "offline_l3": DEFAULT_OFFLINE_L3,
+    # "Ночник" - см. DEFAULT_OFFLINE_BUTTON_CLOCK_SECONDS/DEFAULT_OFFLINE_LED_*
+    # выше за обоснованием.
+    "offline_button_clock_seconds": DEFAULT_OFFLINE_BUTTON_CLOCK_SECONDS,
+    "offline_led_enabled": DEFAULT_OFFLINE_LED_ENABLED,
+    "offline_led_color": DEFAULT_OFFLINE_LED_COLOR,
     # avrdude - путь к папке (или сразу к avrdude.exe), если он не в PATH -
     # см. flash.resolve_avrdude_exe(). Живая настройка со страницы /flash,
     # тот же принцип, что serial_port/tautulli_url и т.п. выше. Пусто -
@@ -488,32 +504,6 @@ def _sanitize_mon_targets(raw):
             port = max(1, min(65535, port))
         out.append({"id": tid, "label": label, "host": host, "port": port})
     return out
-
-
-def _parse_hhmm_to_minutes(s, fallback=0):
-    """"HH:MM" -> минуты с полуночи (0-1439). Невалидный ввод -> fallback,
-    не бросаем исключение - тот же принцип терпимости к мусорному вводу, что
-    и у остальных /api/* в проекте (см. _sanitize_mon_targets и т.п.)."""
-    try:
-        h, m = str(s).strip().split(":")
-        h, m = int(h), int(m)
-        if 0 <= h <= 23 and 0 <= m <= 59:
-            return h * 60 + m
-    except (ValueError, AttributeError):
-        pass
-    return fallback
-
-
-def _minutes_to_hhmm(minutes):
-    minutes = max(0, min(1439, int(minutes)))
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
-
-
-def _sanitize_offline_window(value, fallback):
-    """Строка "HH:MM" -> та же строка в каноническом виде, либо fallback,
-    если не распознать (см. _parse_hhmm_to_minutes)."""
-    fallback_min = _parse_hhmm_to_minutes(fallback, 0)
-    return _minutes_to_hhmm(_parse_hhmm_to_minutes(value, fallback_min))
 
 
 def _sanitize_offline_template(value):
@@ -1606,20 +1596,23 @@ def api_offline():
                 state["cfg"]["offline_timeout_minutes"] = round(max(0.5, min(60.0, float(body["timeout_minutes"]))), 1)
             except (TypeError, ValueError):
                 pass
-        if "window_start" in body:
-            state["cfg"]["offline_window_start"] = _sanitize_offline_window(
-                body["window_start"], state["cfg"]["offline_window_start"]
-            )
-        if "window_end" in body:
-            state["cfg"]["offline_window_end"] = _sanitize_offline_window(
-                body["window_end"], state["cfg"]["offline_window_end"]
-            )
         if "l1" in body:
             state["cfg"]["offline_l1"] = _sanitize_offline_template(body["l1"])
         if "l2" in body:
             state["cfg"]["offline_l2"] = _sanitize_offline_template(body["l2"])
         if "l3" in body:
             state["cfg"]["offline_l3"] = _sanitize_offline_template(body["l3"])
+        if "button_clock_seconds" in body:
+            try:
+                state["cfg"]["offline_button_clock_seconds"] = max(5, min(300, int(body["button_clock_seconds"])))
+            except (TypeError, ValueError):
+                pass
+        if "led_enabled" in body:
+            state["cfg"]["offline_led_enabled"] = bool(body["led_enabled"])
+        if "led_color" in body:
+            color = str(body["led_color"]).strip().lstrip("#").upper()
+            if len(color) == 6 and all(c in "0123456789ABCDEF" for c in color):
+                state["cfg"]["offline_led_color"] = color
         save_settings(state["cfg"])
     return jsonify({"ok": True})
 
@@ -2278,12 +2271,34 @@ def metrics_main_loop(stop_event):
         # что и у обычного proto). '|' и переносы строк из шаблонов уже
         # вычищены в _sanitize_offline_template() при сохранении в /settings,
         # тут это просто готовые строки.
+        # Ночник - led_color хранится в settings.json как hex-строка "RRGGBB"
+        # (тот же формат, что и остальные цвета проекта, см. DEFAULT_COLORS) -
+        # тут раскладывается на три десятичных байта 0-255, т.к. прошивке
+        # дешевле разобрать три strtoul() через запятую, чем ещё один hex-парсер
+        # (hexByte() в .ino уже есть для BAR:, но там фиксированная раскладка
+        # по NUM_LEDS*6 символам, а тут всего один цвет - плодить это ради
+        # трёх байт не стоит).
+        led_color_hex = (cfg.get("offline_led_color") or DEFAULT_OFFLINE_LED_COLOR).strip().lstrip("#")
+        if len(led_color_hex) != 6:
+            led_color_hex = DEFAULT_OFFLINE_LED_COLOR
+        try:
+            led_r = int(led_color_hex[0:2], 16)
+            led_g = int(led_color_hex[2:4], 16)
+            led_b = int(led_color_hex[4:6], 16)
+        except ValueError:
+            led_r = led_g = led_b = 0
+
         offline_values = {
-            "OFFCFG": "{},{},{},{}".format(
+            "OFFCFG": "{},{},{},{},{},{},{},{},{}".format(
                 1 if cfg.get("offline_enabled") else 0,
                 int(round(max(0.5, cfg.get("offline_timeout_minutes", DEFAULT_OFFLINE_TIMEOUT_MINUTES)) * 60)),
-                _parse_hhmm_to_minutes(cfg.get("offline_window_start", DEFAULT_OFFLINE_WINDOW_START), 0),
-                _parse_hhmm_to_minutes(cfg.get("offline_window_end", DEFAULT_OFFLINE_WINDOW_END), 1439),
+                # start_min/end_min - бывшее окно активности, УБРАНО. Поля
+                # оставлены в протоколе (0,0 = "весь день" для старой
+                # прошивки; новая прошивка их просто пропускает).
+                0, 0,
+                max(5, min(300, int(cfg.get("offline_button_clock_seconds", DEFAULT_OFFLINE_BUTTON_CLOCK_SECONDS)))),
+                1 if cfg.get("offline_led_enabled") else 0,
+                led_r, led_g, led_b,
             ),
             "OFFL1": cfg.get("offline_l1", DEFAULT_OFFLINE_L1),
             "OFFL2": cfg.get("offline_l2", DEFAULT_OFFLINE_L2),

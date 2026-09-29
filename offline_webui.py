@@ -21,6 +21,19 @@ metrics_main_loop() и /api/offline там же.
 /api/preview, что и /screens (см. screens_webui.py) - рендерит на хосте по
 текущему context, это просто удобный ориентир "как выглядело бы сейчас",
 сам рендер на плате не завязан на хост и работает независимо от него.
+
+НОВОЕ (см. обсуждение в чате про "ночник"):
+  - "Часы по кнопке" (button_clock_s) - пока хост пропал (см. hostTimedOut
+    в прошивке), клик кнопки энкодера показывает офлайн-часы на плате на
+    заданное число секунд, ДАЖЕ ЕСЛИ основной офлайн-экран (offline_enabled)
+    выключен - это отдельный, "по требованию"
+    показ, не связанный с непрерывным офлайн-режимом выше.
+  - "Ночник ленты" (led_enabled/led_color) - пока хост пропал, вращение
+    энкодера НЕ крутит громкость (слать её некому), а прибавляет/убавляет
+    минуты подсветки ленты сплошным цветом (по часовой - плюс минута за
+    "клик", против часовой - минус, до полного выключения). Цвет
+    настраивается тут же. Сама логика таймера/покраски - на плате (см.
+    win_hud_arduino_firmware.ino), тут только конфиг.
 """
 
 from flask import request, jsonify, Response
@@ -31,6 +44,8 @@ OFFLINE_TOKENS = [
     ("date_now", "Дата ДД.ММ"),
     ("year_now", "Год ГГГГ"),
     ("uptime", "Аптайм Windows (последнее известное значение)"),
+    ("nightled_status", "Ночник ленты: Вкл/Выкл"),
+    ("nightled_time", "Ночник ленты: сколько ещё светить (ММ:СС)"),
 ]
 
 OFFLINE_PAGE_HTML = """<!doctype html>
@@ -68,8 +83,14 @@ OFFLINE_PAGE_HTML = """<!doctype html>
     border-radius:6px; padding:6px 8px; font-size:13px; flex:1; min-width:120px;
   }
   input[type=checkbox] { width:16px; height:16px; }
+  input[type=color] { width:26px; height:26px; border:none; background:none; border-radius:6px; cursor:pointer; padding:0; }
 
   .checkbox-row { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--text); margin-bottom:14px; }
+
+  .slider-row { display:flex; align-items:center; gap:10px; margin-top:10px; font-size:13px; }
+  .slider-row label { color:var(--muted); min-width:170px; }
+  .slider-row input[type=range] { flex:1; }
+  .slider-row .val { min-width:52px; text-align:right; color:var(--text); font-variant-numeric:tabular-nums; }
 
   .legend { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 4px; }
   .legend-item { display:inline-block; background:#101112; border:1px solid var(--border); border-radius:5px;
@@ -105,27 +126,42 @@ OFFLINE_PAGE_HTML = """<!doctype html>
       <label>Через сколько минут молчания</label>
       <input type="number" id="offline-timeout" min="0.5" max="60" step="0.5" value="3">
     </div>
-    <div class="note">Пока хост на связи, ниже видно окно активности офлайн-экрана и
-      сами строки - но реально включится он только через это время после того, как связь
-      с ПК пропадёт.</div>
+    <div class="note">Офлайн-экран включится через это время после того, как связь с ПК
+      пропадёт, и будет показываться, пока хост не вернётся.</div>
 
-    <div class="row" style="margin-top:14px">
-      <label>Окно активности, с</label>
-      <input type="time" id="offline-start" value="00:00">
+    <div class="slider-row" style="margin-top:14px">
+      <label>Часы по кнопке, сек</label>
+      <input type="range" id="offline-button-clock" min="5" max="300" step="5" value="60">
+      <span class="val" id="offline-button-clock-val">60с</span>
     </div>
+    <div class="note">Пока хост пропал - клик кнопки энкодера показывает офлайн-часы на это
+      число секунд, ДАЖЕ ЕСЛИ сам офлайн-экран выше выключен.
+      Отдельный, разовый показ "по требованию" - независим от настроек выше.</div>
+  </div>
+
+  <div class="global-card">
+    <h2>Ночник ленты (когда ПК выключен)</h2>
+    <div class="hint">Пока хост пропал, энкодер перестаёт крутить громкость (слать её некому) -
+      вместо этого вращение прибавляет/убавляет минуты подсветки ленты сплошным цветом:
+      по часовой стрелке - +1 минута за "клик" энкодера, против часовой - -1 минута, вплоть
+      до полного выключения ленты. Логика таймера/покраски - на самой плате.</div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="offline-led-enabled">
+      <label for="offline-led-enabled">Включить ночник ленты</label>
+    </div>
+
     <div class="row">
-      <label>Окно активности, до</label>
-      <input type="time" id="offline-end" value="23:59">
+      <label>Цвет ночника</label>
+      <div><input type="color" id="offline-led-color" value="#FF8C2F"></div>
     </div>
-    <div class="note">Офлайн-экран показывается, только если текущее время суток попадает в
-      это окно - вне его плата просто гаснет, как и раньше ("не хочу, чтоб светился ночью").
-      Если "до" меньше "с" - окно считается через полночь (например 22:00-08:00). Одинаковые
-      значения - "весь день".</div>
+    <div class="note">Сплошной цвет на всю ленту - без градиента/анимации (экономия памяти
+      прошивки). Максимум подсветки - 60 минут за один раз.</div>
   </div>
 
   <div class="global-card">
     <h2>Строки offline-экрана</h2>
-    <div class="hint">Доступно всего пять переменных (плата считает их сама, без хоста) -
+    <div class="hint">Доступно всего семь переменных (плата считает их сама, без хоста) -
       кликни, чтобы вставить в поле. В отличие от обычных экранов на /screens, спецификаторы
       ширины ({var:N}) тут не поддерживаются, а текст не должен содержать символ "|".</div>
     <div class="legend" id="legend"></div>
@@ -141,7 +177,7 @@ OFFLINE_PAGE_HTML = """<!doctype html>
     <label style="font-size:12px;color:var(--muted);display:block;margin:0 0 4px">Строка 3</label>
     <input type="text" id="offline-l3" placeholder="{uptime}">
     <div class="line-preview" id="preview-l3"></div>
-    <div class="note">Предпросмотр считается на хосте по текущим данным - ориентир "как
+    <div class="note">Предпросмотр считается на хосте по текущим данным (для ночника подставлены примеры «Вкл» и «05:00») - ориентир "как
       выглядело бы прямо сейчас". Сам офлайн-экран рендерит плата независимо от хоста, поэтому
       {uptime} там - замороженное последнее известное значение, а не живой счётчик.</div>
   </div>
@@ -151,8 +187,9 @@ OFFLINE_PAGE_HTML = """<!doctype html>
 
 <script>
 let focusedField = null;
-let editingTimeout = false, editingStart = false, editingEnd = false;
+let editingTimeout = false;
 let editingL1 = false, editingL2 = false, editingL3 = false;
+let editingButtonClock = false;
 
 document.querySelectorAll('#offline-l1,#offline-l2,#offline-l3').forEach(el => {
   el.addEventListener('focus', () => focusedField = el);
@@ -180,8 +217,11 @@ function buildLegend() {
 function livePreview(inputEl, previewEl) {
   const tpl = inputEl.value;
   if (!tpl) { previewEl.textContent = ''; previewEl.classList.remove('err'); return; }
+  // Переменные ночника есть только на плате (на хосте их нет в реестре) -
+  // подставляем примеры сами, до отправки на /api/preview.
+  const tplForPreview = tpl.split('{nightled_status}').join('Вкл').split('{nightled_time}').join('05:00');
   fetch('/api/preview', { method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ template: tpl }) })
+    body: JSON.stringify({ template: tplForPreview }) })
     .then(r => r.json())
     .then(res => {
       if (res.unknown_vars.length) {
@@ -210,11 +250,23 @@ enabledEl.addEventListener('change', () => sendOffline({ enabled: enabledEl.chec
 const timeoutEl = document.getElementById('offline-timeout');
 debounceSave(timeoutEl, v => editingTimeout = v, () => sendOffline({ timeout_minutes: parseFloat(timeoutEl.value) }));
 
-const startEl = document.getElementById('offline-start');
-debounceSave(startEl, v => editingStart = v, () => sendOffline({ window_start: startEl.value }));
+const buttonClockEl = document.getElementById('offline-button-clock');
+const buttonClockValEl = document.getElementById('offline-button-clock-val');
+buttonClockEl.addEventListener('input', () => {
+  editingButtonClock = true;
+  buttonClockValEl.textContent = buttonClockEl.value + "с";
+});
+buttonClockEl.addEventListener('change', () => {
+  sendOffline({ button_clock_seconds: parseInt(buttonClockEl.value) });
+  editingButtonClock = false;
+});
 
-const endEl = document.getElementById('offline-end');
-debounceSave(endEl, v => editingEnd = v, () => sendOffline({ window_end: endEl.value }));
+// ---- Ночник ленты ----
+const ledEnabledEl = document.getElementById('offline-led-enabled');
+ledEnabledEl.addEventListener('change', () => sendOffline({ led_enabled: ledEnabledEl.checked }));
+
+const ledColorEl = document.getElementById('offline-led-color');
+ledColorEl.addEventListener('change', () => sendOffline({ led_color: ledColorEl.value.slice(1).toUpperCase() }));
 
 ['l1', 'l2', 'l3'].forEach(k => {
   const input = document.getElementById('offline-' + k);
@@ -230,8 +282,15 @@ function render(s) {
   const cfg = s.cfg;
   enabledEl.checked = !!cfg.offline_enabled;
   if (!editingTimeout) timeoutEl.value = cfg.offline_timeout_minutes;
-  if (!editingStart) startEl.value = cfg.offline_window_start || '00:00';
-  if (!editingEnd) endEl.value = cfg.offline_window_end || '23:59';
+  if (!editingButtonClock) {
+    buttonClockEl.value = cfg.offline_button_clock_seconds;
+    buttonClockValEl.textContent = cfg.offline_button_clock_seconds + "с";
+  }
+
+  ledEnabledEl.checked = !!cfg.offline_led_enabled;
+  if (document.activeElement !== ledColorEl) {
+    ledColorEl.value = '#' + (cfg.offline_led_color || 'FF8C2F');
+  }
 
   if (!editingL1 && document.activeElement !== document.getElementById('offline-l1')) {
     document.getElementById('offline-l1').value = cfg.offline_l1 || '';
