@@ -99,6 +99,9 @@ OFFLINE_PAGE_HTML = """<!doctype html>
 
   .line-preview { font-size:12px; color:var(--accent); font-family:monospace; margin:4px 0 14px; min-height:16px; }
   .line-preview.err { color:var(--danger); }
+  .byte-count { font-size:11px; color:var(--muted); margin:4px 0 0; }
+  .byte-count.over { color:var(--danger); }
+  .byte-count.ok { color:#3ecf6e; }
 
   .note { font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5; }
 
@@ -168,14 +171,17 @@ OFFLINE_PAGE_HTML = """<!doctype html>
 
     <label style="font-size:12px;color:var(--muted);display:block;margin:12px 0 4px">Строка 1</label>
     <input type="text" id="offline-l1" placeholder="{time_now}">
+    <div class="byte-count" id="bytes-l1"></div>
     <div class="line-preview" id="preview-l1"></div>
 
     <label style="font-size:12px;color:var(--muted);display:block;margin:0 0 4px">Строка 2</label>
     <input type="text" id="offline-l2" placeholder="{weekday_name} {date_now}">
+    <div class="byte-count" id="bytes-l2"></div>
     <div class="line-preview" id="preview-l2"></div>
 
     <label style="font-size:12px;color:var(--muted);display:block;margin:0 0 4px">Строка 3</label>
     <input type="text" id="offline-l3" placeholder="{uptime}">
+    <div class="byte-count" id="bytes-l3"></div>
     <div class="line-preview" id="preview-l3"></div>
     <div class="note">Предпросмотр считается на хосте по текущим данным (для ночника подставлены примеры «Вкл» и «05:00») - ориентир "как
       выглядело бы прямо сейчас". Сам офлайн-экран рендерит плата независимо от хоста, поэтому
@@ -268,14 +274,54 @@ ledEnabledEl.addEventListener('change', () => sendOffline({ led_enabled: ledEnab
 const ledColorEl = document.getElementById('offline-led-color');
 ledColorEl.addEventListener('change', () => sendOffline({ led_color: ledColorEl.value.slice(1).toUpperCase() }));
 
+const TEMPLATE_LIMIT = 47;   // байт UTF-8 на строку - должен совпадать с OFFLINE_TEMPLATE_MAX_BYTES в pc_hud.py
+
+function byteLen(str) { return new TextEncoder().encode(str).length; }
+
+// Счётчик байт под полем: кириллица = 2 байта на символ, лимит платы считается
+// в байтах, а не в символах - поэтому именно байты. suffix - статус сохранения.
+function updateByteCount(k, suffix, cls) {
+  const el = document.getElementById('bytes-' + k);
+  const n = byteLen(document.getElementById('offline-' + k).value);
+  const over = n > TEMPLATE_LIMIT;
+  el.textContent = n + ' / ' + TEMPLATE_LIMIT + ' байт' + (over ? ' - лишнее будет обрезано' : '') + (suffix ? ' - ' + suffix : '');
+  el.className = 'byte-count' + (over ? ' over' : (cls ? ' ' + cls : ''));
+}
+
 ['l1', 'l2', 'l3'].forEach(k => {
   const input = document.getElementById('offline-' + k);
   const preview = document.getElementById('preview-' + k);
-  input.addEventListener('input', () => livePreview(input, preview));
-  input.addEventListener('change', () => {
+  let timer = null;
+
+  // replaceField=true (уход из поля): если сервер сохранил не то, что введено
+  // (обрезал/убрал лишнее) - подставляем в поле РЕАЛЬНО сохранённое значение.
+  function save(replaceField) {
     const body = {}; body[k] = input.value;
-    sendOffline(body);
+    fetch('/api/offline', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body) })
+      .then(r => r.json())
+      .then(res => {
+        if (!res || res[k] === undefined) return;
+        if (res[k] === input.value) { updateByteCount(k, 'сохранено', 'ok'); return; }
+        if (replaceField) {
+          input.value = res[k];
+          livePreview(input, preview);
+          updateByteCount(k, 'сохранено в таком виде (лишнее убрано)', 'over');
+          document.getElementById('bytes-' + k).classList.add('over');
+        } else {
+          updateByteCount(k);
+        }
+      })
+      .catch(() => updateByteCount(k, 'ОШИБКА сохранения', 'over'));
+  }
+
+  input.addEventListener('input', () => {
+    livePreview(input, preview);
+    updateByteCount(k);
+    clearTimeout(timer);
+    timer = setTimeout(() => save(false), 800);   // автосохранение, если не ушли из поля
   });
+  input.addEventListener('change', () => { clearTimeout(timer); save(true); });
 });
 
 function render(s) {
@@ -301,7 +347,10 @@ function render(s) {
   if (!editingL3 && document.activeElement !== document.getElementById('offline-l3')) {
     document.getElementById('offline-l3').value = cfg.offline_l3 || '';
   }
-  ['l1','l2','l3'].forEach(k => livePreview(document.getElementById('offline-'+k), document.getElementById('preview-'+k)));
+  ['l1','l2','l3'].forEach(k => {
+    livePreview(document.getElementById('offline-'+k), document.getElementById('preview-'+k));
+    updateByteCount(k);
+  });
 }
 
 buildLegend();

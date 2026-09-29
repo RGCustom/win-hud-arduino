@@ -225,7 +225,7 @@ bool hostTimedOut = false;   // true - лента/OLED уже погашены w
 // конфиг от хоста заново при следующем подключении (см. OFFCFG:/OFFL1-3: в
 // processCommandLine() ниже) - никакого EEPROM.h не нужно, экономит и флеш,
 // и код (нет магии валидности записи/загрузки/сохранения).
-#define OFFLINE_LINE_MAX 40   // шаблон строки; {nightled_status} {nightled_time} вместе = 31 символ
+#define OFFLINE_LINE_MAX 48   // шаблон строки (47 байт UTF-8; кириллица = 2 байта); "Ночник: {nightled_status} {nightled_time}" = 47
 // шаблон может быть чуть длиннее подстрок
 struct OfflineConfig {
 uint8_t enabled;
@@ -610,13 +610,14 @@ fmt4(yearBuf, y);
 const char *weekdayStr = OFFLINE_WEEKDAY_NAMES[wd];
 // Ночник: {nightled_status} = Вкл/Выкл, {nightled_time} = оставшееся время
 // ММ:СС (секунды округляются вверх, чтобы не показывать 00:00 при ещё
-// горящей ленте). Когда ночник выключен - "Выкл" и "00:00".
+// горящей ленте). Когда ночник выключен - "Выкл" и пустая строка вместо времени.
 bool nlOn = offlineConfig.led_enabled && nightlightRemainingMs > 0;
 unsigned long nlSecs = nlOn ? (unsigned long)((nightlightRemainingMs + 999L) / 1000L) : 0UL;
 char nlMin[3], nlSec[3], nlTime[6];
 fmt2(nlMin, (int)(nlSecs / 60UL)); fmt2(nlSec, (int)(nlSecs % 60UL));
 nlTime[0] = nlMin[0]; nlTime[1] = nlMin[1]; nlTime[2] = ':';
 nlTime[3] = nlSec[0]; nlTime[4] = nlSec[1]; nlTime[5] = '\0';
+if (!nlOn) nlTime[0] = '\0';   // ночник выключен (00:00) - {nightled_time} не показываем вовсе
 OfflineToken tokens[] = {
 {"nightled_status", nlOn ? "Вкл" : "Выкл"},
 {"nightled_time", nlTime},

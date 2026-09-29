@@ -506,17 +506,32 @@ def _sanitize_mon_targets(raw):
     return out
 
 
+OFFLINE_TEMPLATE_MAX_BYTES = 47   # OFFLINE_LINE_MAX-1 в прошивке (.ino), байты UTF-8
+
+
 def _sanitize_offline_template(value):
     """Шаблон одной строки офлайн-экрана (см. offline_webui.py/прошивка) -
     убираем '|' (протокольный разделитель полей, см. protocol.py - текст с
     ним сломал бы разбор строки на плате, тот же принцип действует и для
     обычных L1-3) и переводы строк, обрезаем до буфера прошивки
-    (OFFLINE_LINE_MAX-1 в .ino) - тут используем то же число явно, чтобы не
+    (OFFLINE_LINE_MAX-1 = 47 байт в .ino) - тут используем то же число явно, чтобы не
     импортировать константу из .ino (там её и не прочитать программно)."""
     if not isinstance(value, str):
         return ""
     value = value.replace("|", "").replace("\n", " ").replace("\r", "")
-    return value[:27]
+    # Лимит - в БАЙТАХ UTF-8, а не в символах: буфер платы считает байты, а
+    # кириллица занимает 2 байта на символ. errors="ignore" отбрасывает
+    # половинку символа, если срез попал ровно посередине.
+    cut = value.encode("utf-8")[:OFFLINE_TEMPLATE_MAX_BYTES].decode("utf-8", errors="ignore")
+    if cut != value:
+        # Срез не должен оставлять недописанную переменную ("{nightled_time"
+        # без "}") - на плате она не подставится и выглядит как "не
+        # сохранилось". Если последняя "{" осталась без закрывающей "}" -
+        # отбрасываем её целиком вместе с хвостом.
+        last_open = cut.rfind("{")
+        if last_open != -1 and "}" not in cut[last_open:]:
+            cut = cut[:last_open]
+    return cut
 
 
 state_lock = threading.Lock()
@@ -1614,7 +1629,13 @@ def api_offline():
             if len(color) == 6 and all(c in "0123456789ABCDEF" for c in color):
                 state["cfg"]["offline_led_color"] = color
         save_settings(state["cfg"])
-    return jsonify({"ok": True})
+        # Возвращаем, что РЕАЛЬНО сохранилось (после обрезки) - страница
+        # сверяет это с тем, что ввёл пользователь, и показывает предупреждение.
+        return jsonify({
+            "ok": True, "limit_bytes": OFFLINE_TEMPLATE_MAX_BYTES,
+            "l1": state["cfg"]["offline_l1"], "l2": state["cfg"]["offline_l2"],
+            "l3": state["cfg"]["offline_l3"],
+        })
 
 
 @app.route("/api/encoder", methods=["POST"])
