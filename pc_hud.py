@@ -106,7 +106,7 @@ import metrics_ping
 import flash
 import flash_webui
 
-SCRIPT_VERSION = "2026-09-29-1"
+SCRIPT_VERSION = "2026-09-24-1"
 
 CONTAINER_START_TIME = time.time()
 
@@ -177,6 +177,8 @@ TIME_SYNC_INTERVAL_SECONDS = 30.0
 
 DEFAULT_OFFLINE_ENABLED = False
 DEFAULT_OFFLINE_TIMEOUT_MINUTES = 3.0
+DEFAULT_OFFLINE_WINDOW_START = "00:00"  # "весь день" по умолчанию - пока
+DEFAULT_OFFLINE_WINDOW_END = "23:59"    # пользователь не сузил под "тихие часы"
 DEFAULT_OFFLINE_L1 = "{time_now}"
 DEFAULT_OFFLINE_L2 = "{weekday_name} {date_now}"
 DEFAULT_OFFLINE_L3 = "{uptime}"
@@ -404,6 +406,8 @@ DEFAULT_SETTINGS = {
     # ниже) - хост лишь хранит источник правды и пересылает его плате.
     "offline_enabled": DEFAULT_OFFLINE_ENABLED,
     "offline_timeout_minutes": DEFAULT_OFFLINE_TIMEOUT_MINUTES,
+    "offline_window_start": DEFAULT_OFFLINE_WINDOW_START,
+    "offline_window_end": DEFAULT_OFFLINE_WINDOW_END,
     "offline_l1": DEFAULT_OFFLINE_L1,
     "offline_l2": DEFAULT_OFFLINE_L2,
     "offline_l3": DEFAULT_OFFLINE_L3,
@@ -506,7 +510,30 @@ def _sanitize_mon_targets(raw):
     return out
 
 
-OFFLINE_TEMPLATE_MAX_BYTES = 47   # OFFLINE_LINE_MAX-1 в прошивке (.ino), байты UTF-8
+def _parse_hhmm_to_minutes(s, fallback=0):
+    """"HH:MM" -> минуты с полуночи (0-1439). Невалидный ввод -> fallback,
+    не бросаем исключение - тот же принцип терпимости к мусорному вводу, что
+    и у остальных /api/* в проекте (см. _sanitize_mon_targets и т.п.)."""
+    try:
+        h, m = str(s).strip().split(":")
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except (ValueError, AttributeError):
+        pass
+    return fallback
+
+
+def _minutes_to_hhmm(minutes):
+    minutes = max(0, min(1439, int(minutes)))
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _sanitize_offline_window(value, fallback):
+    """Строка "HH:MM" -> та же строка в каноническом виде, либо fallback,
+    если не распознать (см. _parse_hhmm_to_minutes)."""
+    fallback_min = _parse_hhmm_to_minutes(fallback, 0)
+    return _minutes_to_hhmm(_parse_hhmm_to_minutes(value, fallback_min))
 
 
 def _sanitize_offline_template(value):
@@ -514,24 +541,12 @@ def _sanitize_offline_template(value):
     убираем '|' (протокольный разделитель полей, см. protocol.py - текст с
     ним сломал бы разбор строки на плате, тот же принцип действует и для
     обычных L1-3) и переводы строк, обрезаем до буфера прошивки
-    (OFFLINE_LINE_MAX-1 = 47 байт в .ino) - тут используем то же число явно, чтобы не
+    (OFFLINE_LINE_MAX-1 в .ino) - тут используем то же число явно, чтобы не
     импортировать константу из .ino (там её и не прочитать программно)."""
     if not isinstance(value, str):
         return ""
     value = value.replace("|", "").replace("\n", " ").replace("\r", "")
-    # Лимит - в БАЙТАХ UTF-8, а не в символах: буфер платы считает байты, а
-    # кириллица занимает 2 байта на символ. errors="ignore" отбрасывает
-    # половинку символа, если срез попал ровно посередине.
-    cut = value.encode("utf-8")[:OFFLINE_TEMPLATE_MAX_BYTES].decode("utf-8", errors="ignore")
-    if cut != value:
-        # Срез не должен оставлять недописанную переменную ("{nightled_time"
-        # без "}") - на плате она не подставится и выглядит как "не
-        # сохранилось". Если последняя "{" осталась без закрывающей "}" -
-        # отбрасываем её целиком вместе с хвостом.
-        last_open = cut.rfind("{")
-        if last_open != -1 and "}" not in cut[last_open:]:
-            cut = cut[:last_open]
-    return cut
+    return value[:27]
 
 
 state_lock = threading.Lock()
@@ -544,6 +559,11 @@ state = {
 
 _last_context = {}
 _context_lock = threading.Lock()
+
+# Пульс главного цикла - обновляется в начале КАЖДОЙ итерации metrics_main_loop.
+# /api/state отдаёт его возраст (loop_age), главная страница показывает баннер,
+# если цикл молчит дольше нескольких секунд (завис или перезапускается после ошибки).
+_loop_heartbeat = time.time()
 
 flashing_event = threading.Event()
 
@@ -815,7 +835,7 @@ def try_open_serial(port):
     if not port:
         return None
     try:
-        s = serial.Serial(port, BAUD, timeout=0)  # timeout=0 - неблокирующее чтение
+        s = serial.Serial(port, BAUD, timeout=0, write_timeout=1.0)  # timeout=0 - неблокирующее чтение; write_timeout - чтобы залипший USB не вешал главный цикл навсегда
         time.sleep(2)
         with state_lock:
             state["serial_connected"] = True
@@ -916,6 +936,9 @@ SENSORS_PAGE_HTML = """<!doctype html>
   <div class="banner" id="banner"><span class="b-dot"></span>
     Pro Micro не подключена - лента и OLED не обновляются, метрики продолжают собираться</div>
 
+  <div class="banner" id="banner-loop"><span class="b-dot"></span>
+    Главный цикл не отвечает (завис или падает с ошибкой) - см. «Лог программы» ниже</div>
+
   <div class="card">
     <h2>ЛЕНТА <span class="osd-badge" id="osd-badge">OSD</span></h2>
     <div class="strip-track" id="pixels-strip"></div>
@@ -1008,6 +1031,7 @@ function buildPixelGrid(ledsCount) {
 function refresh() {
   fetch("/api/state").then(r => r.json()).then(s => {
     document.getElementById("banner").classList.toggle("show", !s.serial_connected);
+    document.getElementById("banner-loop").classList.toggle("show", s.loop_age > 5);
     if (!pixelsBuilt || lastLedsCount !== s.leds_count) buildPixelGrid(s.leds_count);
 
     const bar = s.bar;
@@ -1216,6 +1240,7 @@ def api_state():
         out["available_disks"] = metrics_windows.list_disk_letters()
         out["available_ports"] = sorted(flash.list_com_ports())
         out["leds_count"] = state["cfg"]["leds_count"]
+        out["loop_age"] = round(time.time() - _loop_heartbeat, 1)
         return jsonify(out)
 
 
@@ -1611,6 +1636,14 @@ def api_offline():
                 state["cfg"]["offline_timeout_minutes"] = round(max(0.5, min(60.0, float(body["timeout_minutes"]))), 1)
             except (TypeError, ValueError):
                 pass
+        if "window_start" in body:
+            state["cfg"]["offline_window_start"] = _sanitize_offline_window(
+                body["window_start"], state["cfg"]["offline_window_start"]
+            )
+        if "window_end" in body:
+            state["cfg"]["offline_window_end"] = _sanitize_offline_window(
+                body["window_end"], state["cfg"]["offline_window_end"]
+            )
         if "l1" in body:
             state["cfg"]["offline_l1"] = _sanitize_offline_template(body["l1"])
         if "l2" in body:
@@ -1629,13 +1662,7 @@ def api_offline():
             if len(color) == 6 and all(c in "0123456789ABCDEF" for c in color):
                 state["cfg"]["offline_led_color"] = color
         save_settings(state["cfg"])
-        # Возвращаем, что РЕАЛЬНО сохранилось (после обрезки) - страница
-        # сверяет это с тем, что ввёл пользователь, и показывает предупреждение.
-        return jsonify({
-            "ok": True, "limit_bytes": OFFLINE_TEMPLATE_MAX_BYTES,
-            "l1": state["cfg"]["offline_l1"], "l2": state["cfg"]["offline_l2"],
-            "l3": state["cfg"]["offline_l3"],
-        })
+    return jsonify({"ok": True})
 
 
 @app.route("/api/encoder", methods=["POST"])
@@ -1692,6 +1719,7 @@ def run_web():
 # ---------------- главный цикл метрик + serial ----------------
 
 def metrics_main_loop(stop_event):
+    global _loop_heartbeat
     print(f"[win-hud-arduino] metrics loop starting, version {SCRIPT_VERSION}", flush=True)
 
     # COM (comtypes/pycaw) должен быть инициализирован В ЭТОМ ПОТОКЕ до
@@ -1809,578 +1837,584 @@ def metrics_main_loop(stop_event):
     read_buffer = ""
 
     while not stop_event.is_set():
-        loop_t0 = time.time()
-        now = loop_t0
+        try:
+            loop_t0 = time.time()
+            _loop_heartbeat = loop_t0
+            now = loop_t0
 
-        with state_lock:
-            cfg = copy.deepcopy(state["cfg"])
+            with state_lock:
+                cfg = copy.deepcopy(state["cfg"])
 
-        # ---- (пере)подключение / отключение на время прошивки ----
-        if flashing_event.is_set():
-            if ser is not None:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-                ser = None
-                with state_lock:
-                    state["serial_connected"] = False
-            last_reconnect_attempt = now
-        elif ser is None and now - last_reconnect_attempt > 5:
-            ser = try_open_serial(cfg["serial_port"])
-            if ser is not None:
-                proto.reset()
-                offline_proto.reset()
-                last_time_sync = 0.0  # форсировать немедленную TSYNC: на новом подключении
-            last_reconnect_attempt = now
-
-        # ---- неблокирующее чтение входящих строк (ENC:/BTN:) ----
-        if ser is not None and not flashing_event.is_set():
-            try:
-                waiting = ser.in_waiting
-                if waiting:
-                    read_buffer += ser.read(waiting).decode("utf-8", errors="ignore")
-                    while "\n" in read_buffer:
-                        line, read_buffer = read_buffer.split("\n", 1)
-                        line_stripped = line.strip()
-                        if line_stripped:
-                            # Лог serial-обмена для терминала на / - см.
-                            # _log_serial() выше. Пишем ЛЮБУЮ непустую строку
-                            # от платы, даже если parse_incoming_line() ниже
-                            # её не разберёт (serial-мусор на подключении -
-                            # это тоже полезно видеть в терминале при отладке).
-                            _log_serial("rx", line_stripped)
-                        event = protocol.parse_incoming_line(line)
-                        if event is None:
-                            continue
-                        kind, value = event
-                        if kind == "encoder":
-                            apply_encoder_delta(value, cfg)
-                        elif kind == "button":
-                            apply_button_click(cfg)
-                        # любое событие энкодера/кнопки - показать OSD громкости
-                        # через единую очередь (см. osd.py) - push() сам решает,
-                        # прервать ли уже показываемый более приоритетный (layout)
-                        # popup, встать в очередь, или показаться сразу; общий
-                        # кулдаун (cfg["osd_cooldown_seconds"]) тоже внутри push().
-                        audio_state = audio_controller.read_state()
-                        osd_manager.push(
-                            "volume",
-                            {"volume_pct": audio_state["volume_pct"], "muted": audio_state["volume_muted"] == "да"},
-                            now, cfg,
-                        )
-            except (serial.SerialException, OSError) as e:
-                print(f"[serial] read failed, will reconnect: {e}", flush=True)
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-                ser = None
-                with state_lock:
-                    state["serial_connected"] = False
+            # ---- (пере)подключение / отключение на время прошивки ----
+            if flashing_event.is_set():
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    ser = None
+                    with state_lock:
+                        state["serial_connected"] = False
+                last_reconnect_attempt = now
+            elif ser is None and now - last_reconnect_attempt > 5:
+                ser = try_open_serial(cfg["serial_port"])
+                if ser is not None:
+                    proto.reset()
+                    offline_proto.reset()
+                    last_time_sync = 0.0  # форсировать немедленную TSYNC: на новом подключении
                 last_reconnect_attempt = now
 
-        # ---- раскладка клавиатуры: КАЖДЫЙ тик, НЕ раз в POLL_INTERVAL -
-        # см. подробное обоснование у объявления watched_layout выше (без
-        # этого попап смены раскладки запаздывал на секунду и более).
-        # watched-value diff - та же логика 1-в-1, что раньше жила внутри
-        # блока медленных метрик, просто перенесена сюда, чтобы срабатывать
-        # с частотой TICK_INTERVAL, а не POLL_INTERVAL.
-        keyboard_state = metrics_windows.read_keyboard_state()
-        keyboard_layout = keyboard_state["keyboard_layout"]
-        foreground_pid = keyboard_state["foreground_pid"]
+            # ---- неблокирующее чтение входящих строк (ENC:/BTN:) ----
+            if ser is not None and not flashing_event.is_set():
+                try:
+                    waiting = ser.in_waiting
+                    if waiting:
+                        read_buffer += ser.read(waiting).decode("utf-8", errors="ignore")
+                        while "\n" in read_buffer:
+                            line, read_buffer = read_buffer.split("\n", 1)
+                            line_stripped = line.strip()
+                            if line_stripped:
+                                # Лог serial-обмена для терминала на / - см.
+                                # _log_serial() выше. Пишем ЛЮБУЮ непустую строку
+                                # от платы, даже если parse_incoming_line() ниже
+                                # её не разберёт (serial-мусор на подключении -
+                                # это тоже полезно видеть в терминале при отладке).
+                                _log_serial("rx", line_stripped)
+                            event = protocol.parse_incoming_line(line)
+                            if event is None:
+                                continue
+                            kind, value = event
+                            if kind == "encoder":
+                                apply_encoder_delta(value, cfg)
+                            elif kind == "button":
+                                apply_button_click(cfg)
+                            # любое событие энкодера/кнопки - показать OSD громкости
+                            # через единую очередь (см. osd.py) - push() сам решает,
+                            # прервать ли уже показываемый более приоритетный (layout)
+                            # popup, встать в очередь, или показаться сразу; общий
+                            # кулдаун (cfg["osd_cooldown_seconds"]) тоже внутри push().
+                            audio_state = audio_controller.read_state()
+                            osd_manager.push(
+                                "volume",
+                                {"volume_pct": audio_state["volume_pct"], "muted": audio_state["volume_muted"] == "да"},
+                                now, cfg,
+                            )
+                except (serial.SerialException, OSError) as e:
+                    print(f"[serial] read failed, will reconnect: {e}", flush=True)
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    ser = None
+                    with state_lock:
+                        state["serial_connected"] = False
+                    last_reconnect_attempt = now
 
-        # ---- watched-value diff: раскладка клавиатуры (см. osd.py) -
-        # триггерим popup, только если раскладка ДЕЙСТВИТЕЛЬНО сменилась
-        # (не первый тик после старта - watched_layout is not None) И
-        # foreground_pid НЕ изменился одновременно с ней - иначе это не
-        # реальное переключение языка, а alt-tab между окнами с разной
-        # per-window раскладкой (см. подробное обоснование в докстринге
-        # metrics_windows.read_keyboard_state()).
-        if (
-            watched_layout is not None
-            and keyboard_layout is not None
-            and keyboard_layout != watched_layout
-            and foreground_pid == watched_layout_pid
-        ):
-            osd_manager.push("layout", {"layout": keyboard_layout}, now, cfg)
-        watched_layout = keyboard_layout
-        watched_layout_pid = foreground_pid
+            # ---- раскладка клавиатуры: КАЖДЫЙ тик, НЕ раз в POLL_INTERVAL -
+            # см. подробное обоснование у объявления watched_layout выше (без
+            # этого попап смены раскладки запаздывал на секунду и более).
+            # watched-value diff - та же логика 1-в-1, что раньше жила внутри
+            # блока медленных метрик, просто перенесена сюда, чтобы срабатывать
+            # с частотой TICK_INTERVAL, а не POLL_INTERVAL.
+            keyboard_state = metrics_windows.read_keyboard_state()
+            keyboard_layout = keyboard_state["keyboard_layout"]
+            foreground_pid = keyboard_state["foreground_pid"]
 
-        # ---- медленные метрики: раз в POLL_INTERVAL ----
-        if now - last_metrics_tick >= POLL_INTERVAL:
-            dt = now - last_metrics_tick if last_metrics_tick else POLL_INTERVAL
-            last_metrics_tick = now
-
-            cpu_pct, cpu_pct_core_max, cpu_freq_mhz = metrics_windows.read_cpu_stats()
-            ram_pct, ram_used_gb, ram_total_gb = metrics_windows.read_ram_stats()
-            gpu_stats = gpu_monitor.read()
-
-            disk1 = metrics_windows.read_disk_usage(cfg["disk1_letter"])
-            disk2 = metrics_windows.read_disk_usage(cfg["disk2_letter"])
-
-            disks_ctx = {}
-            if cfg["disk1_letter"] and disk1:
-                disks_ctx[cfg["disk1_letter"]] = disk1
-            if cfg["disk2_letter"] and disk2:
-                disks_ctx[cfg["disk2_letter"]] = disk2
-
-            # сеть по слотам net1/net2 (для OLED) + метрика "net" для ленты
-            # (использует net1 - отдельного LED-only интерфейса не заводим)
-            net_ctx = {"net1": None, "net2": None}
-            net_pct = 0.0
-            for slot in ("net1", "net2"):
-                iface = cfg[f"{slot}_iface"]
-                if iface != prev_net_iface[slot]:
-                    prev_net_counters[slot] = (None, None)
-                    net_base_counters[slot] = (None, None)
-                    prev_net_iface[slot] = iface
-                if not iface:
-                    continue
-                rx, tx = metrics_windows.read_iface_counters(iface)
-                if rx is None:
-                    continue
-                prev_rx, prev_tx = prev_net_counters[slot]
-                rx_str = format_rate(rx - prev_rx, dt) if prev_rx is not None else "0Kbps"
-                tx_str = format_rate(tx - prev_tx, dt) if prev_tx is not None else "0Kbps"
-                rx_mbps = rate_mbps(rx - prev_rx, dt) if prev_rx is not None else 0.0
-                tx_mbps = rate_mbps(tx - prev_tx, dt) if prev_tx is not None else 0.0
-
-                if prev_rx is not None and dt > 0 and slot == "net1":
-                    mbps = (rx - prev_rx) * 8 / 1_000_000 / dt
-                    net_pct = max(0.0, min(100.0, mbps / NET_MAX_MBPS * 100.0))
-
-                base_rx, base_tx = net_base_counters[slot]
-                if base_rx is None:
-                    base_rx, base_tx = rx, tx
-                total_rx_str = format_bytes_total(rx - base_rx)
-                total_tx_str = format_bytes_total(tx - base_tx)
-
-                prev_net_counters[slot] = (rx, tx)
-                net_base_counters[slot] = (base_rx, base_tx)
-
-                net_ctx[slot] = {
-                    "name": iface,
-                    "speed": format_speed_mbps(metrics_windows.read_iface_speed_mbps(iface)),
-                    "rx": rx_str, "tx": tx_str,
-                    "total_rx": total_rx_str, "total_tx": total_tx_str,
-                    "rx_mbps": rx_mbps, "tx_mbps": tx_mbps,
-                }
-
-            # ---- диск I/O (суммарно по всем дискам) - скорость чтения/записи, МБ/с ----
-            read_bytes, write_bytes = metrics_windows.read_disk_io_counters()
-            if read_bytes is not None and prev_disk_io_counters[0] is not None and dt > 0:
-                disk_io_read_mbps = round((read_bytes - prev_disk_io_counters[0]) / (1024 ** 2) / dt, 1)
-                disk_io_write_mbps = round((write_bytes - prev_disk_io_counters[1]) / (1024 ** 2) / dt, 1)
-            else:
-                disk_io_read_mbps = 0.0
-                disk_io_write_mbps = 0.0
-            if read_bytes is not None:
-                prev_disk_io_counters = (read_bytes, write_bytes)
-
-            audio_state = audio_controller.read_state()
-            media_state = media_monitor.read()
-            # keyboard_layout - уже прочитан ВЫШЕ, КАЖДЫЙ тик (см. блок
-            # сразу после чтения serial в начале while) - тут повторно НЕ
-            # читается, просто используется в context ниже как есть.
-
-            # ---- watched-value diff: устройство вывода звука (см. osd.py) -
-            # без фильтра по окну (переключение устройства не связано с
-            # фокусом окна, в отличие от раскладки выше). "N/A" (pycaw
-            # недоступен/устройство временно не определилось) не триггерит -
-            # иначе временный сбой чтения устройства выглядел бы как "смена".
+            # ---- watched-value diff: раскладка клавиатуры (см. osd.py) -
+            # триггерим popup, только если раскладка ДЕЙСТВИТЕЛЬНО сменилась
+            # (не первый тик после старта - watched_layout is not None) И
+            # foreground_pid НЕ изменился одновременно с ней - иначе это не
+            # реальное переключение языка, а alt-tab между окнами с разной
+            # per-window раскладкой (см. подробное обоснование в докстринге
+            # metrics_windows.read_keyboard_state()).
             if (
-                watched_device_name is not None
-                and audio_state["audio_device_name"] not in (None, "N/A")
-                and audio_state["audio_device_name"] != watched_device_name
+                watched_layout is not None
+                and keyboard_layout is not None
+                and keyboard_layout != watched_layout
+                and foreground_pid == watched_layout_pid
             ):
-                osd_manager.push("device", {"device_name": audio_state["audio_device_name"]}, now, cfg)
-            watched_device_name = audio_state["audio_device_name"]
+                osd_manager.push("layout", {"layout": keyboard_layout}, now, cfg)
+            watched_layout = keyboard_layout
+            watched_layout_pid = foreground_pid
 
-            # ---- Tautulli (Plex) / qBittorrent / мониторинг ресурсов -
-            # ТОЛЬКО чтение уже готового результата фоновых потоков
-            # (integrations_loop/monitor_loop), никаких сетевых вызовов
-            # прямо тут - см. обоснование у INTEGRATIONS_POLL_INTERVAL/
-            # DEFAULT_PING_INTERVAL_SECONDS в шапке файла.
-            integrations = get_integrations_state()
-            monitor_state = get_monitor_state()
+            # ---- медленные метрики: раз в POLL_INTERVAL ----
+            if now - last_metrics_tick >= POLL_INTERVAL:
+                dt = now - last_metrics_tick if last_metrics_tick else POLL_INTERVAL
+                last_metrics_tick = now
 
-            # Захватываем последнее посчитанное VU-значение ДО того, как
-            # common_metrics будет переприсвоен целиком ниже - сам блок VU
-            # находится ПОСЛЕ медленных метрик по циклу (см. комментарий там
-            # же про "иначе vu-ключи терялись бы") и обновляет common_metrics
-            # каждый БЫСТРЫЙ тик, а не раз в POLL_INTERVAL - у истории графика
-            # (см. ниже) для минутного тренда более частая запись не нужна,
-            # хватает того же ритма, что и у cpu/ram/gpu. Лаг в один тик
-            # (~TICK_INTERVAL) для минутного графика незначим.
-            prev_vu_peak = common_metrics.get("vu_peak", 0.0)
+                cpu_pct, cpu_pct_core_max, cpu_freq_mhz = metrics_windows.read_cpu_stats()
+                ram_pct, ram_used_gb, ram_total_gb = metrics_windows.read_ram_stats()
+                gpu_stats = gpu_monitor.read()
 
-            common_metrics = {
-                "cpu": cpu_pct, "ram": ram_pct,
-                "gpu": gpu_stats["gpu_pct"], "gpu_vram": gpu_stats["gpu_vram_pct"],
-                "disk1": disk1["used_pct"] if disk1 else 0.0,
-                "disk2": disk2["used_pct"] if disk2 else 0.0,
-                "net": net_pct,
-            }
+                disk1 = metrics_windows.read_disk_usage(cfg["disk1_letter"])
+                disk2 = metrics_windows.read_disk_usage(cfg["disk2_letter"])
 
-            # История для мини-графиков (cpu_graph/ram_graph/... - см.
-            # history.py/variables._graph()) - раз в POLL_INTERVAL, тем же
-            # ритмом, что и сами common_metrics выше (а не каждый быстрый
-            # тик, как VU для ленты) - при том же размере буфера
-            # (history._BUFFER_MAXLEN) это даёт заметно больший реальный
-            # охват по времени, а минутному тренду секундная точность
-            # избыточна. Простой цикл по common_metrics.items() автоматически
-            # подхватит любую метрику, которую добавят сюда в будущем -
-            # отдельного списка ключей поддерживать не нужно.
-            for metric_key, metric_value in common_metrics.items():
-                metric_history.record(metric_key, metric_value, now=now)
-            metric_history.record("vu_peak", prev_vu_peak, now=now)
+                disks_ctx = {}
+                if cfg["disk1_letter"] and disk1:
+                    disks_ctx[cfg["disk1_letter"]] = disk1
+                if cfg["disk2_letter"] and disk2:
+                    disks_ctx[cfg["disk2_letter"]] = disk2
 
-            context = {
-                "cpu_pct": round(cpu_pct), "cpu_pct_core_max": round(cpu_pct_core_max),
-                "cpu_freq_mhz": cpu_freq_mhz,
-                "ram_pct": round(ram_pct), "ram_used_gb": ram_used_gb, "ram_total_gb": ram_total_gb,
-                "gpu_name": gpu_stats["gpu_name"], "gpu_pct": round(gpu_stats["gpu_pct"]),
-                "gpu_temp_c": gpu_stats["gpu_temp_c"],
-                "gpu_vram_used_gb": gpu_stats["gpu_vram_used_gb"], "gpu_vram_total_gb": gpu_stats["gpu_vram_total_gb"],
-                "gpu_vram_pct": round(gpu_stats["gpu_vram_pct"]), "gpu_power_w": gpu_stats["gpu_power_w"],
-                "disk_slots": {"disk1_letter": cfg["disk1_letter"], "disk2_letter": cfg["disk2_letter"]},
-                "disks": disks_ctx,
-                "disk_io_read_mbps": disk_io_read_mbps, "disk_io_write_mbps": disk_io_write_mbps,
-                "net": net_ctx,
-                "uptime": format_duration(time.time() - _boot_time()),
-                "container_uptime": format_duration(now - CONTAINER_START_TIME),
-                "time_now": time.strftime("%H:%M"),
-                "weekday_name": format_weekday_name(),
-                "date_now": time.strftime("%d.%m"),
-                "year_now": time.strftime("%Y"),
-                # top_process_name/top_process_cpu_pct/top_process_ram_pct -
-                # НЕ читаются тут напрямую (см. удалённый top_process_monitor.read()
-                # выше) - приходят через **integrations ниже, т.к. опрос
-                # переехал в integrations_loop (см. пояснение у
-                # _integrations_state/integrations_loop).
-                "volume_pct": audio_state["volume_pct"], "volume_muted": audio_state["volume_muted"],
-                "audio_device_name": audio_state["audio_device_name"],
-                # VU (реальный уровень звука) для OLED-шаблонов - берём уже
-                # посчитанное значение из common_metrics (обновляется каждый
-                # тик ниже по циклу, см. блок "VU" после медленных метрик) -
-                # отдельный COM-вызов тут не нужен, лаг не больше одного тика
-                # (~TICK_INTERVAL), для текстового экрана это незаметно.
-                "vu_peak_pct": round(common_metrics.get("vu_peak", 0.0)),
-                "vu_left_pct": round(common_metrics.get("vu_left", 0.0)),
-                "vu_right_pct": round(common_metrics.get("vu_right", 0.0)),
-                "keyboard_layout": keyboard_layout,
-                "media_title": media_state["media_title"],
-                "media_artist": media_state["media_artist"],
-                "media_playing": media_state["media_playing"],
-                # my_plex_user - НЕ переменная OLED-шаблонов (не зарегистрирована
-                # в variables.VARIABLES, не появится в легенде /screens) -
-                # используется ТОЛЬКО screens.build_active_screens() для
-                # point-override tier у отдельных копий repeating-группы
-                # "stream" (см. обсуждение в чате про "свой/чужой Plex-сеанс"
-                # и докстринг build_active_screens() в screens.py).
-                "my_plex_user": cfg.get("my_plex_user", ""),
-                # metric_history - тот же служебный, не-переменная-шаблона
-                # ключ context, что и my_plex_user выше - используется ТОЛЬКО
-                # резолверами *_graph (см. variables._graph()) для доступа к
-                # накопленной истории cpu/ram/gpu/... за последние секунды,
-                # сам по себе переменной шаблона не является и в легенде на
-                # /screens не появится (не зарегистрирован в variables.VARIABLES).
-                "metric_history": metric_history,
-                # Plex (через Tautulli) + qBittorrent - integrations уже
-                # содержит РОВНО те ключи, что ожидают резолверы variables.py
-                # (plex_*/streams/recent/qbt_*/torrents) - см.
-                # get_integrations_state()/integrations_loop() ниже.
-                **integrations,
-                # Мониторинг ресурсов (ping/TCP, см. metrics_ping.py) -
-                # monitor_state уже содержит РОВНО те ключи, что ожидают
-                # резолверы variables.py (mon/mon_down_count/mon_down_names) -
-                # см. get_monitor_state()/monitor_loop() ниже.
-                **monitor_state,
-            }
-            with _context_lock:
-                _last_context.clear()
-                _last_context.update(context)
+                # сеть по слотам net1/net2 (для OLED) + метрика "net" для ленты
+                # (использует net1 - отдельного LED-only интерфейса не заводим)
+                net_ctx = {"net1": None, "net2": None}
+                net_pct = 0.0
+                for slot in ("net1", "net2"):
+                    iface = cfg[f"{slot}_iface"]
+                    if iface != prev_net_iface[slot]:
+                        prev_net_counters[slot] = (None, None)
+                        net_base_counters[slot] = (None, None)
+                        prev_net_iface[slot] = iface
+                    if not iface:
+                        continue
+                    rx, tx = metrics_windows.read_iface_counters(iface)
+                    if rx is None:
+                        continue
+                    prev_rx, prev_tx = prev_net_counters[slot]
+                    rx_str = format_rate(rx - prev_rx, dt) if prev_rx is not None else "0Kbps"
+                    tx_str = format_rate(tx - prev_tx, dt) if prev_tx is not None else "0Kbps"
+                    rx_mbps = rate_mbps(rx - prev_rx, dt) if prev_rx is not None else 0.0
+                    tx_mbps = rate_mbps(tx - prev_tx, dt) if prev_tx is not None else 0.0
 
-            current_screens = screens_webui.get_screens()
-            # Гейт по OsdManager - если сейчас показывается ЛЮБОЙ OSD-попап
-            # (громкость/раскладка/устройство), rotation.current_lines() НЕ
-            # вызывается вовсе: её внутренние курсоры/таймеры/started_at не
-            # двигаются, ротация реально "стоит на паузе" (а не просто её
-            # результат визуально перезаписывается, как было раньше только
-            # для громкости) - продолжится с того же места сама, как только
-            # OSD-очередь опустеет. osd_manager.tick(now, cfg) тут ничего не
-            # меняет состояние очереди даже при повторном вызове с тем же
-            # now (см. осд.py) - тот же теккущий/следующий popup будет ещё
-            # раз прочитан ниже, в блоке расчёта ленты, идемпотентно.
-            if osd_manager.tick(now, cfg) is None:
-                lines = rotation.current_lines(
-                    current_screens, context, now=now,
-                    boost_priority=cfg.get("boost_priority", DEFAULT_BOOST_PRIORITY),
-                    boost_ambient=cfg.get("boost_ambient", DEFAULT_BOOST_AMBIENT),
-                )
-        #    with state_lock:
-        #        state["oled_lines"] = lines
+                    if prev_rx is not None and dt > 0 and slot == "net1":
+                        mbps = (rx - prev_rx) * 8 / 1_000_000 / dt
+                        net_pct = max(0.0, min(100.0, mbps / NET_MAX_MBPS * 100.0))
 
-        # ---- VU (реальный уровень звука): каждый тик, НЕ раз в POLL_INTERVAL -
-        # иначе индикатор ощутимо дёргается/лагает при интервале в секунду.
-        # dt считаем по факту прошедшего времени между итерациями (а не
-        # "теоретический" TICK_INTERVAL) - на случай, если предыдущая
-        # итерация подвисла на serial write/read. Пишем в common_metrics
-        # ПОСЛЕ блока медленных метрик выше - там common_metrics иногда
-        # переприсваивается целиком, и vu-ключи иначе терялись бы до
-        # следующего POLL_INTERVAL.
-        vu_dt = now - last_vu_time
-        last_vu_time = now
-        try:
-            vu_state = audio_controller.read_vu(dt=vu_dt if vu_dt > 0 else cfg.get("tick_interval", TICK_INTERVAL))
-        except Exception as e:
-            # Страховка: на реальном запуске необработанное исключение
-            # именно отсюда (AttributeError из-за неполного объявления
-            # IAudioMeterInformation в pycaw - см. metrics_windows.py) убило
-            # ВЕСЬ поток metrics_main_loop целиком, а не только VU - экран
-            # переставал обновляться вообще (CPU/RAM/лента/OLED - всё
-            # замирало). read_vu() теперь сама не должна бросать исключения,
-            # но эта обвязка - защита именно от того, чтобы ЛЮБАЯ будущая
-            # ошибка в чтении звука не могла повторить тот же сценарий.
-            print(f"[audio] read_vu() unexpected error, VU отключён на этот тик: {e}", flush=True)
-            vu_state = {"vu_peak_pct": 0.0, "vu_left_pct": 0.0, "vu_right_pct": 0.0}
-        common_metrics["vu_peak"] = vu_state["vu_peak_pct"]
-        common_metrics["vu_left"] = vu_state["vu_left_pct"]
-        common_metrics["vu_right"] = vu_state["vu_right_pct"]
+                    base_rx, base_tx = net_base_counters[slot]
+                    if base_rx is None:
+                        base_rx, base_tx = rx, tx
+                    total_rx_str = format_bytes_total(rx - base_rx)
+                    total_tx_str = format_bytes_total(tx - base_tx)
 
-        # ---- лента: OSD popup (громкость/раскладка/устройство) ИЛИ обычная
-        # метрика (каждый тик) - см. osd.py за унификацией трёх типов ----
-        leds_count = cfg["leds_count"]
-        osd_result = osd_manager.tick(now, cfg)
+                    prev_net_counters[slot] = (rx, tx)
+                    net_base_counters[slot] = (base_rx, base_tx)
 
-        if osd_result is not None:
-            # ЛЮБОЙ активный OSD-тип - OLED полностью заменяется попапом.
-            # Лента подменяется, ТОЛЬКО если рендерер это предусмотрел (см.
-            # osd.OSD_TYPES - у "device" render возвращает pixels=None,
-            # означающее "не трогай ленту"). В этом случае pixels/bar_state
-            # НЕ переприсваиваются вовсе и остаются такими, какими их
-            # оставила ПРЕДЫДУЩАЯ итерация (см. их объявление до while) -
-            # "не подменять" реализовано буквально, без отдельного кэша.
-            #
-            # peak_trackers/обычная метрика бара (см. else-ветку ниже) НЕ
-            # пересчитываются, пока показывается любой OSD - та же пауза,
-            # что раньше была только у громкости (после окончания OSD
-            # peak hold продолжит отсчёт от значения ДО паузы, не от
-            # накопленного "в фоне" - это осознанное поведение, тот же
-            # компромисс, что был и в прежнем коде).
-            osd_lines, osd_pixels = osd_manager.render(osd_result["type"], osd_result["payload"], cfg, leds_count)
-            lines = osd_lines
-            if osd_pixels is not None:
-                pixels = osd_pixels
-                # pct_bottom - для превью на / (см. SENSORS_PAGE_HTML ниже) -
-                # volume_pct для типа "volume", иначе просто "полная шкала"
-                # (100) ради вменяемого числа в UI, содержательного смысла
-                # как у обычных метрик тут нет (см. osd._render_layout).
-                pct_display = osd_result["payload"].get("volume_pct", 100)
-                bar_state = {
-                    "mode": f"{osd_result['type']}_osd", "pixels": pixels,
-                    "pct_bottom": pct_display, "pct_top": None,
-                    "osd_active": True, "osd_type": osd_result["type"],
+                    net_ctx[slot] = {
+                        "name": iface,
+                        "speed": format_speed_mbps(metrics_windows.read_iface_speed_mbps(iface)),
+                        "rx": rx_str, "tx": tx_str,
+                        "total_rx": total_rx_str, "total_tx": total_tx_str,
+                        "rx_mbps": rx_mbps, "tx_mbps": tx_mbps,
+                    }
+
+                # ---- диск I/O (суммарно по всем дискам) - скорость чтения/записи, МБ/с ----
+                read_bytes, write_bytes = metrics_windows.read_disk_io_counters()
+                if read_bytes is not None and prev_disk_io_counters[0] is not None and dt > 0:
+                    disk_io_read_mbps = round((read_bytes - prev_disk_io_counters[0]) / (1024 ** 2) / dt, 1)
+                    disk_io_write_mbps = round((write_bytes - prev_disk_io_counters[1]) / (1024 ** 2) / dt, 1)
+                else:
+                    disk_io_read_mbps = 0.0
+                    disk_io_write_mbps = 0.0
+                if read_bytes is not None:
+                    prev_disk_io_counters = (read_bytes, write_bytes)
+
+                audio_state = audio_controller.read_state()
+                media_state = media_monitor.read()
+                # keyboard_layout - уже прочитан ВЫШЕ, КАЖДЫЙ тик (см. блок
+                # сразу после чтения serial в начале while) - тут повторно НЕ
+                # читается, просто используется в context ниже как есть.
+
+                # ---- watched-value diff: устройство вывода звука (см. osd.py) -
+                # без фильтра по окну (переключение устройства не связано с
+                # фокусом окна, в отличие от раскладки выше). "N/A" (pycaw
+                # недоступен/устройство временно не определилось) не триггерит -
+                # иначе временный сбой чтения устройства выглядел бы как "смена".
+                if (
+                    watched_device_name is not None
+                    and audio_state["audio_device_name"] not in (None, "N/A")
+                    and audio_state["audio_device_name"] != watched_device_name
+                ):
+                    osd_manager.push("device", {"device_name": audio_state["audio_device_name"]}, now, cfg)
+                watched_device_name = audio_state["audio_device_name"]
+
+                # ---- Tautulli (Plex) / qBittorrent / мониторинг ресурсов -
+                # ТОЛЬКО чтение уже готового результата фоновых потоков
+                # (integrations_loop/monitor_loop), никаких сетевых вызовов
+                # прямо тут - см. обоснование у INTEGRATIONS_POLL_INTERVAL/
+                # DEFAULT_PING_INTERVAL_SECONDS в шапке файла.
+                integrations = get_integrations_state()
+                monitor_state = get_monitor_state()
+
+                # Захватываем последнее посчитанное VU-значение ДО того, как
+                # common_metrics будет переприсвоен целиком ниже - сам блок VU
+                # находится ПОСЛЕ медленных метрик по циклу (см. комментарий там
+                # же про "иначе vu-ключи терялись бы") и обновляет common_metrics
+                # каждый БЫСТРЫЙ тик, а не раз в POLL_INTERVAL - у истории графика
+                # (см. ниже) для минутного тренда более частая запись не нужна,
+                # хватает того же ритма, что и у cpu/ram/gpu. Лаг в один тик
+                # (~TICK_INTERVAL) для минутного графика незначим.
+                prev_vu_peak = common_metrics.get("vu_peak", 0.0)
+
+                common_metrics = {
+                    "cpu": cpu_pct, "ram": ram_pct,
+                    "gpu": gpu_stats["gpu_pct"], "gpu_vram": gpu_stats["gpu_vram_pct"],
+                    "disk1": disk1["used_pct"] if disk1 else 0.0,
+                    "disk2": disk2["used_pct"] if disk2 else 0.0,
+                    "net": net_pct,
                 }
-            else:
-                bar_state = dict(bar_state)
-                bar_state["osd_active"] = True
-                bar_state["osd_type"] = osd_result["type"]
-        else:
-            bar_mode = cfg["mode"]["bar0"]
-            peak_info = cfg["peak"]["bar0"]
-            peak_enabled = peak_info["enabled"]
 
-            peak_trackers["bottom"].set_style(peak_info["style"])
-            peak_trackers["bottom"].set_timings(cfg["peak_hold_seconds"], cfg["peak_fade_seconds"])
+                # История для мини-графиков (cpu_graph/ram_graph/... - см.
+                # history.py/variables._graph()) - раз в POLL_INTERVAL, тем же
+                # ритмом, что и сами common_metrics выше (а не каждый быстрый
+                # тик, как VU для ленты) - при том же размере буфера
+                # (history._BUFFER_MAXLEN) это даёт заметно больший реальный
+                # охват по времени, а минутному тренду секундная точность
+                # избыточна. Простой цикл по common_metrics.items() автоматически
+                # подхватит любую метрику, которую добавят сюда в будущем -
+                # отдельного списка ключей поддерживать не нужно.
+                for metric_key, metric_value in common_metrics.items():
+                    metric_history.record(metric_key, metric_value, now=now)
+                metric_history.record("vu_peak", prev_vu_peak, now=now)
 
-            pct_bottom = round(common_metrics.get(cfg["assignment"]["bar0"], 0))
-            bottom_peak = peak_trackers["bottom"].update(pct_bottom, now)
+                context = {
+                    "cpu_pct": round(cpu_pct), "cpu_pct_core_max": round(cpu_pct_core_max),
+                    "cpu_freq_mhz": cpu_freq_mhz,
+                    "ram_pct": round(ram_pct), "ram_used_gb": ram_used_gb, "ram_total_gb": ram_total_gb,
+                    "gpu_name": gpu_stats["gpu_name"], "gpu_pct": round(gpu_stats["gpu_pct"]),
+                    "gpu_temp_c": gpu_stats["gpu_temp_c"],
+                    "gpu_vram_used_gb": gpu_stats["gpu_vram_used_gb"], "gpu_vram_total_gb": gpu_stats["gpu_vram_total_gb"],
+                    "gpu_vram_pct": round(gpu_stats["gpu_vram_pct"]), "gpu_power_w": gpu_stats["gpu_power_w"],
+                    "disk_slots": {"disk1_letter": cfg["disk1_letter"], "disk2_letter": cfg["disk2_letter"]},
+                    "disks": disks_ctx,
+                    "disk_io_read_mbps": disk_io_read_mbps, "disk_io_write_mbps": disk_io_write_mbps,
+                    "net": net_ctx,
+                    "uptime": format_duration(time.time() - _boot_time()),
+                    "container_uptime": format_duration(now - CONTAINER_START_TIME),
+                    "time_now": time.strftime("%H:%M"),
+                    "weekday_name": format_weekday_name(),
+                    "date_now": time.strftime("%d.%m"),
+                    "year_now": time.strftime("%Y"),
+                    # top_process_name/top_process_cpu_pct/top_process_ram_pct -
+                    # НЕ читаются тут напрямую (см. удалённый top_process_monitor.read()
+                    # выше) - приходят через **integrations ниже, т.к. опрос
+                    # переехал в integrations_loop (см. пояснение у
+                    # _integrations_state/integrations_loop).
+                    "volume_pct": audio_state["volume_pct"], "volume_muted": audio_state["volume_muted"],
+                    "audio_device_name": audio_state["audio_device_name"],
+                    # VU (реальный уровень звука) для OLED-шаблонов - берём уже
+                    # посчитанное значение из common_metrics (обновляется каждый
+                    # тик ниже по циклу, см. блок "VU" после медленных метрик) -
+                    # отдельный COM-вызов тут не нужен, лаг не больше одного тика
+                    # (~TICK_INTERVAL), для текстового экрана это незаметно.
+                    "vu_peak_pct": round(common_metrics.get("vu_peak", 0.0)),
+                    "vu_left_pct": round(common_metrics.get("vu_left", 0.0)),
+                    "vu_right_pct": round(common_metrics.get("vu_right", 0.0)),
+                    "keyboard_layout": keyboard_layout,
+                    "media_title": media_state["media_title"],
+                    "media_artist": media_state["media_artist"],
+                    "media_playing": media_state["media_playing"],
+                    # my_plex_user - НЕ переменная OLED-шаблонов (не зарегистрирована
+                    # в variables.VARIABLES, не появится в легенде /screens) -
+                    # используется ТОЛЬКО screens.build_active_screens() для
+                    # point-override tier у отдельных копий repeating-группы
+                    # "stream" (см. обсуждение в чате про "свой/чужой Plex-сеанс"
+                    # и докстринг build_active_screens() в screens.py).
+                    "my_plex_user": cfg.get("my_plex_user", ""),
+                    # metric_history - тот же служебный, не-переменная-шаблона
+                    # ключ context, что и my_plex_user выше - используется ТОЛЬКО
+                    # резолверами *_graph (см. variables._graph()) для доступа к
+                    # накопленной истории cpu/ram/gpu/... за последние секунды,
+                    # сам по себе переменной шаблона не является и в легенде на
+                    # /screens не появится (не зарегистрирован в variables.VARIABLES).
+                    "metric_history": metric_history,
+                    # Plex (через Tautulli) + qBittorrent - integrations уже
+                    # содержит РОВНО те ключи, что ожидают резолверы variables.py
+                    # (plex_*/streams/recent/qbt_*/torrents) - см.
+                    # get_integrations_state()/integrations_loop() ниже.
+                    **integrations,
+                    # Мониторинг ресурсов (ping/TCP, см. metrics_ping.py) -
+                    # monitor_state уже содержит РОВНО те ключи, что ожидают
+                    # резолверы variables.py (mon/mon_down_count/mon_down_names) -
+                    # см. get_monitor_state()/monitor_loop() ниже.
+                    **monitor_state,
+                }
+                with _context_lock:
+                    _last_context.clear()
+                    _last_context.update(context)
 
-            if bar_mode in ("center", "edges"):
-                # center и edges - геометрически одна и та же пара половин
-                # (те же assignment_top/colors_top/solid_top, тот же
-                # top-трекер peak hold) - отличается только сама функция
-                # расчёта пикселей в ledbar.py (направление роста внутри
-                # половины). См. докстринг ledbar.compute_bar_pixels_edges().
-                peak_trackers["top"].set_style(peak_info["style"])
-                peak_trackers["top"].set_timings(cfg["peak_hold_seconds"], cfg["peak_fade_seconds"])
+                current_screens = screens_webui.get_screens()
+                # Гейт по OsdManager - если сейчас показывается ЛЮБОЙ OSD-попап
+                # (громкость/раскладка/устройство), rotation.current_lines() НЕ
+                # вызывается вовсе: её внутренние курсоры/таймеры/started_at не
+                # двигаются, ротация реально "стоит на паузе" (а не просто её
+                # результат визуально перезаписывается, как было раньше только
+                # для громкости) - продолжится с того же места сама, как только
+                # OSD-очередь опустеет. osd_manager.tick(now, cfg) тут ничего не
+                # меняет состояние очереди даже при повторном вызове с тем же
+                # now (см. осд.py) - тот же теккущий/следующий popup будет ещё
+                # раз прочитан ниже, в блоке расчёта ленты, идемпотентно.
+                if osd_manager.tick(now, cfg) is None:
+                    lines = rotation.current_lines(
+                        current_screens, context, now=now,
+                        boost_priority=cfg.get("boost_priority", DEFAULT_BOOST_PRIORITY),
+                        boost_ambient=cfg.get("boost_ambient", DEFAULT_BOOST_AMBIENT),
+                    )
+            #    with state_lock:
+            #        state["oled_lines"] = lines
 
-                pct_top = round(common_metrics.get(cfg["assignment_top"]["bar0"], 0))
-                top_peak = peak_trackers["top"].update(pct_top, now)
-
-                compute_fn = ledbar.compute_bar_pixels_center if bar_mode == "center" else ledbar.compute_bar_pixels_edges
-                pixels = compute_fn(
-                    pct_bottom, pct_top,
-                    cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"], cfg["solid"]["bar0"],
-                    cfg["colors_top"]["bar0"]["c1"], cfg["colors_top"]["bar0"]["c2"], cfg["colors_top"]["bar0"]["c3"], cfg["solid_top"]["bar0"],
-                    leds_per_bar=leds_count,
-                    peak_pct_bottom=bottom_peak if peak_enabled else None,
-                    peak_pct_top=top_peak if peak_enabled else None,
-                )
-                bar_state = {"mode": bar_mode, "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": pct_top,
-                             "osd_active": False, "osd_type": None}
-            elif bar_mode == "flat":
-                # flat - однометричный режим (как classic - только нижняя/
-                # единственная метрика assignment, без top-половины), но без
-                # peak hold: у "заливки всей ленты одним цветом" нет позиции,
-                # куда ставить точку недавнего максимума (см. докстринг
-                # ledbar.compute_bar_pixels_flat()) - top-трекер и
-                # peak_enabled тут осознанно не используются.
-                pixels = ledbar.compute_bar_pixels_flat(
-                    pct_bottom,
-                    cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"],
-                    leds_per_bar=leds_count,
-                )
-                bar_state = {"mode": "flat", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None,
-                             "osd_active": False, "osd_type": None}
-            else:
-                pixels = ledbar.compute_bar_pixels(
-                    pct_bottom, cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"], cfg["solid"]["bar0"],
-                    leds_per_bar=leds_count,
-                    peak_pct=bottom_peak if peak_enabled else None,
-                )
-                bar_state = {"mode": "classic", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None,
-                             "osd_active": False, "osd_type": None}
-
-        if cfg.get("leds_reverse"):
-            # Физический реверс - см. докстринг leds_reverse в
-            # DEFAULT_SETTINGS выше. Разворачиваем УЖЕ ГОТОВЫЙ список
-            # пикселей здесь, ОДИН РАЗ, для результата ЛЮБОЙ ветки выше
-            # (OSD громкости и все режимы classic/center/edges/flat) -
-            # переприсваиваем и pixels (используется ниже при упаковке в
-            # BAR: для платы), и bar_state["pixels"] (уходит в state["bar"]
-            # для превью на /), чтобы превью на сайте всегда совпадало с
-            # тем, что реально отправляется на плату.
-            pixels = list(reversed(pixels))
-            bar_state["pixels"] = pixels
-
-        with state_lock:
-            state["bar"] = bar_state
-            state["oled_lines"] = lines
-
-        # ---- собрать и отправить serial-строку ----
-        proto_values = {
-            "BAR": protocol.pack_bar_pixels(pixels),
-            "BRI": str(cfg["brightness"]),
-            "CON": str(cfg["contrast"]),
-            "L1": lines[0], "L2": lines[1], "L3": lines[2],
-        }
-        line_to_send = proto.build(proto_values, now=now)
-
-        if ser is not None and not flashing_event.is_set() and line_to_send is not None:
+            # ---- VU (реальный уровень звука): каждый тик, НЕ раз в POLL_INTERVAL -
+            # иначе индикатор ощутимо дёргается/лагает при интервале в секунду.
+            # dt считаем по факту прошедшего времени между итерациями (а не
+            # "теоретический" TICK_INTERVAL) - на случай, если предыдущая
+            # итерация подвисла на serial write/read. Пишем в common_metrics
+            # ПОСЛЕ блока медленных метрик выше - там common_metrics иногда
+            # переприсваивается целиком, и vu-ключи иначе терялись бы до
+            # следующего POLL_INTERVAL.
+            vu_dt = now - last_vu_time
+            last_vu_time = now
             try:
-                ser.write((line_to_send + "\n").encode("utf-8"))
-                _log_serial("tx", line_to_send)
-            except (serial.SerialException, OSError) as e:
-                print(f"[serial] write failed, will reconnect: {e}", flush=True)
+                vu_state = audio_controller.read_vu(dt=vu_dt if vu_dt > 0 else cfg.get("tick_interval", TICK_INTERVAL))
+            except Exception as e:
+                # Страховка: на реальном запуске необработанное исключение
+                # именно отсюда (AttributeError из-за неполного объявления
+                # IAudioMeterInformation в pycaw - см. metrics_windows.py) убило
+                # ВЕСЬ поток metrics_main_loop целиком, а не только VU - экран
+                # переставал обновляться вообще (CPU/RAM/лента/OLED - всё
+                # замирало). read_vu() теперь сама не должна бросать исключения,
+                # но эта обвязка - защита именно от того, чтобы ЛЮБАЯ будущая
+                # ошибка в чтении звука не могла повторить тот же сценарий.
+                print(f"[audio] read_vu() unexpected error, VU отключён на этот тик: {e}", flush=True)
+                vu_state = {"vu_peak_pct": 0.0, "vu_left_pct": 0.0, "vu_right_pct": 0.0}
+            common_metrics["vu_peak"] = vu_state["vu_peak_pct"]
+            common_metrics["vu_left"] = vu_state["vu_left_pct"]
+            common_metrics["vu_right"] = vu_state["vu_right_pct"]
+
+            # ---- лента: OSD popup (громкость/раскладка/устройство) ИЛИ обычная
+            # метрика (каждый тик) - см. osd.py за унификацией трёх типов ----
+            leds_count = cfg["leds_count"]
+            osd_result = osd_manager.tick(now, cfg)
+
+            if osd_result is not None:
+                # ЛЮБОЙ активный OSD-тип - OLED полностью заменяется попапом.
+                # Лента подменяется, ТОЛЬКО если рендерер это предусмотрел (см.
+                # osd.OSD_TYPES - у "device" render возвращает pixels=None,
+                # означающее "не трогай ленту"). В этом случае pixels/bar_state
+                # НЕ переприсваиваются вовсе и остаются такими, какими их
+                # оставила ПРЕДЫДУЩАЯ итерация (см. их объявление до while) -
+                # "не подменять" реализовано буквально, без отдельного кэша.
+                #
+                # peak_trackers/обычная метрика бара (см. else-ветку ниже) НЕ
+                # пересчитываются, пока показывается любой OSD - та же пауза,
+                # что раньше была только у громкости (после окончания OSD
+                # peak hold продолжит отсчёт от значения ДО паузы, не от
+                # накопленного "в фоне" - это осознанное поведение, тот же
+                # компромисс, что был и в прежнем коде).
+                osd_lines, osd_pixels = osd_manager.render(osd_result["type"], osd_result["payload"], cfg, leds_count)
+                lines = osd_lines
+                if osd_pixels is not None:
+                    pixels = osd_pixels
+                    # pct_bottom - для превью на / (см. SENSORS_PAGE_HTML ниже) -
+                    # volume_pct для типа "volume", иначе просто "полная шкала"
+                    # (100) ради вменяемого числа в UI, содержательного смысла
+                    # как у обычных метрик тут нет (см. osd._render_layout).
+                    pct_display = osd_result["payload"].get("volume_pct", 100)
+                    bar_state = {
+                        "mode": f"{osd_result['type']}_osd", "pixels": pixels,
+                        "pct_bottom": pct_display, "pct_top": None,
+                        "osd_active": True, "osd_type": osd_result["type"],
+                    }
+                else:
+                    bar_state = dict(bar_state)
+                    bar_state["osd_active"] = True
+                    bar_state["osd_type"] = osd_result["type"]
+            else:
+                bar_mode = cfg["mode"]["bar0"]
+                peak_info = cfg["peak"]["bar0"]
+                peak_enabled = peak_info["enabled"]
+
+                peak_trackers["bottom"].set_style(peak_info["style"])
+                peak_trackers["bottom"].set_timings(cfg["peak_hold_seconds"], cfg["peak_fade_seconds"])
+
+                pct_bottom = round(common_metrics.get(cfg["assignment"]["bar0"], 0))
+                bottom_peak = peak_trackers["bottom"].update(pct_bottom, now)
+
+                if bar_mode in ("center", "edges"):
+                    # center и edges - геометрически одна и та же пара половин
+                    # (те же assignment_top/colors_top/solid_top, тот же
+                    # top-трекер peak hold) - отличается только сама функция
+                    # расчёта пикселей в ledbar.py (направление роста внутри
+                    # половины). См. докстринг ledbar.compute_bar_pixels_edges().
+                    peak_trackers["top"].set_style(peak_info["style"])
+                    peak_trackers["top"].set_timings(cfg["peak_hold_seconds"], cfg["peak_fade_seconds"])
+
+                    pct_top = round(common_metrics.get(cfg["assignment_top"]["bar0"], 0))
+                    top_peak = peak_trackers["top"].update(pct_top, now)
+
+                    compute_fn = ledbar.compute_bar_pixels_center if bar_mode == "center" else ledbar.compute_bar_pixels_edges
+                    pixels = compute_fn(
+                        pct_bottom, pct_top,
+                        cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"], cfg["solid"]["bar0"],
+                        cfg["colors_top"]["bar0"]["c1"], cfg["colors_top"]["bar0"]["c2"], cfg["colors_top"]["bar0"]["c3"], cfg["solid_top"]["bar0"],
+                        leds_per_bar=leds_count,
+                        peak_pct_bottom=bottom_peak if peak_enabled else None,
+                        peak_pct_top=top_peak if peak_enabled else None,
+                    )
+                    bar_state = {"mode": bar_mode, "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": pct_top,
+                                 "osd_active": False, "osd_type": None}
+                elif bar_mode == "flat":
+                    # flat - однометричный режим (как classic - только нижняя/
+                    # единственная метрика assignment, без top-половины), но без
+                    # peak hold: у "заливки всей ленты одним цветом" нет позиции,
+                    # куда ставить точку недавнего максимума (см. докстринг
+                    # ledbar.compute_bar_pixels_flat()) - top-трекер и
+                    # peak_enabled тут осознанно не используются.
+                    pixels = ledbar.compute_bar_pixels_flat(
+                        pct_bottom,
+                        cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"],
+                        leds_per_bar=leds_count,
+                    )
+                    bar_state = {"mode": "flat", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None,
+                                 "osd_active": False, "osd_type": None}
+                else:
+                    pixels = ledbar.compute_bar_pixels(
+                        pct_bottom, cfg["colors"]["bar0"]["c1"], cfg["colors"]["bar0"]["c2"], cfg["colors"]["bar0"]["c3"], cfg["solid"]["bar0"],
+                        leds_per_bar=leds_count,
+                        peak_pct=bottom_peak if peak_enabled else None,
+                    )
+                    bar_state = {"mode": "classic", "pixels": pixels, "pct_bottom": pct_bottom, "pct_top": None,
+                                 "osd_active": False, "osd_type": None}
+
+            if cfg.get("leds_reverse"):
+                # Физический реверс - см. докстринг leds_reverse в
+                # DEFAULT_SETTINGS выше. Разворачиваем УЖЕ ГОТОВЫЙ список
+                # пикселей здесь, ОДИН РАЗ, для результата ЛЮБОЙ ветки выше
+                # (OSD громкости и все режимы classic/center/edges/flat) -
+                # переприсваиваем и pixels (используется ниже при упаковке в
+                # BAR: для платы), и bar_state["pixels"] (уходит в state["bar"]
+                # для превью на /), чтобы превью на сайте всегда совпадало с
+                # тем, что реально отправляется на плату.
+                pixels = list(reversed(pixels))
+                bar_state["pixels"] = pixels
+
+            with state_lock:
+                state["bar"] = bar_state
+                state["oled_lines"] = lines
+
+            # ---- собрать и отправить serial-строку ----
+            proto_values = {
+                "BAR": protocol.pack_bar_pixels(pixels),
+                "BRI": str(cfg["brightness"]),
+                "CON": str(cfg["contrast"]),
+                "L1": lines[0], "L2": lines[1], "L3": lines[2],
+            }
+            line_to_send = proto.build(proto_values, now=now)
+
+            if ser is not None and not flashing_event.is_set() and line_to_send is not None:
                 try:
-                    ser.close()
-                except Exception:
+                    ser.write((line_to_send + "\n").encode("utf-8"))
+                    _log_serial("tx", line_to_send)
+                except (serial.SerialException, OSError) as e:
+                    print(f"[serial] write failed, will reconnect: {e}", flush=True)
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    ser = None
+                    with state_lock:
+                        state["serial_connected"] = False
+                    last_reconnect_attempt = now
+
+            # ---- offline-режим: конфиг платы (OFFCFG:/OFFL1-3:), diff-протокол ----
+            # cfg["offline_*"] - живая настройка (/offline в вебе), см.
+            # DEFAULT_OFFLINE_*/api_offline() выше - offline_proto.build() сам
+            # решает, изменилось ли что-то с прошлого тика (либо настал
+            # FULL_RESYNC_SECONDS - та же страховка на случай перезагрузки платы,
+            # что и у обычного proto). '|' и переносы строк из шаблонов уже
+            # вычищены в _sanitize_offline_template() при сохранении в /settings,
+            # тут это просто готовые строки.
+            # Ночник - led_color хранится в settings.json как hex-строка "RRGGBB"
+            # (тот же формат, что и остальные цвета проекта, см. DEFAULT_COLORS) -
+            # тут раскладывается на три десятичных байта 0-255, т.к. прошивке
+            # дешевле разобрать три strtoul() через запятую, чем ещё один hex-парсер
+            # (hexByte() в .ino уже есть для BAR:, но там фиксированная раскладка
+            # по NUM_LEDS*6 символам, а тут всего один цвет - плодить это ради
+            # трёх байт не стоит).
+            led_color_hex = (cfg.get("offline_led_color") or DEFAULT_OFFLINE_LED_COLOR).strip().lstrip("#")
+            if len(led_color_hex) != 6:
+                led_color_hex = DEFAULT_OFFLINE_LED_COLOR
+            try:
+                led_r = int(led_color_hex[0:2], 16)
+                led_g = int(led_color_hex[2:4], 16)
+                led_b = int(led_color_hex[4:6], 16)
+            except ValueError:
+                led_r = led_g = led_b = 0
+
+            offline_values = {
+                "OFFCFG": "{},{},{},{},{},{},{},{},{}".format(
+                    1 if cfg.get("offline_enabled") else 0,
+                    int(round(max(0.5, cfg.get("offline_timeout_minutes", DEFAULT_OFFLINE_TIMEOUT_MINUTES)) * 60)),
+                    _parse_hhmm_to_minutes(cfg.get("offline_window_start", DEFAULT_OFFLINE_WINDOW_START), 0),
+                    _parse_hhmm_to_minutes(cfg.get("offline_window_end", DEFAULT_OFFLINE_WINDOW_END), 1439),
+                    max(5, min(300, int(cfg.get("offline_button_clock_seconds", DEFAULT_OFFLINE_BUTTON_CLOCK_SECONDS)))),
+                    1 if cfg.get("offline_led_enabled") else 0,
+                    led_r, led_g, led_b,
+                ),
+                "OFFL1": cfg.get("offline_l1", DEFAULT_OFFLINE_L1),
+                "OFFL2": cfg.get("offline_l2", DEFAULT_OFFLINE_L2),
+                "OFFL3": cfg.get("offline_l3", DEFAULT_OFFLINE_L3),
+            }
+            offline_line_to_send = offline_proto.build(offline_values, now=now)
+            if ser is not None and not flashing_event.is_set() and offline_line_to_send is not None:
+                try:
+                    ser.write((offline_line_to_send + "\n").encode("utf-8"))
+                    _log_serial("tx", offline_line_to_send)
+                except (serial.SerialException, OSError):
+                    pass  # основной write-путь выше уже обработает переподключение на своей проверке
+
+            # ---- offline-режим: периодическая синхронизация часов платы ----
+            # TSYNC:/UPT: - см. докстринг protocol.py и win_hud_arduino_firmware.ino
+            # ("Offline-режим"). НЕ через diff-протокол (см. обоснование у
+            # last_time_sync выше) - обычная raw-строка раз в
+            # TIME_SYNC_INTERVAL_SECONDS. uptime_text форматируется тем же
+            # format_duration(), что и context["uptime"] в медленном блоке метрик
+            # выше - тут считается заново, а не берётся из context, чтобы не
+            # зависеть от того, успел ли уже отработать POLL_INTERVAL-блок на
+            # этом конкретном тике.
+            if ser is not None and not flashing_event.is_set() and now - last_time_sync >= TIME_SYNC_INTERVAL_SECONDS:
+                last_time_sync = now
+                uptime_text = format_duration(time.time() - _boot_time())
+                # У платы нет ни RTC, ни tzdata - computeLocalTime() в .ino просто
+                # считает epochAtSync + millis() и раскладывает в год/месяц/день/
+                # час/минуту, ничего не зная о часовом поясе (см. TSYNC: в
+                # protocol.py/win_hud_arduino_firmware.ino). Если слать сюда
+                # честный int(time.time()) (UTC) - офлайн-часы платы показывают
+                # время по Гринвичу, а не по локальному поясу хоста (на GMT+3
+                # расхождение ровно 3 часа - баг-репорт Konstantin). Вместо того
+                # чтобы учить плату часовым поясам (новое поле в протоколе +
+                # правки прошивки), проще и надёжнее компенсировать смещение
+                # здесь: считаем ТЕКУЩИЙ локальный офсет хоста (учитывает и DST,
+                # если он есть) и шлём плате epoch, СДВИНУТЫЙ на этот офсет -
+                # плата складывает его с millis() и получает уже ПРАВИЛЬНОЕ
+                # локальное время, хотя сама по-прежнему думает, что просто
+                # считает секунды с 1970 года без какой-либо зоны.
+                tz_offset_seconds = round((datetime.datetime.now() - datetime.datetime.utcnow()).total_seconds())
+                local_epoch = int(time.time()) + tz_offset_seconds
+                tsync_line = f"TSYNC:{local_epoch}|UPT:{uptime_text}"
+                try:
+                    ser.write((tsync_line + "\n").encode("utf-8"))
+                    _log_serial("tx", tsync_line)
+                except (serial.SerialException, OSError):
                     pass
-                ser = None
-                with state_lock:
-                    state["serial_connected"] = False
-                last_reconnect_attempt = now
 
-        # ---- offline-режим: конфиг платы (OFFCFG:/OFFL1-3:), diff-протокол ----
-        # cfg["offline_*"] - живая настройка (/offline в вебе), см.
-        # DEFAULT_OFFLINE_*/api_offline() выше - offline_proto.build() сам
-        # решает, изменилось ли что-то с прошлого тика (либо настал
-        # FULL_RESYNC_SECONDS - та же страховка на случай перезагрузки платы,
-        # что и у обычного proto). '|' и переносы строк из шаблонов уже
-        # вычищены в _sanitize_offline_template() при сохранении в /settings,
-        # тут это просто готовые строки.
-        # Ночник - led_color хранится в settings.json как hex-строка "RRGGBB"
-        # (тот же формат, что и остальные цвета проекта, см. DEFAULT_COLORS) -
-        # тут раскладывается на три десятичных байта 0-255, т.к. прошивке
-        # дешевле разобрать три strtoul() через запятую, чем ещё один hex-парсер
-        # (hexByte() в .ino уже есть для BAR:, но там фиксированная раскладка
-        # по NUM_LEDS*6 символам, а тут всего один цвет - плодить это ради
-        # трёх байт не стоит).
-        led_color_hex = (cfg.get("offline_led_color") or DEFAULT_OFFLINE_LED_COLOR).strip().lstrip("#")
-        if len(led_color_hex) != 6:
-            led_color_hex = DEFAULT_OFFLINE_LED_COLOR
-        try:
-            led_r = int(led_color_hex[0:2], 16)
-            led_g = int(led_color_hex[2:4], 16)
-            led_b = int(led_color_hex[4:6], 16)
-        except ValueError:
-            led_r = led_g = led_b = 0
+            elapsed = time.time() - loop_t0
+            # cfg["tick_interval"] - живая настройка из /settings (см.
+            # /api/tick_interval и DEFAULT_SETTINGS выше), а не статическая
+            # TICK_INTERVAL - cfg уже перечитывается из state в начале КАЖДОЙ
+            # итерации цикла (см. "cfg = copy.deepcopy(state[\"cfg\"])" в самом
+            # начале while), поэтому смена значения в /settings подхватывается
+            # на следующем же тике, без перезапуска pc_hud.py. TICK_INTERVAL
+            # (env var) используется только как дефолт при самом первом запуске
+            # (см. DEFAULT_SETTINGS) - .get() тут на случай уже сохранённого
+            # settings.json от версии ДО этой настройки (там ключа ещё нет).
+            tick_interval = cfg.get("tick_interval", TICK_INTERVAL)
+            stop_event.wait(timeout=max(0.0, tick_interval - elapsed))
 
-        offline_values = {
-            "OFFCFG": "{},{},{},{},{},{},{},{},{}".format(
-                1 if cfg.get("offline_enabled") else 0,
-                int(round(max(0.5, cfg.get("offline_timeout_minutes", DEFAULT_OFFLINE_TIMEOUT_MINUTES)) * 60)),
-                # start_min/end_min - бывшее окно активности, УБРАНО. Поля
-                # оставлены в протоколе (0,0 = "весь день" для старой
-                # прошивки; новая прошивка их просто пропускает).
-                0, 0,
-                max(5, min(300, int(cfg.get("offline_button_clock_seconds", DEFAULT_OFFLINE_BUTTON_CLOCK_SECONDS)))),
-                1 if cfg.get("offline_led_enabled") else 0,
-                led_r, led_g, led_b,
-            ),
-            "OFFL1": cfg.get("offline_l1", DEFAULT_OFFLINE_L1),
-            "OFFL2": cfg.get("offline_l2", DEFAULT_OFFLINE_L2),
-            "OFFL3": cfg.get("offline_l3", DEFAULT_OFFLINE_L3),
-        }
-        offline_line_to_send = offline_proto.build(offline_values, now=now)
-        if ser is not None and not flashing_event.is_set() and offline_line_to_send is not None:
-            try:
-                ser.write((offline_line_to_send + "\n").encode("utf-8"))
-                _log_serial("tx", offline_line_to_send)
-            except (serial.SerialException, OSError):
-                pass  # основной write-путь выше уже обработает переподключение на своей проверке
-
-        # ---- offline-режим: периодическая синхронизация часов платы ----
-        # TSYNC:/UPT: - см. докстринг protocol.py и win_hud_arduino_firmware.ino
-        # ("Offline-режим"). НЕ через diff-протокол (см. обоснование у
-        # last_time_sync выше) - обычная raw-строка раз в
-        # TIME_SYNC_INTERVAL_SECONDS. uptime_text форматируется тем же
-        # format_duration(), что и context["uptime"] в медленном блоке метрик
-        # выше - тут считается заново, а не берётся из context, чтобы не
-        # зависеть от того, успел ли уже отработать POLL_INTERVAL-блок на
-        # этом конкретном тике.
-        if ser is not None and not flashing_event.is_set() and now - last_time_sync >= TIME_SYNC_INTERVAL_SECONDS:
-            last_time_sync = now
-            uptime_text = format_duration(time.time() - _boot_time())
-            # У платы нет ни RTC, ни tzdata - computeLocalTime() в .ino просто
-            # считает epochAtSync + millis() и раскладывает в год/месяц/день/
-            # час/минуту, ничего не зная о часовом поясе (см. TSYNC: в
-            # protocol.py/win_hud_arduino_firmware.ino). Если слать сюда
-            # честный int(time.time()) (UTC) - офлайн-часы платы показывают
-            # время по Гринвичу, а не по локальному поясу хоста (на GMT+3
-            # расхождение ровно 3 часа - баг-репорт Konstantin). Вместо того
-            # чтобы учить плату часовым поясам (новое поле в протоколе +
-            # правки прошивки), проще и надёжнее компенсировать смещение
-            # здесь: считаем ТЕКУЩИЙ локальный офсет хоста (учитывает и DST,
-            # если он есть) и шлём плате epoch, СДВИНУТЫЙ на этот офсет -
-            # плата складывает его с millis() и получает уже ПРАВИЛЬНОЕ
-            # локальное время, хотя сама по-прежнему думает, что просто
-            # считает секунды с 1970 года без какой-либо зоны.
-            tz_offset_seconds = round((datetime.datetime.now() - datetime.datetime.utcnow()).total_seconds())
-            local_epoch = int(time.time()) + tz_offset_seconds
-            tsync_line = f"TSYNC:{local_epoch}|UPT:{uptime_text}"
-            try:
-                ser.write((tsync_line + "\n").encode("utf-8"))
-                _log_serial("tx", tsync_line)
-            except (serial.SerialException, OSError):
-                pass
-
-        elapsed = time.time() - loop_t0
-        # cfg["tick_interval"] - живая настройка из /settings (см.
-        # /api/tick_interval и DEFAULT_SETTINGS выше), а не статическая
-        # TICK_INTERVAL - cfg уже перечитывается из state в начале КАЖДОЙ
-        # итерации цикла (см. "cfg = copy.deepcopy(state[\"cfg\"])" в самом
-        # начале while), поэтому смена значения в /settings подхватывается
-        # на следующем же тике, без перезапуска pc_hud.py. TICK_INTERVAL
-        # (env var) используется только как дефолт при самом первом запуске
-        # (см. DEFAULT_SETTINGS) - .get() тут на случай уже сохранённого
-        # settings.json от версии ДО этой настройки (там ключа ещё нет).
-        tick_interval = cfg.get("tick_interval", TICK_INTERVAL)
-        stop_event.wait(timeout=max(0.0, tick_interval - elapsed))
-
+        except Exception:
+            # Любая необработанная ошибка в итерации раньше убивала поток целиком
+            # (веб жив, а лента/OLED замирали навсегда). Теперь - в лог и дальше.
+            import traceback
+            print("[loop] необработанная ошибка в итерации главного цикла:\n" + traceback.format_exc(), flush=True)
+            stop_event.wait(timeout=1.0)
     if ser is not None:
         try:
             ser.close()

@@ -27,6 +27,7 @@ audio-функций).
 
 import asyncio
 import ctypes
+import threading
 import time
 
 import psutil
@@ -761,90 +762,229 @@ class MediaMonitor:
     "пустые" значения, как GpuMonitor/AudioController без своих библиотек.
     """
 
+    # Таймауты изоляции SMTC-вызова (см. read() ниже). Живой случай: брокер
+    # медиасессий Windows зависает в пользовательской сессии, WinRT-await
+    # не возвращается НИКОГДА - раньше это вешало весь главный цикл
+    # (лента/OLED замирали), лечилось только выходом из системы.
+    WORKER_TIMEOUT_S = 12.0       # потолок на ОДИН полный опрос (потом поток бросается)
+    AWAIT_TIMEOUT_S = 3.0         # потолок на каждый отдельный WinRT-await внутри опроса
+    RETRY_AFTER_HANG_S = 60.0     # пауза перед новой попыткой после зависания
+    RETRY_SLOW_S = 600.0          # если зависших потоков уже много - пробуем редко, но не сдаёмся навсегда
+    MAX_ABANDONED_ALIVE = 5       # столько ЖИВЫХ брошенных потоков терпим, дальше переходим на RETRY_SLOW_S
+    STALE_AFTER_S = 10.0          # кэш старше этого возраста отдаётся как "ничего не играет"
+
+    _EMPTY = {"media_title": None, "media_artist": None, "media_playing": "нет"}
+    _TIMED_OUT = object()         # сентинел "await не уложился в AWAIT_TIMEOUT_S"
+
     def __init__(self):
         self.available = _WINSDK_AVAILABLE
+        self._lock = threading.Lock()
+        self._cached = dict(self._EMPTY)
+        self._cached_ts = 0.0
+        self._worker = None
+        self._worker_started = 0.0
+        self._worker_token = 0
+        self._worker_ctx = None
+        self._abandoned_threads = []
+        self._retry_not_before = 0.0
+        self._had_hang = False
         if not self.available:
             print("[media] winsdk не установлен - Now Playing недоступен", flush=True)
 
-    def read(self):
-        """dict: media_title, media_artist (None, если сейчас ничего не играет
-        - в частности на паузе/стопе тоже None, см. _read_async() ниже -
-        чтобы OLED-экран Now Playing автоматически пропускался ротацией
-        через общий механизм screens.build_active_screens(), как экраны
-        net2/disk2 без настройки - см. докстринг screens.py), media_playing
-        ('да'/'нет', всегда строка, не None)."""
-        empty = {"media_title": None, "media_artist": None, "media_playing": "нет"}
-        if not self.available:
-            return empty
+    def _worker_main(self, token, ctx):
+        """Один опрос SMTC в отдельном потоке. Если он зависнет - зависнет
+        только этот поток, а не главный цикл (см. read()). ctx - словарь,
+        в который _read_async() пишет "на каком этапе/источнике сейчас" -
+        read() читает его, чтобы сказать в логе, ГДЕ именно завис опрос.
+
+        Свой цикл событий вместо asyncio.run(): asyncio.run() при выходе
+        отменяет и ЖДЁТ все недоделанные задачи, а зависшая WinRT-задача
+        отмену может не обработать никогда - поток завис бы ещё и на
+        закрытии. loop.close() без ожидания этого не делает."""
+        init_com_for_thread()
+        loop = None
         try:
-            return asyncio.run(self._read_async())
+            loop = asyncio.new_event_loop()
+            result = loop.run_until_complete(self._read_async(ctx))
         except Exception as e:
             print(f"[media] read failed: {e}", flush=True)
-            return empty
+            result = dict(self._EMPTY)
+        finally:
+            if loop is not None:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+        with self._lock:
+            # результат опоздавшего (уже брошенного как зависший) потока игнорируем
+            if token == self._worker_token:
+                self._cached = result
+                self._cached_ts = time.time()
+                if self._had_hang and ctx.get("clean"):
+                    self._had_hang = False
+                    print("[media] SMTC снова отвечает - Now Playing работает", flush=True)
+
+    def read(self):
+        """dict: media_title, media_artist (None, если сейчас ничего не играет
+        - в частности на паузе/стопе тоже None, чтобы OLED-экран Now Playing
+        автоматически пропускался ротацией через общий механизм
+        screens.build_active_screens()), media_playing ('да'/'нет', всегда
+        строка, не None).
+
+        НЕ БЛОКИРУЕТ вызывающий поток: реальный опрос SMTC идёт в отдельном
+        потоке-работнике, а сюда сразу возвращается последний готовый
+        результат из кэша. Если работник завис дольше WORKER_TIMEOUT_S -
+        он бросается (daemon-поток, мы его не ждём), в лог пишется ЭТАП и
+        ИСТОЧНИК (приложение), на котором он застрял, новая попытка через
+        RETRY_AFTER_HANG_S. Если живых брошенных потоков уже
+        MAX_ABANDONED_ALIVE - попытки идут раз в RETRY_SLOW_S (не
+        отключаемся навсегда: как только брокер оживёт, Now Playing
+        вернётся сам, без перезапуска приложения). Кэш старше
+        STALE_AFTER_S отдаётся как "ничего не играет"."""
+        if not self.available:
+            return dict(self._EMPTY)
+
+        now = time.time()
+        with self._lock:
+            self._abandoned_threads = [t for t in self._abandoned_threads if t.is_alive()]
+
+            w = self._worker
+            if w is not None and not w.is_alive():
+                self._worker = None
+            elif w is not None and now - self._worker_started > self.WORKER_TIMEOUT_S:
+                ctx = self._worker_ctx or {}
+                self._worker_token += 1   # результат этого потока больше не принимается
+                self._abandoned_threads.append(w)
+                self._worker = None
+                self._had_hang = True
+                alive = len(self._abandoned_threads)
+                delay = self.RETRY_AFTER_HANG_S if alive < self.MAX_ABANDONED_ALIVE else self.RETRY_SLOW_S
+                self._retry_not_before = now + delay
+                where = f"этап '{ctx.get('stage', '?')}'"
+                if ctx.get("source"):
+                    where += f", источник '{ctx['source']}'"
+                print(
+                    f"[media] SMTC-опрос завис >{self.WORKER_TIMEOUT_S:.0f}с: {where} - "
+                    f"Now Playing пропускаю, повтор через {delay:.0f}с (зависших потоков: {alive})",
+                    flush=True,
+                )
+
+            if self._worker is None and now >= self._retry_not_before:
+                self._worker_token += 1
+                ctx = {"stage": "start", "source": "", "clean": False}
+                t = threading.Thread(target=self._worker_main, args=(self._worker_token, ctx),
+                                     daemon=True, name="media-worker")
+                self._worker = t
+                self._worker_ctx = ctx
+                self._worker_started = now
+                t.start()
+
+            if now - self._cached_ts > self.STALE_AFTER_S:
+                return dict(self._EMPTY)
+            return dict(self._cached)
+
+    async def _await_with_timeout(self, awaitable, label, source=""):
+        """await с потолком AWAIT_TIMEOUT_S, который НЕ ждёт отмены зависшей
+        задачи (в отличие от asyncio.wait_for, который при таймауте ждёт, пока
+        отменённая задача реально завершится - а зависший WinRT-await может
+        не завершиться никогда). Возвращает результат либо _TIMED_OUT."""
+        task = asyncio.ensure_future(awaitable)
+        done, pending = await asyncio.wait({task}, timeout=self.AWAIT_TIMEOUT_S)
+        if pending:
+            task.cancel()
+            extra = f" (источник '{source}')" if source else ""
+            print(f"[media] {label} не ответил за {self.AWAIT_TIMEOUT_S:.0f}с{extra}", flush=True)
+            return self._TIMED_OUT
+        return task.result()
 
     def debug_list_sessions(self):
         """
-        Диагностика для ручной проверки (см. самотест в конце файла:
-        `python metrics_windows.py`) - НЕ используется в обычной работе
-        pc_hud.py. Печатает КАЖДУЮ SMTC-сессию, которую видит Windows, с её
-        источником (app_user_model_id) и статусом - позволяет отличить два
-        разных случая:
-          - сессий вообще нет / нужного плеера нет в списке -> само
-            приложение не регистрируется в SMTC, это не чинится в этом коде
-            (см. докстринг класса выше про AIMP/Plex)
-          - сессия есть, но playback_status не Playing -> отладка тут, в
-            _read_async()/read()
+        Диагностика для ручной проверки (запуск: `python metrics_windows.py`
+        или `python -c "from metrics_windows import MediaMonitor;
+        MediaMonitor().debug_list_sessions()"`) - НЕ используется в обычной
+        работе pc_hud.py. Печатает КАЖДУЮ SMTC-сессию, которую видит Windows,
+        с её источником (app_user_model_id), статусом и (для играющих)
+        результатом запроса свойств - каждый await с таймаутом, поэтому
+        зависший брокер/сессия не вешает диагностику, а явно называется.
         """
         if not self.available:
             print("[media] winsdk недоступен")
             return
-        asyncio.run(self._debug_list_sessions_async())
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self._debug_list_sessions_async())
+        finally:
+            loop.close()
 
     async def _debug_list_sessions_async(self):
-        manager = await _MediaManager.request_async()
+        manager = await self._await_with_timeout(_MediaManager.request_async(), "request_async")
+        if manager is self._TIMED_OUT:
+            print("[media] брокер медиасессий Windows не отвечает (request_async)")
+            return
         sessions = manager.get_sessions()
         if not sessions:
             print("[media] Windows не видит НИ ОДНОЙ SMTC-сессии сейчас")
             return
         for session in sessions:
+            source = session.source_app_user_model_id
             info = session.get_playback_info()
             status = info.playback_status if info else None
-            source = session.source_app_user_model_id
             print(f"[media] сессия: source={source!r} playback_status={status}")
+            props = await self._await_with_timeout(session.try_get_media_properties_async(), "try_get_media_properties_async", source)
+            if props is self._TIMED_OUT:
+                print(f"[media]   -> ЭТА сессия зависает на запросе свойств: {source!r}")
+            elif props:
+                print(f"[media]   -> title={props.title!r} artist={props.artist!r}")
 
-    async def _read_async(self):
-        manager = await _MediaManager.request_async()
+    async def _read_async(self, ctx=None):
+        if ctx is None:
+            ctx = {}
+        timed_out = False
+
+        ctx["stage"], ctx["source"] = "request_async", ""
+        manager = await self._await_with_timeout(_MediaManager.request_async(), "request_async")
+        if manager is self._TIMED_OUT:
+            return dict(self._EMPTY)
 
         # НЕ используем manager.get_current_session() - это эвристика Windows
         # "какую сессию считать текущей", и она нередко возвращает None даже
-        # при реально играющей музыке (особенно если открыто несколько
-        # источников звука одновременно, или фокус недавно переключался
-        # между приложениями) - см. обсуждение в README. Вместо этого сами
-        # перебираем ВСЕ зарегистрированные SMTC-сессии и берём первую, где
-        # реально Playing - так надёжнее и не зависит от того, что Windows
-        # сочла "текущим".
+        # при реально играющей музыке. Вместо этого сами перебираем ВСЕ
+        # зарегистрированные SMTC-сессии и берём первую, где реально Playing.
+        # Каждый запрос свойств - со своим таймаутом: зависшая сессия одного
+        # приложения пропускается, остальные продолжают работать.
+        ctx["stage"] = "get_sessions"
         sessions = manager.get_sessions()
 
-        playing_session = None
         for session in sessions:
+            try:
+                source = session.source_app_user_model_id
+            except Exception:
+                source = "?"
+            ctx["source"] = source
+
+            ctx["stage"] = "get_playback_info"
             info = session.get_playback_info()
             # PlaybackStatus: Closed=0, Opened=1, Changing=2, Stopped=3, Playing=4, Paused=5
-            if info and info.playback_status == 4:
-                playing_session = session
-                break
+            if not (info and info.playback_status == 4):
+                continue
 
-        if playing_session is None:
-            return {"media_title": None, "media_artist": None, "media_playing": "нет"}
+            ctx["stage"] = "try_get_media_properties_async"
+            props = await self._await_with_timeout(session.try_get_media_properties_async(), "try_get_media_properties_async", source)
+            if props is self._TIMED_OUT:
+                timed_out = True
+                continue
 
-        props = await playing_session.try_get_media_properties_async()
-        title = (props.title or "").strip() if props else ""
-        artist = (props.artist or "").strip() if props else ""
+            title = (props.title or "").strip() if props else ""
+            artist = (props.artist or "").strip() if props else ""
+            ctx["clean"] = not timed_out
+            return {
+                "media_title": title or None,
+                "media_artist": artist or None,
+                "media_playing": "да",
+            }
 
-        return {
-            "media_title": title or None,
-            "media_artist": artist or None,
-            "media_playing": "да",
-        }
+        ctx["clean"] = not timed_out
+        return dict(self._EMPTY)
 
 
 # ---------------- Раскладка клавиатуры ----------------
